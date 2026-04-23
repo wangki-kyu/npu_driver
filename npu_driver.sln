@@ -5,6 +5,8 @@ VisualStudioVersion = 17.14.37111.16 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "npu_driver", "npu_driver\npu_driver.vcxproj", "{9C0FEFF3-6DD7-5DC2-3272-0823D26CE4E9}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "npu_test_console", "npu_test_console\npu_test_console.vcxproj", "{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -25,6 +27,14 @@ Global
 		{9C0FEFF3-6DD7-5DC2-3272-0823D26CE4E9}.Release|x64.ActiveCfg = Release|x64
 		{9C0FEFF3-6DD7-5DC2-3272-0823D26CE4E9}.Release|x64.Build.0 = Release|x64
 		{9C0FEFF3-6DD7-5DC2-3272-0823D26CE4E9}.Release|x64.Deploy.0 = Release|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Debug|ARM64.ActiveCfg = Debug|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Debug|ARM64.Build.0 = Debug|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Debug|x64.ActiveCfg = Debug|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Debug|x64.Build.0 = Debug|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Release|ARM64.ActiveCfg = Release|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Release|ARM64.Build.0 = Release|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Release|x64.ActiveCfg = Release|x64
+		{32AA8DC1-85A9-4871-87BE-F3AB18A77CC0}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

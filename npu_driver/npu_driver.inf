@@ -28,7 +28,7 @@ npu_driver.sys = 1,,
 %ManufacturerName% = Standard,NT$ARCH$.10.0...16299 ; %13% support introduced in build 16299
 
 [Standard.NT$ARCH$.10.0...16299]
-%npu_driver.DeviceDesc% = npu_driver_Device, Root\npu_driver ; TODO: edit hw-id
+%npu_driver.DeviceDesc% = npu_driver_Device, PCI\VEN_1AC1&DEV_089A&SUBSYS_089A1AC1&REV_00; TODO: edit hw-id
 
 [npu_driver_Device.NT]
 CopyFiles = File_Copy
