@@ -1,4 +1,6 @@
 #include "Driver.h"
+#include "Memory.h"
+#include "Queue.h"
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, npudriverCreateDevice)
@@ -12,6 +14,7 @@ VOID npudriverReadTemperature(WDFDEVICE Device);
 NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 {
 	WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
+	WDF_FILEOBJECT_CONFIG fileObjectConfig;
 	WDF_OBJECT_ATTRIBUTES deviceAttributes;
 	PDEVICE_CONTEXT deviceContext;
 	WDFDEVICE device;
@@ -25,6 +28,10 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 
 	WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
+	// Set up file object config with cleanup callback
+	WDF_FILEOBJECT_CONFIG_INIT(&fileObjectConfig, NULL, NULL, npudriverEvtFileCleanup);
+	WdfDeviceInitSetFileObjectConfig(DeviceInit, &fileObjectConfig, WDF_NO_OBJECT_ATTRIBUTES);
+
 	WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&deviceAttributes, DEVICE_CONTEXT);
 
 	status = WdfDeviceCreate(&DeviceInit, &deviceAttributes, &device);
@@ -35,15 +42,26 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 
 		// Initialize the context
 		deviceContext->PrivateDeviceData = 0;
+		deviceContext->LockedModelMdl = NULL;
+		deviceContext->LockedModelSize = 0;
+		deviceContext->DeviceStatus = DEVICE_STATUS_DEAD;
 
-		// Create a device interface so that application can find and talk to us 
+		// Create a device interface so that application can find and talk to us
 
 		status = WdfDeviceCreateDeviceInterface(device, &GUID_DEVINTERFACE_npudriver, NULL);
 
 		if (NT_SUCCESS(status))
 		{
-			// todo: Initialize the I/O Package and any Queues
+			// Initialize the I/O Queue
+			WDF_IO_QUEUE_CONFIG queueConfig;
+			WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
+			queueConfig.EvtIoDeviceControl = npudriverEvtIoDeviceControl;
 
+			status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->IoQueue);
+			if (!NT_SUCCESS(status)) {
+				DbgPrint("[%s] WdfIoQueueCreate failed: 0x%x\n", __FUNCTION__, status);
+				return status;
+			}
 		}
 	}
 
@@ -60,10 +78,19 @@ npudriverEvtDevicePrepareHardware(
 	UNREFERENCED_PARAMETER(Device);
 	UNREFERENCED_PARAMETER(ResourceListTranslated);
 
+	NTSTATUS status = STATUS_SUCCESS;
+
 	DbgPrint("[%s] Entry\n", __FUNCTION__);
 
 	npudriverSettingResourceInfo(Device, ResourceList);
 	npudriverReadTemperature(Device);
+
+	// Initialize page table for memory mapping
+	status = ApexPageTableInit(Device);
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("[%s] ApexPageTableInit failed: 0x%x\n", __FUNCTION__, status);
+		return status;
+	}
 
 	DbgPrint("[%s] Exit\n", __FUNCTION__);
 
@@ -155,18 +182,48 @@ npudriverEvtDeviceReleaseHardware(
 
 	DbgPrint("[%s] Entry\n", __FUNCTION__);
 
+	// Cleanup page table
+	ApexPageTableCleanup(Device);
+
 	if (deviceContext->Bar2BaseAddress != NULL) {
 		MmUnmapIoSpace(deviceContext->Bar2BaseAddress, deviceContext->Bar2Length);
 		deviceContext->Bar2BaseAddress = NULL;
 		DbgPrint("[%s] BAR2 unmapped\n", __FUNCTION__);
 	}
 
+	deviceContext->DeviceStatus = DEVICE_STATUS_DEAD;
+
 	DbgPrint("[%s] Exit\n", __FUNCTION__);
 
 	return STATUS_SUCCESS;
 }
 
-// Coral 
+VOID
+npudriverEvtFileCleanup(
+	_In_ WDFFILEOBJECT FileObject
+)
+{
+	WDFDEVICE device = WdfFileObjectGetDevice(FileObject);
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(device);
+
+	DbgPrint("[%s] File cleanup called\n", __FUNCTION__);
+
+	// Safety check: unlock pages if they weren't properly unlocked
+	if (deviceContext->LockedModelMdl != NULL) {
+		DbgPrint("[%s] WARNING: Locked MDL detected during file cleanup\n", __FUNCTION__);
+		DbgPrint("[%s] Unlocking %llu bytes...\n", __FUNCTION__, deviceContext->LockedModelSize);
+
+		MmUnlockPages(deviceContext->LockedModelMdl);
+		IoFreeMdl(deviceContext->LockedModelMdl);
+
+		deviceContext->LockedModelMdl = NULL;
+		deviceContext->LockedModelSize = 0;
+
+		DbgPrint("[%s] Locked pages cleaned up successfully\n", __FUNCTION__);
+	}
+}
+
+// Coral
 
 VOID npudriverReadTemperature(WDFDEVICE Device)
 {
@@ -183,3 +240,4 @@ VOID npudriverReadTemperature(WDFDEVICE Device)
 
 	DbgPrint("[%s] Register(0x01a0d0) Raw Value: 0x%08X\n", __FUNCTION__, rawTemp);
 }
+

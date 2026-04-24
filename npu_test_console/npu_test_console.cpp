@@ -2,8 +2,54 @@
 //
 
 #include <iostream>
+#include <vector>
+#include <fstream>
 #include "../include/util.hpp"
 #include "../include/Public.h"
+#include <Windows.h>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "../lib/edgetpu.dll.if.lib")
+
+// Load model file from disk
+std::vector<char> LoadModelFile(const char* filename)
+{
+    std::ifstream file(filename, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open model file: " << filename << std::endl;
+        return {};
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<char> buffer(size);
+    if (!file.read(buffer.data(), size)) {
+        std::cerr << "Failed to read model file" << std::endl;
+        return {};
+    }
+
+    std::cout << "Model loaded: " << size << " bytes" << std::endl;
+    return buffer;
+}
+
+// Helper function to allocate aligned memory
+void* AllocateAlignedMemory(size_t size, size_t alignment)
+{
+    void* ptr = _aligned_malloc(size, alignment);
+    if (ptr == nullptr) {
+        std::cerr << "Failed to allocate aligned memory" << std::endl;
+        return nullptr;
+    }
+    return ptr;
+}
+
+void FreeAlignedMemory(void* ptr)
+{
+    if (ptr) {
+        _aligned_free(ptr);
+    }
+}
 
 int main()
 {
@@ -15,20 +61,89 @@ int main()
         return 1;
     }
 
+    std::cout << "success to get device handle!" << std::endl;
+
+    // Load actual model file
+    std::vector<char> modelData = LoadModelFile(".\\models\\ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite");
+
+    if (modelData.empty()) {
+        std::cout << "Failed to load model file" << std::endl;
+        CloseHandle(handle);
+        return 1;
+    }
+
+    size_t MODEL_SIZE = modelData.size();
+
+    // Allocate page-aligned buffer for model
+    void* pModelBuffer = AllocateAlignedMemory(MODEL_SIZE, 4096);
+
+    if (pModelBuffer == nullptr) {
+        std::cout << "Failed to allocate model buffer" << std::endl;
+        CloseHandle(handle);
+        return 1;
+    }
+
+    // Copy model data to aligned buffer
+    memcpy(pModelBuffer, modelData.data(), MODEL_SIZE);
+    std::cout << "Model buffer allocated at 0x" << std::hex << (UINT64)pModelBuffer
+              << std::dec << " size: " << MODEL_SIZE << " bytes" << std::endl;
+
+    // Prepare IOCTL input
+    MAP_BUFFER_INPUT mapInput;
+    mapInput.UserAddress = (UINT64)pModelBuffer;
+    mapInput.Size = MODEL_SIZE;
+
+    DWORD bytesReturned = 0;
+
+    // Call IOCTL_MAP_BUFFER
+    BOOL result = DeviceIoControl(
+        handle,
+        IOCTL_MAP_BUFFER,
+        &mapInput,
+        sizeof(MAP_BUFFER_INPUT),
+        nullptr,
+        0,
+        &bytesReturned,
+        nullptr
+    );
+
+    if (result) {
+        std::cout << "IOCTL_MAP_BUFFER succeeded!" << std::endl;
+    }
+    else {
+        std::cout << "IOCTL_MAP_BUFFER failed: " << GetLastError() << std::endl;
+    }
+
+    // Test IOCTL_UNMAP_BUFFER
+    UNMAP_BUFFER_INPUT unmapInput;
+    unmapInput.DeviceAddress = 0;  // Device virtual address
+    unmapInput.Size = MODEL_SIZE;
+
+    result = DeviceIoControl(
+        handle,
+        IOCTL_UNMAP_BUFFER,
+        &unmapInput,
+        sizeof(UNMAP_BUFFER_INPUT),
+        nullptr,
+        0,
+        &bytesReturned,
+        nullptr
+    );
+
+    if (result) {
+        std::cout << "IOCTL_UNMAP_BUFFER succeeded!" << std::endl;
+    }
+    else {
+        std::cout << "IOCTL_UNMAP_BUFFER failed: " << GetLastError() << std::endl;
+    }
+
+    // Cleanup
+    FreeAlignedMemory(pModelBuffer);
     CloseHandle(handle);
 
-    std::cout << "success to get device handle!" << std::endl;
+    std::cout << "Test completed!" << std::endl;
+
+    MessageBox(NULL, L"wait", L"wait", NULL);
 
     return 0;
 }
-
-// 프로그램 실행: <Ctrl+F5> 또는 [디버그] > [디버깅하지 않고 시작] 메뉴
-// 프로그램 디버그: <F5> 키 또는 [디버그] > [디버깅 시작] 메뉴
-
-// 시작을 위한 팁: 
-//   1. [솔루션 탐색기] 창을 사용하여 파일을 추가/관리합니다.
-//   2. [팀 탐색기] 창을 사용하여 소스 제어에 연결합니다.
-//   3. [출력] 창을 사용하여 빌드 출력 및 기타 메시지를 확인합니다.
-//   4. [오류 목록] 창을 사용하여 오류를 봅니다.
-//   5. [프로젝트] > [새 항목 추가]로 이동하여 새 코드 파일을 만들거나, [프로젝트] > [기존 항목 추가]로 이동하여 기존 코드 파일을 프로젝트에 추가합니다.
-//   6. 나중에 이 프로젝트를 다시 열려면 [파일] > [열기] > [프로젝트]로 이동하고 .sln 파일을 선택합니다.

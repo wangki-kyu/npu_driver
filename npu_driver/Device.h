@@ -11,12 +11,30 @@ EXTERN_C_START
 
 typedef struct _DEVICE_CONTEXT
 {
-	// BAR2 
+	// BAR2
 	PVOID Bar2BaseAddress;	// MmMapIoSpace
-	ULONG Bar2Length;		// 
+	ULONG Bar2Length;		//
 
-	// Interrupt 
+	// Interrupt
 	WDFINTERRUPT Interrupts[1];
+
+	// Page table for model/data memory mapping
+	PVOID PageTableBase;                 // Page table kernel VA
+	PHYSICAL_ADDRESS PageTablePhys;      // Page table physical address
+	ULONG PageTableSize;                 // Number of allocated page table entries
+
+	// Synchronization
+	WDFSPINLOCK PageTableLock;           // Protect page table access
+
+	// Device status
+	ULONG DeviceStatus;                  // DEVICE_STATUS_DEAD/ALIVE
+
+	// I/O Queue
+	WDFQUEUE IoQueue;                    // Default I/O queue for IOCTLs
+
+	// Locked memory tracking (keep pages locked during inference)
+	PMDL LockedModelMdl;                 // MDL for locked model pages
+	UINT64 LockedModelSize;              // Size of locked model
 
 	ULONG PrivateDeviceData;  // just a placeholder
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
@@ -32,5 +50,6 @@ EVT_WDF_DEVICE_PREPARE_HARDWARE npudriverEvtDevicePrepareHardware;
 
 EVT_WDF_DEVICE_RELEASE_HARDWARE npudriverEvtDeviceReleaseHardware;
 
+EVT_WDF_FILE_CLEANUP npudriverEvtFileCleanup;
 
 EXTERN_C_END
