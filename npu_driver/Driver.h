@@ -23,6 +23,7 @@ Environment:
 
 #include "Device.h"
 #include "..\include\Public.h"
+#include "Hardware.h"
 
 EXTERN_C_START
 
@@ -33,5 +34,7 @@ EXTERN_C_START
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD npudriverEvtDeviceAdd;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP npudriverEvtDriverContextCleanup;
+
+NTSTATUS npudriverLogResourceInfo(WDFCMRESLIST ResourceList);
 
 EXTERN_C_END

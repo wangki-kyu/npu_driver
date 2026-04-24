@@ -41,5 +41,8 @@
     <ClInclude Include="..\include\Public.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Hardware.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

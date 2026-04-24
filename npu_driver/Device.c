@@ -6,6 +6,9 @@
 #pragma alloc_text(PAGE, npudriverEvtDeviceReleaseHardware)
 #endif
 
+NTSTATUS npudriverSettingResourceInfo(WDFDEVICE Device, WDFCMRESLIST ResourceList);
+VOID npudriverReadTemperature(WDFDEVICE Device);
+
 NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 {
 	WDF_PNPPOWER_EVENT_CALLBACKS pnpPowerCallbacks;
@@ -55,8 +58,85 @@ npudriverEvtDevicePrepareHardware(
 )
 {
 	UNREFERENCED_PARAMETER(Device);
-	UNREFERENCED_PARAMETER(ResourceList);
 	UNREFERENCED_PARAMETER(ResourceListTranslated);
+
+	DbgPrint("[%s] Entry\n", __FUNCTION__);
+
+	npudriverSettingResourceInfo(Device, ResourceList);
+	npudriverReadTemperature(Device);
+
+	DbgPrint("[%s] Exit\n", __FUNCTION__);
+
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS npudriverSettingResourceInfo(WDFDEVICE Device, WDFCMRESLIST ResourceList)
+{
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
+	ULONG count;
+	ULONG i;
+	PCM_PARTIAL_RESOURCE_DESCRIPTOR descriptor;
+
+	if (ResourceList == NULL) {
+		DbgPrint("[%s] ResourceList is NULL\n", __FUNCTION__);
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	count = WdfCmResourceListGetCount(ResourceList);
+	DbgPrint("[%s] Total Resources: %lu\n", __FUNCTION__, count);
+
+	for (i = 0; i < count; i++) {
+		descriptor = WdfCmResourceListGetDescriptor(ResourceList, i);
+
+		if (descriptor == NULL) {
+			continue;
+		}
+
+		DbgPrint("[%s] Resource[%lu]: Type=%lu", __FUNCTION__, i, descriptor->Type);
+
+		switch (descriptor->Type) {
+		case CmResourceTypeMemory:
+			DbgPrint(" (Memory) Start=0x%llx Length=0x%lx\n",
+				descriptor->u.Memory.Start.QuadPart,
+				descriptor->u.Memory.Length);
+
+			// save BAR2 
+			if (descriptor->u.Memory.Length == 0x100000) {
+				deviceContext->Bar2Length = descriptor->u.Memory.Length;
+
+				deviceContext->Bar2BaseAddress = MmMapIoSpace(
+					descriptor->u.Memory.Start,
+					descriptor->u.Memory.Length,
+					MmNonCached
+				);
+			}
+
+			break;
+
+		case CmResourceTypePort:
+			DbgPrint(" (I/O Port) Start=0x%llx Length=0x%lx\n",
+				descriptor->u.Port.Start.QuadPart,
+				descriptor->u.Port.Length);
+			break;
+
+		case CmResourceTypeInterrupt:
+			DbgPrint(" (Interrupt) Level=%lu Vector=%lu Affinity=0x%lx\n",
+				descriptor->u.Interrupt.Level,
+				descriptor->u.Interrupt.Vector,
+				(ULONG)descriptor->u.Interrupt.Affinity);
+			break;
+
+		case CmResourceTypeDma:
+			DbgPrint(" (DMA) Channel=%lu Port=%lu\n",
+				descriptor->u.Dma.Channel,
+				descriptor->u.Dma.Port);
+			break;
+
+		default:
+			DbgPrint(" (Unknown Type)\n");
+			break;
+		}
+	}
 
 	return STATUS_SUCCESS;
 }
@@ -67,14 +147,39 @@ npudriverEvtDeviceReleaseHardware(
 	_In_ WDFCMRESLIST ResourcesTranslated
 )
 {
-	UNREFERENCED_PARAMETER(Device);
 	UNREFERENCED_PARAMETER(ResourcesTranslated);
+
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
 
 	PAGED_CODE();
 
 	DbgPrint("[%s] Entry\n", __FUNCTION__);
 
+	if (deviceContext->Bar2BaseAddress != NULL) {
+		MmUnmapIoSpace(deviceContext->Bar2BaseAddress, deviceContext->Bar2Length);
+		deviceContext->Bar2BaseAddress = NULL;
+		DbgPrint("[%s] BAR2 unmapped\n", __FUNCTION__);
+	}
+
 	DbgPrint("[%s] Exit\n", __FUNCTION__);
 
 	return STATUS_SUCCESS;
+}
+
+// Coral 
+
+VOID npudriverReadTemperature(WDFDEVICE Device)
+{
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
+
+	if (deviceContext->Bar2BaseAddress == NULL) {
+		DbgPrint("[%s] Bar2BaseAddress is NULL", __FUNCTION__);
+		return;
+	}
+
+	PVOID tempRegAddr = (PVOID)((PCHAR)deviceContext->Bar2BaseAddress + APEX_REG_OMC0_D0);
+
+	ULONG rawTemp = READ_REGISTER_ULONG((PULONG)tempRegAddr);
+
+	DbgPrint("[%s] Register(0x01a0d0) Raw Value: 0x%08X\n", __FUNCTION__, rawTemp);
 }

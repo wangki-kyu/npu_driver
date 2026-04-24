@@ -11,6 +11,13 @@ EXTERN_C_START
 
 typedef struct _DEVICE_CONTEXT
 {
+	// BAR2 
+	PVOID Bar2BaseAddress;	// MmMapIoSpace
+	ULONG Bar2Length;		// 
+
+	// Interrupt 
+	WDFINTERRUPT Interrupts[1];
+
 	ULONG PrivateDeviceData;  // just a placeholder
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
