@@ -16,10 +16,14 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 
 // model inference
 typedef struct IOCTL_INFER_INFO {
-    UINT64 InputImageAddr;
-    UINT64 InputImageSize;
-    UINT64 OutputBufferAddr;
-    UINT64 OutputBufferSize;
+    UINT64 InputImageAddr;    // userspace VA of input image
+    UINT64 InputImageSize;    // size in bytes
+    UINT64 OutputBufferAddr;  // userspace VA of output buffer
+    UINT64 OutputBufferSize;  // size in bytes
+    UINT64 InputDeviceVA;     // device VA for PTE registration (PAGE_ALIGN_UP(bitstream_size))
+    UINT64 OutputDeviceVA;    // device VA for PTE registration (InputDeviceVA + PAGE_ALIGN_UP(InputImageSize))
+    UINT64 BitstreamDeviceVA; // device VA of bitstream for Instr Queue descriptor (usually 0)
+    UINT64 BitstreamSize;     // size of bitstream for Instr Queue descriptor
 } IOCTL_INFER_INFO;
 
 // IOCTL input/output structures

@@ -65,6 +65,17 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
         (UINT64)APEX_PAGE_TABLE_ENTRIES
     );
 
+    // APEX_REG_EXTENDED_TABLE stores the NUMBER OF SIMPLE ENTRIES (boundary value),
+    // NOT a boolean enable. Writing N means "entries [0..N-1] are simple (direct 4KB),
+    // entries [N..] are extended (2-level sub-table)."
+    // We want all 8192 entries to be simple → write 8192.
+    // (gasket driver: writeq(num_simple_entries, extended_offset_reg) = writeq(8192, 0x46008))
+    apex_write_register(
+        pDevContext->Bar2BaseAddress,
+        APEX_REG_EXTENDED_TABLE,
+        APEX_PAGE_TABLE_ENTRIES
+    );
+
     // Create spinlock for page table access
     WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);
     lockAttributes.ParentObject = Device;

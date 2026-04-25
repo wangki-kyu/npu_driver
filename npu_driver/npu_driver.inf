@@ -36,6 +36,16 @@ CopyFiles = File_Copy
 [File_Copy]
 npu_driver.sys
 
+;-------------- Hardware Configuration
+[npu_driver_Device.NT.HW]
+AddReg = npu_driver_HW_Reg
+
+[npu_driver_HW_Reg]
+HKR, "Interrupt Management", 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", "MSISupported", 0x00010001, 1
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", "MessageNumberLimit", 0x00010001, 4
+
 ;-------------- Service installation
 [npu_driver_Device.NT.Services]
 AddService = npu_driver,%SPSVCINST_ASSOCSERVICE%, npu_driver_Service_Inst
