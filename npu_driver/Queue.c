@@ -47,10 +47,18 @@ VOID npudriverEvtIoDeviceControl(
 
 		DbgPrint("[%s] MAP_BUFFER: UserAddr=0x%llx, Size=0x%llx\n",
 			__FUNCTION__, pInput->UserAddress, pInput->Size);
+		{
+			PDEVICE_CONTEXT pDC = DeviceGetContext(device);
+			DbgPrint("[MAP] HIB_ERROR before map = 0x%llx\n",
+				apex_read_register(pDC->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
+		}
 
 		status = ApexPageTableMap(device, (PVOID)pInput->UserAddress, (SIZE_T)pInput->Size, &deviceAddr);
 
 		if (NT_SUCCESS(status)) {
+			PDEVICE_CONTEXT pDC = DeviceGetContext(device);
+			DbgPrint("[MAP] HIB_ERROR after map = 0x%llx\n",
+				apex_read_register(pDC->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
 			DbgPrint("[%s] Mapped successfully, DeviceAddr=0x%llx\n", __FUNCTION__, deviceAddr);
 		}
 		break;
@@ -220,8 +228,11 @@ VOID npudriverEvtIoDeviceControl(
 			WdfSpinLockRelease(pDevContext->PageTableLock);
 		}
 
-		// Enable MMU translation
-		apex_write_register(bar2, APEX_REG_TRANSLATION_ENABLE, 1);
+		// Configure tiles now that bitstream is mapped — tiles activate here and may
+		// immediately access bitstream VAs, so PTE[0..N] must already be valid.
+		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
+		apex_write_register(bar2, APEX_REG_TILE_DEEP_SLEEP, 0x1E02ULL);
+		DbgPrint("[INFER] TILE_CONFIG0=0x7F TILE_DEEP_SLEEP=0x1E02\n");
 
 		// Set run controls now that bitstream is mapped (PTE[0..N] valid).
 		// Must NOT be set in PrepareHardware — bitstream isn't mapped yet at that point.
@@ -242,12 +253,17 @@ VOID npudriverEvtIoDeviceControl(
 		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
 		DbgPrint("[INFER] Run controls set\n");
 		
-		// Verify PTE writes actually stuck in hardware
+		// Verify PTE and queue config
 		{
-			UINT64 pte0  = apex_read_register(bar2, APEX_REG_PAGE_TABLE + 0);
-			UINT64 pte49 = apex_read_register(bar2, APEX_REG_PAGE_TABLE + 49 * 8);
-			UINT64 transEn = apex_read_register(bar2, APEX_REG_TRANSLATION_ENABLE);
-			DbgPrint("[DIAG] PTE[0]=0x%llx PTE[49]=0x%llx TRANS_EN=0x%llx\n", pte0, pte49, transEn);
+			UINT64 diagPte0     = apex_read_register(bar2, APEX_REG_PAGE_TABLE + 0);
+			UINT64 diagQBase    = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_BASE);
+			UINT64 diagRingIdx  = diagQBase >> 12;
+			UINT64 diagPteRing  = apex_read_register(bar2, APEX_REG_PAGE_TABLE + diagRingIdx * 8);
+			UINT64 diagDescSize = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_DESC_SIZE);
+			UINT64 diagPtSize   = apex_read_register(bar2, APEX_REG_PAGE_TABLE_SIZE);
+			DbgPrint("[DIAG] PTE[0]=0x%llx QUEUE_BASE=0x%llx PTE[%llu]=0x%llx\n",
+				diagPte0, diagQBase, diagRingIdx, diagPteRing);
+			DbgPrint("[DIAG] DESC_SIZE=%llu PAGE_TABLE_SIZE=%llu\n", diagDescSize, diagPtSize);
 		}
 
 		// 6. Submit HostQueueDescriptor to ring

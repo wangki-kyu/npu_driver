@@ -17,7 +17,7 @@
 // ========== Memory Management ==========
 #define APEX_REG_PAGE_TABLE_SIZE            0x46000
 #define APEX_REG_EXTENDED_TABLE             0x46008
-#define APEX_REG_TRANSLATION_ENABLE         0x46010
+// 0x46010: no translation_enable register — MMU is activated by page_table_init=1
 #define APEX_REG_PAGE_TABLE                 0x50000
 
 // ========== Interrupt Control ==========

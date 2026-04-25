@@ -235,29 +235,15 @@ npudriverEvtDevicePrepareHardware(
 		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x00000001ULL);
 		DbgPrint("[%s] IdleRegister → 0x1 (enabled, counter=1)\n", __FUNCTION__);
 
-		// ExitReset step 5: TILE_CONFIG0 broadcast write to all 7 tiles (= 0x7F).
-		// Address is 0x48788 (NOT 0x420c0 which is TILE_OP_RUN_CONTROL).
-		// Poll until readback == 0x7F before proceeding.
-		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
-		{
-			int retry;
-			for (retry = 0; retry < 100; retry++) {
-				UINT64 tc = apex_read_register(bar2, APEX_REG_TILE_CONFIG0);
-				if (tc == 0x7F) {
-					DbgPrint("[%s] TILE_CONFIG0 confirmed 0x7F (%d tries)\n", __FUNCTION__, retry);
-					break;
-				}
-				KeStallExecutionProcessor(100);
-			}
-			if (retry >= 100) {
-				DbgPrint("[%s] WARNING: TILE_CONFIG0 poll timeout\n", __FUNCTION__);
-			}
-		}
+		// Re-write HIB MMU config after GCB reset — these registers may have been
+		// cleared by the reset even though they were written in ApexPageTableInit().
+		apex_write_register(bar2, APEX_REG_PAGE_TABLE_SIZE, (UINT64)APEX_PAGE_TABLE_ENTRIES);
+		apex_write_register(bar2, APEX_REG_EXTENDED_TABLE, 6144);
+		DbgPrint("[%s] PAGE_TABLE_SIZE=%u EXTENDED_TABLE=6144 re-written after GCB reset\n",
+			__FUNCTION__, APEX_PAGE_TABLE_ENTRIES);
 
-		// ExitReset step 6: tile deep sleep delays.
-		// to_sleep_delay=2 (bits[7:0]), to_wake_delay=30 (bits[15:8]) → 0x1E02.
-		apex_write_register(bar2, APEX_REG_TILE_DEEP_SLEEP, 0x1E02ULL);
-		DbgPrint("[%s] DeepSleep → 0x1E02\n", __FUNCTION__);
+		// TILE_CONFIG0 and TILE_DEEP_SLEEP are written in IOCTL_INFER after bitstream
+		// is mapped, so tiles don't access unmapped VAs during device open.
 	}
 
 	// Initialize interrupt routing
@@ -374,20 +360,20 @@ npudriverEvtDevicePrepareHardware(
 	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_SIZE,         256);
 	apex_write_register(deviceContext->Bar2BaseAddress,
+		APEX_REG_INSTR_QUEUE_DESC_SIZE,    16);  // sizeof(HOST_QUEUE_DESC) = 8+4+4
+	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_TAIL,         0);
-	DbgPrint("[%s] Instruction queue configured: BASE=0x%llx STATUS_BLOCK=0x%llx SIZE=256 TAIL=0\n",
+	DbgPrint("[%s] Instruction queue configured: BASE=0x%llx STATUS_BLOCK=0x%llx SIZE=256 DESC_SIZE=16 TAIL=0\n",
 		__FUNCTION__, deviceContext->DescRingDeviceVA, deviceContext->StatusBlockDeviceVA);
 
-	// Enable MMU translation BEFORE queue enable.
-	// With TRANSLATION_ENABLE=0, hardware treats QUEUE_BASE (0x1FFE000) as a raw
-	// physical address and tries to DMA directly to that PA — which doesn't exist.
-	// With TRANSLATION_ENABLE=1, hardware walks PTE[8190/8191] to find the real PA.
-	// PTE array was zero-filled in ApexPageTableInit, so only [8190/8191] are valid.
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_TRANSLATION_ENABLE, 1);
-	DbgPrint("[%s] TRANSLATION_ENABLE → 1\n", __FUNCTION__);
+	// Verify both ring PTEs are valid before enabling queue
 	{
-		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
-		DbgPrint("[%s] HIB_ERROR after TRANSLATION_ENABLE = 0x%llx\n", __FUNCTION__, hibChk);
+		UINT64 rb6142 = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_PAGE_TABLE + (6142 * 8));
+		UINT64 rb6143 = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_PAGE_TABLE + (6143 * 8));
+		DbgPrint("[%s] PTE[6142](DescRing)=0x%llx PTE[6143](StatusBlock)=0x%llx\n",
+			__FUNCTION__, rb6142, rb6143);
+		if ((rb6142 & 1) == 0) DbgPrint("[%s] WARNING: PTE[6142] not valid!\n", __FUNCTION__);
+		if ((rb6143 & 1) == 0) DbgPrint("[%s] WARNING: PTE[6143] not valid!\n", __FUNCTION__);
 	}
 
 	// Step A: enable only (bit0), no sb_wr_enable yet — isolate which bit causes fault

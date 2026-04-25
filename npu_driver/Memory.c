@@ -168,6 +168,9 @@ NTSTATUS ApexPageTableMap(
 
     WdfSpinLockAcquire(pDevContext->PageTableLock);
 
+    DbgPrint("[MAP] HIB_ERROR before PTE loop = 0x%llx\n",
+        apex_read_register(pDevContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
+
     // Write page table entries to hardware
     for (i = 0; i < pageCount; i++) {
         physAddr.QuadPart = pfnArray[i] << PAGE_SHIFT;
@@ -184,12 +187,11 @@ NTSTATUS ApexPageTableMap(
         );
     }
 
-    // Enable translation
-    apex_write_register(
-        pDevContext->Bar2BaseAddress,
-        APEX_REG_TRANSLATION_ENABLE,
-        1
-    );
+    DbgPrint("[MAP] HIB_ERROR after PTE loop = 0x%llx\n",
+        apex_read_register(pDevContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
+
+    // MMU translation is activated by page_table_init=1 (written in ApexPageTableInit).
+    // There is no separate translation_enable register in Beagle hardware.
 
     WdfSpinLockRelease(pDevContext->PageTableLock);
 
