@@ -65,16 +65,25 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
         (UINT64)APEX_PAGE_TABLE_ENTRIES
     );
 
-    // APEX_REG_EXTENDED_TABLE stores the NUMBER OF SIMPLE ENTRIES (boundary value),
-    // NOT a boolean enable. Writing N means "entries [0..N-1] are simple (direct 4KB),
-    // entries [N..] are extended (2-level sub-table)."
-    // We want all 8192 entries to be simple → write 8192.
-    // (gasket driver: writeq(num_simple_entries, extended_offset_reg) = writeq(8192, 0x46008))
+    // extended_table = first extended entry index (libedgetpu: 6144).
+    // PTE[0..6143] = simple (direct 4KB), PTE[6144..8191] = extended (2-level).
     apex_write_register(
         pDevContext->Bar2BaseAddress,
         APEX_REG_EXTENDED_TABLE,
-        APEX_PAGE_TABLE_ENTRIES
+        6144
     );
+
+    // Zero-fill the entire hardware PTE array in BAR2 (0x50000 ~ 0x5FFFF, 8192 * 8 bytes).
+    // Previous driver session may have left dirty PTEs with valid bit=1,
+    // which causes inbound_page_fault when hardware walks unmapped VAs.
+    {
+        UINT32 j;
+        for (j = 0; j < APEX_PAGE_TABLE_ENTRIES; j++) {
+            apex_write_register(pDevContext->Bar2BaseAddress,
+                                APEX_REG_PAGE_TABLE + (j * 8), 0);
+        }
+        DbgPrint("[%s] Hardware PTE array cleared (8192 entries)\n", __FUNCTION__);
+    }
 
     // Create spinlock for page table access
     WDF_OBJECT_ATTRIBUTES_INIT(&lockAttributes);

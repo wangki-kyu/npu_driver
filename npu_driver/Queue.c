@@ -220,10 +220,28 @@ VOID npudriverEvtIoDeviceControl(
 			WdfSpinLockRelease(pDevContext->PageTableLock);
 		}
 
-		// Enable MMU translation (critical: must be enabled for PTE lookups to work)
+		// Enable MMU translation
 		apex_write_register(bar2, APEX_REG_TRANSLATION_ENABLE, 1);
-		DbgPrint("[%s] MMU translation enabled\n", __FUNCTION__);
 
+		// Set run controls now that bitstream is mapped (PTE[0..N] valid).
+		// Must NOT be set in PrepareHardware — bitstream isn't mapped yet at that point.
+		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,             1);
+		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,             1);
+		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL,      1);
+		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,            1);
+		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,         1);
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
+		apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
+		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
+		DbgPrint("[INFER] Run controls set\n");
+		
 		// Verify PTE writes actually stuck in hardware
 		{
 			UINT64 pte0  = apex_read_register(bar2, APEX_REG_PAGE_TABLE + 0);

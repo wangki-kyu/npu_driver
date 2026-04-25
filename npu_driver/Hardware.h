@@ -101,20 +101,24 @@
 #define APEX_REG_TILE_CONFIG0                0x48788  // beagle_csr_offsets.h: tileconfig0
 
 // ========== Instruction Queue ==========
-// Offsets from beagle_csr_offsets.h (libedgetpu)
-#define APEX_REG_INSTR_QUEUE_CONTROL         0x48568  // enable | sb_wr_enable (QueueControl CSR)
-#define APEX_REG_INSTR_QUEUE_INT_CONTROL     0x485c0  // interrupt control
-#define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (read to diagnose)
+// Offsets from beagle_csr_offsets.h (libedgetpu kBeagleInstructionQueueCsrOffsets)
+#define APEX_REG_INSTR_QUEUE_CONTROL         0x48568  // enable(bit0) | sb_wr_enable(bit2)
+#define APEX_REG_INSTR_QUEUE_STATUS          0x48570  // poll bit0==1 after writing CONTROL
+#define APEX_REG_INSTR_QUEUE_DESC_SIZE       0x48578  // descriptor size field
 #define APEX_REG_INSTR_QUEUE_BASE            0x48590  // ring buffer device VA
 #define APEX_REG_INSTR_QUEUE_STATUS_BLOCK    0x48598  // status block device VA
 #define APEX_REG_INSTR_QUEUE_SIZE            0x485a0  // ring capacity (# descriptors)
 #define APEX_REG_INSTR_QUEUE_TAIL            0x485a8  // cumulative descriptor count
 #define APEX_REG_INSTR_QUEUE_FETCHED_HEAD    0x485b0  // hw fetch progress
 #define APEX_REG_INSTR_QUEUE_COMPLETED_HEAD  0x485b8  // hw completion progress
+#define APEX_REG_INSTR_QUEUE_INT_CONTROL     0x485c0  // interrupt control
+#define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (write 0 to clear)
 
 // ========== Status & Debug ==========
 #define APEX_REG_OMC0_D0                    0x01a0d0  // Temperature sensor
-#define APEX_REG_USER_HIB_ERROR_STATUS      0x86f0   // Host Interface Block error
+#define APEX_REG_USER_HIB_ERROR_STATUS      0x486f0  // HIB error status (beagle_csr_offsets.h)
+#define APEX_REG_USER_HIB_ERROR_MASK        0x486f8  // HIB error mask
+#define APEX_REG_USER_HIB_FIRST_ERROR       0x48700  // HIB first error status
 #define APEX_REG_SCALAR_CORE_ERROR_STATUS   0x41a0   // Scalar Core error status
 #define APEX_REG_IDLEGENERATOR              0x4A000  // Idle state: 0xFFFFFFFF = all blocks idle
 

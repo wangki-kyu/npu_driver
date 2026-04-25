@@ -306,15 +306,8 @@ npudriverEvtDevicePrepareHardware(
 			__FUNCTION__, initHibError, initScError);
 	}
 
-	// Enable instruction queue: bit0=enable, bit2=sb_wr_enable (status block write).
-	// sb_wr_enable=1 is required for hardware to DMA-write completion info to the
-	// status block, which triggers the MSI-X interrupt on descriptor completion.
-	apex_write_register(deviceContext->Bar2BaseAddress,
-		APEX_REG_INSTR_QUEUE_CONTROL, 0x5);
-	DbgPrint("[%s] INSTR_QUEUE_CONTROL → 0x5 (enable + sb_wr_enable)\n", __FUNCTION__);
-
 	// Allocate descriptor ring (4KB = 256 slots * 16 bytes each)
-	// Maps to PTE slot 8190, device VA = 8190 * 4KB = 0x1FFE000
+	// Maps to PTE slot 6142 (last-2 simple entry), device VA = 6142 * 4KB = 0x17FE000
 	#pragma warning(push)
 	#pragma warning(disable:4996)
 	deviceContext->DescRingBase = ExAllocatePoolWithTag(NonPagedPoolNx, PAGE_SIZE, 'DRNG');
@@ -326,17 +319,22 @@ npudriverEvtDevicePrepareHardware(
 	RtlZeroMemory(deviceContext->DescRingBase, PAGE_SIZE);
 	{
 		PHYSICAL_ADDRESS descPhys = MmGetPhysicalAddress(deviceContext->DescRingBase);
-		deviceContext->DescRingDeviceVA = (UINT64)8190 * PAGE_SIZE;  // 0x1FFE000
+		deviceContext->DescRingDeviceVA = (UINT64)6142 * PAGE_SIZE;  // 0x17FE000
 		deviceContext->DescRingTail = 0;
 		apex_write_register(deviceContext->Bar2BaseAddress,
-			APEX_REG_PAGE_TABLE + (8190 * 8), descPhys.QuadPart | 1);
-		DbgPrint("[%s] DescRing: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[8190]=0x%llx\n",
-			__FUNCTION__, deviceContext->DescRingBase, descPhys.QuadPart,
-			deviceContext->DescRingDeviceVA, descPhys.QuadPart | 1);
+			APEX_REG_PAGE_TABLE + (6142 * 8), descPhys.QuadPart | 1);
+		{
+			UINT64 rb = apex_read_register(deviceContext->Bar2BaseAddress,
+				APEX_REG_PAGE_TABLE + (6142 * 8));
+			DbgPrint("[%s] DescRing: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[6142] write=0x%llx readback=0x%llx %s\n",
+				__FUNCTION__, deviceContext->DescRingBase, descPhys.QuadPart,
+				deviceContext->DescRingDeviceVA, descPhys.QuadPart | 1, rb,
+				(rb == (UINT64)(descPhys.QuadPart | 1)) ? "OK" : "MISMATCH");
+		}
 	}
 
 	// Allocate status block (4KB) — hardware DMA-writes completion info here
-	// Maps to PTE slot 8191, device VA = 8191 * 4KB = 0x1FFF000
+	// Maps to PTE slot 6143 (last simple entry), device VA = 6143 * 4KB = 0x17FF000
 	#pragma warning(push)
 	#pragma warning(disable:4996)
 	deviceContext->StatusBlockBase = ExAllocatePoolWithTag(NonPagedPoolNx, PAGE_SIZE, 'SBLK');
@@ -350,52 +348,89 @@ npudriverEvtDevicePrepareHardware(
 	RtlZeroMemory(deviceContext->StatusBlockBase, PAGE_SIZE);
 	{
 		PHYSICAL_ADDRESS sblkPhys = MmGetPhysicalAddress(deviceContext->StatusBlockBase);
-		deviceContext->StatusBlockDeviceVA = (UINT64)8191 * PAGE_SIZE;  // 0x1FFF000
+		deviceContext->StatusBlockDeviceVA = (UINT64)6143 * PAGE_SIZE;  // 0x17FF000
 		apex_write_register(deviceContext->Bar2BaseAddress,
-			APEX_REG_PAGE_TABLE + (8191 * 8), sblkPhys.QuadPart | 1);
-		DbgPrint("[%s] StatusBlock: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[8191]=0x%llx\n",
-			__FUNCTION__, deviceContext->StatusBlockBase, sblkPhys.QuadPart,
-			deviceContext->StatusBlockDeviceVA, sblkPhys.QuadPart | 1);
+			APEX_REG_PAGE_TABLE + (6143 * 8), sblkPhys.QuadPart | 1);
+		{
+			UINT64 rb = apex_read_register(deviceContext->Bar2BaseAddress,
+				APEX_REG_PAGE_TABLE + (6143 * 8));
+			DbgPrint("[%s] StatusBlock: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[6143] write=0x%llx readback=0x%llx %s\n",
+				__FUNCTION__, deviceContext->StatusBlockBase, sblkPhys.QuadPart,
+				deviceContext->StatusBlockDeviceVA, sblkPhys.QuadPart | 1, rb,
+				(rb == (UINT64)(sblkPhys.QuadPart | 1)) ? "OK" : "MISMATCH");
+		}
 	}
 
-	// Configure instruction queue hardware registers
+	// Signal page table initialization complete after writing PTE[8190/8191].
+	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_KERNEL_HIB_PAGE_TABLE_INIT, 1);
+	DbgPrint("[%s] PAGE_TABLE_INIT signaled\n", __FUNCTION__);
+
+	// Configure instruction queue CSRs (libedgetpu HostQueue::Open() step 5).
+	// BASE/SIZE/STATUS_BLOCK must be written BEFORE enabling CTRL.
 	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_BASE,         deviceContext->DescRingDeviceVA);
 	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_STATUS_BLOCK, deviceContext->StatusBlockDeviceVA);
 	apex_write_register(deviceContext->Bar2BaseAddress,
-		APEX_REG_INSTR_QUEUE_SIZE,         256);  // ring capacity = 256 descriptors
+		APEX_REG_INSTR_QUEUE_SIZE,         256);
 	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_TAIL,         0);
 	DbgPrint("[%s] Instruction queue configured: BASE=0x%llx STATUS_BLOCK=0x%llx SIZE=256 TAIL=0\n",
 		__FUNCTION__, deviceContext->DescRingDeviceVA, deviceContext->StatusBlockDeviceVA);
 
-	// Disable all breakpoints — default value is 0x0 which means "halt at VA 0x0",
-	// exactly where our bitstream starts. Must be set to unreachable address.
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_SCALAR_BREAKPOINT,        0xFFFFFFFFFFFFFFFF);
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_INFEED_BREAKPOINT,        0xFFFFFFFFFFFFFFFF);
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_OUTFEED_BREAKPOINT,       0xFFFFFFFFFFFFFFFF);
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_PARAMETER_POP_BREAKPOINT, 0xFFFFFFFFFFFFFFFF);
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_AVDATA_POP_BREAKPOINT,    0xFFFFFFFFFFFFFFFF);
+	// Enable MMU translation BEFORE queue enable.
+	// With TRANSLATION_ENABLE=0, hardware treats QUEUE_BASE (0x1FFE000) as a raw
+	// physical address and tries to DMA directly to that PA — which doesn't exist.
+	// With TRANSLATION_ENABLE=1, hardware walks PTE[8190/8191] to find the real PA.
+	// PTE array was zero-filled in ApexPageTableInit, so only [8190/8191] are valid.
+	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_TRANSLATION_ENABLE, 1);
+	DbgPrint("[%s] TRANSLATION_ENABLE → 1\n", __FUNCTION__);
+	{
+		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
+		DbgPrint("[%s] HIB_ERROR after TRANSLATION_ENABLE = 0x%llx\n", __FUNCTION__, hibChk);
+	}
 
-	// Set all run controls once at device open (per libedgetpu model).
-	// Engines enter running/ready state and wait for descriptors.
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCALAR_RUN_CONTROL,             1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_INFEED_RUN_CONTROL,             1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_PARAMETER_POP_RUN_CONTROL,      1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_OUTFEED_RUN_CONTROL,            1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AVDATA_POP_RUN_CONTROL,         1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_TILE_OP_RUN_CONTROL,            1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
-	DbgPrint("[%s] All run controls set, breakpoints disabled\n", __FUNCTION__);
+	// Step A: enable only (bit0), no sb_wr_enable yet — isolate which bit causes fault
+	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_CONTROL, 0x1);
+	DbgPrint("[%s] INSTR_QUEUE_CONTROL → 0x1 (enable only)\n", __FUNCTION__);
+	{
+		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
+		DbgPrint("[%s] HIB_ERROR after CTRL=0x1 = 0x%llx\n", __FUNCTION__, hibChk);
+	}
+
+	// Step B: add sb_wr_enable (bit2)
+	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_CONTROL, 0x5);
+	DbgPrint("[%s] INSTR_QUEUE_CONTROL → 0x5 (enable + sb_wr_enable)\n", __FUNCTION__);
+	{
+		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
+		DbgPrint("[%s] HIB_ERROR after CTRL=0x5 = 0x%llx\n", __FUNCTION__, hibChk);
+	}
+
+	// Poll queue_status (0x48570) until bit0==1 (libedgetpu step 7).
+	// Hardware must confirm enable before any TAIL writes are meaningful.
+	{
+		int retry;
+		for (retry = 0; retry < 200; retry++) {
+			UINT64 qs = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_STATUS);
+			if (qs & 1) {
+				DbgPrint("[%s] INSTR_QUEUE_STATUS = 0x%llx (enabled, %d tries)\n",
+					__FUNCTION__, qs, retry);
+				break;
+			}
+			KeStallExecutionProcessor(100);
+		}
+		if (retry >= 200) {
+			UINT64 qs = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_STATUS);
+			DbgPrint("[%s] WARNING: queue_status poll timeout STATUS=0x%llx\n", __FUNCTION__, qs);
+		}
+	}
+
+	// Run controls are NOT set here. libedgetpu DoOpen() does not set run controls
+	// at open time. Setting them here causes scalar core to start executing immediately
+	// before any bitstream is mapped (MAP_BUFFER happens later from userspace),
+	// which triggers inbound_page_fault on every PrepareHardware.
+	// Run controls are set per-inference in IOCTL_INFER after bitstream is mapped.
+	DbgPrint("[%s] Breakpoints disabled\n", __FUNCTION__);
 
 	// =====================================================================
 	// READBACK VERIFICATION — 실제로 레지스터에 뭐가 써있는지 확인
@@ -446,6 +481,12 @@ npudriverEvtDevicePrepareHardware(
 			if (hibErr64 & (1ULL<<9))  DbgPrint("[RB]   bit9 : instruction_queue_invalid\n");
 			if (hibErr64 & (1ULL<<13)) DbgPrint("[RB]   bit13: length_0_dma\n");
 			if (hibErr64 & (1ULL<<14)) DbgPrint("[RB]   bit14: virt_table_rdata_uncorr\n");
+
+			/* Faulting VA — only valid when bit0 (inbound_page_fault) is set */
+			if (hibErr64 & 1ULL) {
+				UINT64 firstErr = apex_read_register(b, APEX_REG_USER_HIB_FIRST_ERROR);
+				DbgPrint("[RB] HIB_FIRST_ERROR(0x48700) = 0x%016llx  (faulting device VA)\n", firstErr);
+			}
 		}
 
 		// SCU 상태 (cur_pwr_state bits[9:8] == 0이어야 active)

@@ -43,12 +43,12 @@ typedef struct _DEVICE_CONTEXT
 	// Inference 완료 동기화 (IOCTL이 대기, DPC가 signal)
 	KEVENT InferCompleteEvent;           // Event for inference completion
 
-	// Instruction queue descriptor ring (PTE slot 8190, deviceVA=0x1FFE000)
+	// Instruction queue descriptor ring (PTE slot 6142, deviceVA=0x17FE000)
 	PVOID   DescRingBase;        // kernel VA (NonPagedPoolNx, 4KB)
 	UINT64  DescRingDeviceVA;    // device virtual address seen by hardware
 	UINT32  DescRingTail;        // monotonic submitted descriptor count
 
-	// Status block (hardware DMA-writes completion info here, PTE slot 8191)
+	// Status block (hardware DMA-writes completion info here, PTE slot 6143)
 	PVOID   StatusBlockBase;     // kernel VA (NonPagedPoolNx, 4KB)
 	UINT64  StatusBlockDeviceVA; // device virtual address seen by hardware
 
