@@ -234,6 +234,16 @@ VOID npudriverEvtIoDeviceControl(
 		apex_write_register(bar2, APEX_REG_TILE_DEEP_SLEEP, 0x1E02ULL);
 		DbgPrint("[INFER] TILE_CONFIG0=0x7F TILE_DEEP_SLEEP=0x1E02\n");
 
+		// Disable all breakpoints — after GCB reset the default is 0, which means
+		// "halt at PC=0" and causes the scalar core to stop before executing one instruction.
+		apex_write_register(bar2, APEX_REG_SCALAR_BREAKPOINT,        0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_INFEED_BREAKPOINT,        0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_OUTFEED_BREAKPOINT,       0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_PARAMETER_POP_BREAKPOINT, 0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_AVDATA_POP_BREAKPOINT,    0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_TILE_OP_BREAKPOINT,       0xFFFFFFFFFFFFFFFFULL);
+		DbgPrint("[INFER] Breakpoints disabled (set to 0xFFFFFFFFFFFFFFFF)\n");
+
 		// Set run controls now that bitstream is mapped (PTE[0..N] valid).
 		// Must NOT be set in PrepareHardware — bitstream isn't mapped yet at that point.
 		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,             1);
@@ -339,6 +349,20 @@ VOID npudriverEvtIoDeviceControl(
 				// Chip completed inference but MSI-X interrupt was missed — succeed anyway
 				DbgPrint("[50MS] Chip completed (STATUS=0x%x) but interrupt missed — signalling success\n",
 					scRunStatus50ms);
+
+				// Diagnose why output might be zero: check outfeed and page fault
+				{
+					UINT32 outfeedSt  = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+					UINT32 infeedSt   = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
+					UINT64 hibErr     = apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
+					UINT64 firstErr   = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
+					DbgPrint("[50MS] OUTFEED_STATUS=0x%x INFEED_STATUS=0x%x\n", outfeedSt, infeedSt);
+					DbgPrint("[50MS] HIB_ERROR=0x%llx HIB_FIRST_ERROR(faulting VA)=0x%llx\n",
+						hibErr, firstErr);
+					if (hibErr & 1ULL)
+						DbgPrint("[50MS]   inbound_page_fault at device VA 0x%llx\n", firstErr);
+				}
+
 				if (pDevContext->InferInputMdl) {
 					MmUnlockPages(pDevContext->InferInputMdl);
 					IoFreeMdl(pDevContext->InferInputMdl);
