@@ -254,6 +254,11 @@ npudriverEvtDevicePrepareHardware(
 						   APEX_REG_SC_HOST_INTVECCTL, 0);
 		DbgPrint("[%s] SC_HOST_INTVECCTL set to route to MSI-X vector 0\n", __FUNCTION__);
 
+		// SC_HOST_INT_CONTROL: enable the SC_HOST completion interrupt source
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_SC_HOST_INT_CONTROL, 1);
+		DbgPrint("[%s] SC_HOST_INT_CONTROL → 1 (interrupt enabled)\n", __FUNCTION__);
+
 		// INSTR_QUEUE_INTVECCTL: route instruction queue interrupt to MSI-X vector 0
 		apex_write_register(deviceContext->Bar2BaseAddress,
 						   APEX_REG_INSTR_QUEUE_INTVECCTL, 0);

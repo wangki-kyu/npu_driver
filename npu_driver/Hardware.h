@@ -65,36 +65,38 @@
 #define APEX_REG_AVDATA_POP_BREAKPOINT      0x44160
 
 // ========== Tile Operation Control (Core Computation) ==========
-#define APEX_REG_TILE_OP_RUN_CONTROL        0x420c0
-#define APEX_REG_TILE_OP_RUN_STATUS         0x420e0
+// RUN_CONTROL: kBeagleTileCsrOffsets (0x40000 base) — WRITE only
+// RUN_STATUS:  kBeagleDebugTileCsrOffsets (0x42000 base) — READ only
+#define APEX_REG_TILE_OP_RUN_CONTROL        0x400c0  // write: Tile Config CSR
+#define APEX_REG_TILE_OP_RUN_STATUS         0x420e0  // read:  Tile Debug CSR
 #define APEX_REG_TILE_OP_BREAKPOINT         0x420d0
 #define APEX_REG_TILE_DEEP_SLEEP            0x42020  // Tile deep sleep delays
 
 // ========== Tile Internal Communication ==========
 // Narrow-to-Wide (N2W)
-#define APEX_REG_NARROW_TO_WIDE_RUN_CONTROL 0x42150
-#define APEX_REG_NARROW_TO_WIDE_RUN_STATUS  0x42158
+#define APEX_REG_NARROW_TO_WIDE_RUN_CONTROL 0x40150  // write: Tile Config CSR (was 0x42150 — WRONG)
+#define APEX_REG_NARROW_TO_WIDE_RUN_STATUS  0x42158  // read:  Tile Debug CSR
 
 // Wide-to-Narrow (W2N)
-#define APEX_REG_WIDE_TO_NARROW_RUN_CONTROL 0x42110
-#define APEX_REG_WIDE_TO_NARROW_RUN_STATUS  0x42118
+#define APEX_REG_WIDE_TO_NARROW_RUN_CONTROL 0x40110  // write: Tile Config CSR
+#define APEX_REG_WIDE_TO_NARROW_RUN_STATUS  0x42118  // read:  Tile Debug CSR
 
 // Mesh Bus (4 buses for inter-tile data transfer)
-#define APEX_REG_MESH_BUS0_RUN_CONTROL      0x42250
+#define APEX_REG_MESH_BUS0_RUN_CONTROL      0x40250  // write: Tile Config CSR
 #define APEX_REG_MESH_BUS0_RUN_STATUS       0x42258
-#define APEX_REG_MESH_BUS1_RUN_CONTROL      0x42298
+#define APEX_REG_MESH_BUS1_RUN_CONTROL      0x40298
 #define APEX_REG_MESH_BUS1_RUN_STATUS       0x422a0
-#define APEX_REG_MESH_BUS2_RUN_CONTROL      0x422e0
+#define APEX_REG_MESH_BUS2_RUN_CONTROL      0x402e0
 #define APEX_REG_MESH_BUS2_RUN_STATUS       0x422e8
-#define APEX_REG_MESH_BUS3_RUN_CONTROL      0x42328
+#define APEX_REG_MESH_BUS3_RUN_CONTROL      0x40328
 #define APEX_REG_MESH_BUS3_RUN_STATUS       0x42330
 
 // Ring Bus (Circular communication structure)
-#define APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL  0x42190
+#define APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL  0x40190  // write: Tile Config CSR
 #define APEX_REG_RING_BUS_CONSUMER0_RUN_STATUS   0x42198
-#define APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL  0x421d0
+#define APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL  0x401d0
 #define APEX_REG_RING_BUS_CONSUMER1_RUN_STATUS   0x421d8
-#define APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL   0x42210
+#define APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL   0x40210
 #define APEX_REG_RING_BUS_PRODUCER_RUN_STATUS    0x42218
 
 // Tile Configuration (HIB broadcast: writes go to all tiles simultaneously)
@@ -113,6 +115,9 @@
 #define APEX_REG_INSTR_QUEUE_COMPLETED_HEAD  0x485b8  // hw completion progress
 #define APEX_REG_INSTR_QUEUE_INT_CONTROL     0x485c0  // interrupt control
 #define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (write 0 to clear)
+
+// ========== SC_HOST Interrupt Control ==========
+#define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 1 = enable SC_HOST completion interrupt
 
 // ========== Status & Debug ==========
 #define APEX_REG_OMC0_D0                    0x01a0d0  // Temperature sensor
