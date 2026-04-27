@@ -23,5 +23,8 @@
     <ClInclude Include="..\include\apex_model.hpp">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="..\include\apex_model_fb.hpp">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>

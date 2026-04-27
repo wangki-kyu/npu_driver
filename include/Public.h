@@ -13,6 +13,17 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 #define IOCTL_INFER \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
 
+#define IOCTL_PARAM_CACHE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
+
+
+// parameter caching (Phase 1): load weights into on-chip SRAM via PARAMETER_CACHING executable
+typedef struct {
+    UINT64 ParamAddr;     // userspace VA of exe1.parameters() data
+    UINT64 ParamSize;     // size in bytes
+    UINT64 ParamDeviceVA; // device VA for PTE mapping (PageAlignUp(exe1_bitstream_size))
+    UINT64 BitstreamSize; // exe1 bitstream size (already mapped at device VA 0x0)
+} IOCTL_PARAM_CACHE_INFO;
 
 // model inference
 typedef struct IOCTL_INFER_INFO {
@@ -24,6 +35,9 @@ typedef struct IOCTL_INFER_INFO {
     UINT64 OutputDeviceVA;    // device VA for PTE registration (InputDeviceVA + PAGE_ALIGN_UP(InputImageSize))
     UINT64 BitstreamDeviceVA; // device VA of bitstream for Instr Queue descriptor (usually 0)
     UINT64 BitstreamSize;     // size of bitstream for Instr Queue descriptor
+    UINT64 ScratchAddr;       // userspace VA of scratch buffer (0 if not needed)
+    UINT64 ScratchSize;       // scratch size in bytes (0 if not needed)
+    UINT64 ScratchDeviceVA;   // device VA for scratch PTE registration
 } IOCTL_INFER_INFO;
 
 // IOCTL input/output structures

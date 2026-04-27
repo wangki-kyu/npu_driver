@@ -35,11 +35,18 @@ struct LayerInfo {
 };
 
 struct ApexModelFb {
+    // executable[0]: main inference (EXECUTION_ONLY or STAND_ALONE)
     std::vector<uint8_t>    bitstream;
     std::vector<FieldPatch> patches;
     std::vector<LayerInfo>  input_layers;
     std::vector<LayerInfo>  output_layers;
     size_t                  scratch_size_bytes;
+    size_t                  total_output_size_bytes; // sum of PageAlignUp(each output layer)
+
+    // executable[1]: parameter caching (PARAMETER_CACHING, may be empty)
+    std::vector<uint8_t>    param_bitstream;  // exe1 bitstream (~9KB)
+    std::vector<FieldPatch> param_patches;    // exe1 VA patches
+    std::vector<uint8_t>    parameters;       // exe1 raw parameter data (~6MB)
 };
 
 inline uint64_t PageAlignUp(uint64_t n) { return (n + 4095ULL) & ~4095ULL; }
@@ -125,6 +132,39 @@ inline ApexModelFb LoadModel(const std::string& path) {
         return {};
     }
     std::cout << "[LoadModel] executables count: " << execs_vec->size() << std::endl;
+
+    // 5a. Dump all executables (chip, name, sizes) before committing to [0]
+    for (uint32_t ei = 0; ei < execs_vec->size(); ei++) {
+        const auto* se = execs_vec->Get(ei);
+        if (!se) { std::cout << "[LoadModel] executable[" << ei << "] is null" << std::endl; continue; }
+        std::cout << "[LoadModel] executable[" << ei << "] raw size: " << se->size() << " bytes" << std::endl;
+        const auto* ex = ::flatbuffers::GetRoot<platforms::darwinn::Executable>(se->data());
+        if (!ex) { std::cout << "[LoadModel] executable[" << ei << "] parse failed" << std::endl; continue; }
+        std::cout << "[LoadModel] executable[" << ei << "] name=" << (ex->name() ? ex->name()->c_str() : "N/A")
+                  << " chip=" << (ex->chip() ? ex->chip()->c_str() : "N/A")
+                  << " scratch=" << ex->scratch_size_bytes() << "B" << std::endl;
+        const auto* ibs_v = ex->instruction_bitstreams();
+        if (ibs_v && ibs_v->size() > 0 && ibs_v->Get(0)) {
+            const auto* bs = ibs_v->Get(0)->bitstream();
+            std::cout << "[LoadModel] executable[" << ei << "] bitstream=" << (bs ? bs->size() : 0) << " bytes" << std::endl;
+        }
+        const auto* in_v = ex->input_layers();
+        if (in_v) for (uint32_t li = 0; li < in_v->size(); li++) {
+            const auto* l = in_v->Get(li);
+            if (l) std::cout << "[LoadModel] executable[" << ei << "] input[" << li << "]: "
+                             << (l->name() ? l->name()->c_str() : "?")
+                             << " " << l->y_dim() << "x" << l->x_dim() << "x" << l->z_dim()
+                             << " = " << l->size_bytes() << "B" << std::endl;
+        }
+        const auto* out_v = ex->output_layers();
+        if (out_v) for (uint32_t li = 0; li < out_v->size(); li++) {
+            const auto* l = out_v->Get(li);
+            if (l) std::cout << "[LoadModel] executable[" << ei << "] output[" << li << "]: "
+                             << (l->name() ? l->name()->c_str() : "?")
+                             << " " << l->y_dim() << "x" << l->x_dim() << "x" << l->z_dim()
+                             << " = " << l->size_bytes() << "B" << std::endl;
+        }
+    }
 
     // 5. Get first serialized executable
     std::cout << "[LoadModel] Step 5: Get executable[0]..." << std::endl;
@@ -249,20 +289,109 @@ inline ApexModelFb LoadModel(const std::string& path) {
         std::cout << "[LoadModel]   output_layers: none" << std::endl;
     }
 
+    // Compute total_output_size_bytes (sum of PageAlignUp of each output layer)
+    model.total_output_size_bytes = 0;
+    for (const auto& layer : model.output_layers)
+        model.total_output_size_bytes += PageAlignUp(layer.size_bytes);
+    std::cout << "[LoadModel] total_output_size_bytes: " << model.total_output_size_bytes << std::endl;
+
+    // 14. Parse executable[1] (PARAMETER_CACHING) if present
+    std::cout << "[LoadModel] Step 14: executable[1]..." << std::endl;
+    if (execs_vec->size() > 1) {
+        const auto* se1 = execs_vec->Get(1);
+        if (se1) {
+            const auto* ex1 = ::flatbuffers::GetRoot<platforms::darwinn::Executable>(se1->data());
+            if (ex1) {
+                const auto* ibs_vec1 = ex1->instruction_bitstreams();
+                if (ibs_vec1 && ibs_vec1->size() > 0) {
+                    const auto* ibs1 = ibs_vec1->Get(0);
+                    if (ibs1) {
+                        const auto* bs1 = ibs1->bitstream();
+                        if (bs1 && bs1->size() > 0)
+                            model.param_bitstream.assign(bs1->begin(), bs1->end());
+                        const auto* fo_vec1 = ibs1->field_offsets();
+                        if (fo_vec1) {
+                            for (uint32_t i = 0; i < fo_vec1->size(); i++) {
+                                const auto* fo = fo_vec1->Get(i);
+                                if (!fo || !fo->meta()) continue;
+                                FieldPatch p;
+                                p.offset_bit = fo->offset_bit();
+                                p.desc       = fo->meta()->desc();
+                                p.position   = fo->meta()->position();
+                                if (p.offset_bit / 8 + 4 <= (int32_t)model.param_bitstream.size())
+                                    model.param_patches.push_back(p);
+                            }
+                        }
+                    }
+                }
+                const auto* params = ex1->parameters();
+                if (params && params->size() > 0)
+                    model.parameters.assign(params->begin(), params->end());
+                std::cout << "[LoadModel] exe1 bitstream: " << model.param_bitstream.size()
+                          << " bytes, patches: " << model.param_patches.size()
+                          << ", parameters: " << model.parameters.size() << " bytes" << std::endl;
+            }
+        }
+    } else {
+        std::cout << "[LoadModel] No exe[1] (STAND_ALONE model)" << std::endl;
+    }
+
     std::cout << "[LoadModel] Done!" << std::endl;
     return model;
 }
 
-inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va) {
+// Dump all VA fields found in the bitstream patches (call after PatchVAs to see final values).
+// Prints INPUT, OUTPUT, PARAMETER, SCRATCH VAs and scratch_size_bytes.
+// PARAMETER should point into bitstream (0x0~bitstream_size); SCRATCH must be allocated & mapped.
+inline void DumpPatchedVAs(const ApexModelFb& model) {
+    using namespace platforms::darwinn;
+    uint64_t input_lo = 0, input_hi = 0;
+    uint64_t output_lo = 0, output_hi = 0;
+    uint64_t param_lo = 0, param_hi = 0;
+    uint64_t scratch_lo = 0, scratch_hi = 0;
+
+    for (const auto& p : model.patches) {
+        if (p.offset_bit / 8 + 4 > (int32_t)model.bitstream.size()) continue;
+        uint32_t val = 0;
+        std::memcpy(&val, model.bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+        bool lo = (p.position == Position_LOWER_32BIT);
+        switch (p.desc) {
+        case Description_BASE_ADDRESS_INPUT_ACTIVATION:
+            if (lo) input_lo = val; else input_hi = val; break;
+        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION:
+            if (lo) output_lo = val; else output_hi = val; break;
+        case Description_BASE_ADDRESS_PARAMETER:
+            if (lo) param_lo = val; else param_hi = val; break;
+        case Description_BASE_ADDRESS_SCRATCH:
+            if (lo) scratch_lo = val; else scratch_hi = val; break;
+        default: break;
+        }
+    }
+
+    auto va64 = [](uint64_t hi, uint64_t lo) { return (hi << 32) | lo; };
+    std::cout << std::hex << std::setfill('0');
+    std::cout << "  INPUT   VA: 0x" << std::setw(16) << va64(input_hi,   input_lo)   << std::endl;
+    std::cout << "  OUTPUT  VA: 0x" << std::setw(16) << va64(output_hi,  output_lo)  << std::endl;
+    std::cout << "  PARAM   VA: 0x" << std::setw(16) << va64(param_hi,   param_lo)   << std::endl;
+    std::cout << "  SCRATCH VA: 0x" << std::setw(16) << va64(scratch_hi, scratch_lo) << std::endl;
+    std::cout << std::dec;
+    std::cout << "  scratch_size_bytes: " << model.scratch_size_bytes << std::endl;
+    if (model.scratch_size_bytes > 0 && va64(scratch_hi, scratch_lo) == 0)
+        std::cout << "  WARNING: scratch_size > 0 but SCRATCH VA = 0 — scratch buffer not allocated/patched!" << std::endl;
+}
+
+inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
+                     uint64_t param_va = 0, uint64_t scratch_va = 0) {
     using namespace platforms::darwinn;
     for (const auto& p : model.patches) {
-        if (p.desc != Description_BASE_ADDRESS_INPUT_ACTIVATION &&
-            p.desc != Description_BASE_ADDRESS_OUTPUT_ACTIVATION) {
-            continue;
+        uint64_t va = 0;
+        switch (p.desc) {
+        case Description_BASE_ADDRESS_INPUT_ACTIVATION:  va = input_va;   break;
+        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: va = output_va;  break;
+        case Description_BASE_ADDRESS_PARAMETER:         va = param_va;   break;
+        case Description_BASE_ADDRESS_SCRATCH:           va = scratch_va; break;
+        default: continue;
         }
-
-        uint64_t va = (p.desc == Description_BASE_ADDRESS_INPUT_ACTIVATION)
-                      ? input_va : output_va;
 
         uint32_t val = (p.position == Position_LOWER_32BIT)
                        ? (uint32_t)(va & 0xFFFFFFFF)
@@ -270,6 +399,42 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va) 
 
         std::memcpy(model.bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
     }
+}
+
+// Patch exe1 (PARAMETER_CACHING) bitstream: write param_va into BASE_ADDRESS_PARAMETER fields.
+inline void PatchParamBitstreamVAs(ApexModelFb& model, uint64_t param_va) {
+    using namespace platforms::darwinn;
+    for (const auto& p : model.param_patches) {
+        if (p.offset_bit / 8 + 4 > (int32_t)model.param_bitstream.size()) continue;
+        uint64_t va = 0;
+        switch (p.desc) {
+        case Description_BASE_ADDRESS_PARAMETER: va = param_va; break;
+        default: continue;
+        }
+        uint32_t val = (p.position == Position_LOWER_32BIT)
+                       ? (uint32_t)(va & 0xFFFFFFFF)
+                       : (uint32_t)(va >> 32);
+        std::memcpy(model.param_bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
+    }
+}
+
+inline void DumpParamPatchedVAs(const ApexModelFb& model) {
+    using namespace platforms::darwinn;
+    uint64_t param_lo = 0, param_hi = 0;
+    for (const auto& p : model.param_patches) {
+        if (p.offset_bit / 8 + 4 > (int32_t)model.param_bitstream.size()) continue;
+        uint32_t val = 0;
+        std::memcpy(&val, model.param_bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+        bool lo = (p.position == Position_LOWER_32BIT);
+        if (p.desc == Description_BASE_ADDRESS_PARAMETER) {
+            if (lo) param_lo = val; else param_hi = val;
+        }
+    }
+    auto va64 = [](uint64_t hi, uint64_t lo) { return (hi << 32) | lo; };
+    std::cout << std::hex << std::setfill('0');
+    std::cout << "  [param exe] PARAMETER VA: 0x" << std::setw(16) << va64(param_hi, param_lo) << std::dec << std::endl;
+    std::cout << "  [param exe] bitstream: " << model.param_bitstream.size()
+              << " bytes, parameters: " << model.parameters.size() << " bytes" << std::endl;
 }
 
 } // namespace apex_fb

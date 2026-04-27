@@ -225,6 +225,22 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[%s] SCU_3 after power-state override: 0x%08x\n", __FUNCTION__, scu3After);
 	}
 
+	// Clear AXI quiesce — MUST happen after quit-reset, before run controls.
+	// If left set, scalar core cannot push DMA descriptors to INFEED/OUTFEED via
+	// internal AXI bus: engines do exactly ONE DMA (the pre-quiesce one) then halt at 0x4.
+	{
+		UINT32 aqBefore = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AXI_QUIESCE);
+		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x\n", __FUNCTION__, aqBefore);
+		apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AXI_QUIESCE, 0);
+		UINT32 aqAfter = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AXI_QUIESCE);
+		DbgPrint("[%s] AXI_QUIESCE after clear: 0x%08x\n", __FUNCTION__, aqAfter);
+	}
+
+	// Unpause DMA engines — the pause written before reset must be explicitly cleared.
+	// GCB reset may or may not clear this register; write 0 unconditionally.
+	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_DMA_PAUSE, 0);
+	DbgPrint("[%s] USER_HIB_DMA_PAUSE cleared (DMA unpaused)\n", __FUNCTION__);
+
 	DbgPrint("[%s] GCB reset/quit-reset sequence complete\n", __FUNCTION__);
 
 	// ExitReset step 4 (libedgetpu beagle_top_level_handler.cc::QuitReset):
@@ -263,6 +279,19 @@ npudriverEvtDevicePrepareHardware(
 		apex_write_register(deviceContext->Bar2BaseAddress,
 						   APEX_REG_INSTR_QUEUE_INTVECCTL, 0);
 		DbgPrint("[%s] INSTR_QUEUE_INTVECCTL → MSI-X vector 0\n", __FUNCTION__);
+
+		// INSTR_QUEUE_INT_CONTROL: enable IQ completion interrupt (host_queue.h:84-85).
+		// Without this, IQ_INT_STATUS stays 0 and WIRE_INT_PENDING never fires for IQ.
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_INSTR_QUEUE_INT_CONTROL, 1);
+		DbgPrint("[%s] INSTR_QUEUE_INT_CONTROL → 1 (IQ interrupt enabled)\n", __FUNCTION__);
+
+		// TOP_LEVEL_INTVECCTL: routes the aggregated WIRE_INT_PENDING signal to
+		// MSI-X vector 0. Without this, WIRE_INT_PENDING is set but no MSI-X
+		// write transaction is generated → ISR never called.
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_TOP_LEVEL_INTVECCTL, 0);
+		DbgPrint("[%s] TOP_LEVEL_INTVECCTL → MSI-X vector 0\n", __FUNCTION__);
 
 		// WIRE_INT_MASK: unmask all wire interrupts (value 0 = all unmasked)
 		apex_write_register(deviceContext->Bar2BaseAddress,
@@ -368,6 +397,7 @@ npudriverEvtDevicePrepareHardware(
 		APEX_REG_INSTR_QUEUE_DESC_SIZE,    16);  // sizeof(HOST_QUEUE_DESC) = 8+4+4
 	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_TAIL,         0);
+	deviceContext->DescRingTail = 0;  // sync sw counter with hw TAIL reset
 	DbgPrint("[%s] Instruction queue configured: BASE=0x%llx STATUS_BLOCK=0x%llx SIZE=256 DESC_SIZE=16 TAIL=0\n",
 		__FUNCTION__, deviceContext->DescRingDeviceVA, deviceContext->StatusBlockDeviceVA);
 
@@ -416,12 +446,61 @@ npudriverEvtDevicePrepareHardware(
 		}
 	}
 
-	// Run controls are NOT set here. libedgetpu DoOpen() does not set run controls
-	// at open time. Setting them here causes scalar core to start executing immediately
-	// before any bitstream is mapped (MAP_BUFFER happens later from userspace),
-	// which triggers inbound_page_fault on every PrepareHardware.
-	// Run controls are set per-inference in IOCTL_INFER after bitstream is mapped.
-	DbgPrint("[%s] Breakpoints disabled\n", __FUNCTION__);
+	// Initialize all cores (breakpoints, tile config, run controls).
+	// Per libedgetpu DoOpen(): run controls are set ONCE at device open time.
+	// SCALAR enters kRunning but waits for a descriptor before executing anything,
+	// so no bitstream access occurs here — no page fault risk.
+	// INFEED/AVDATA stay in kRunning idle-loop until scalar pushes commands.
+	// Per-inference run-control writes caused INFEED to halt before scalar could
+	// push its first command, producing the INFEED=0x4/SCALAR=0x1 deadlock.
+	{
+		PVOID bar2 = deviceContext->Bar2BaseAddress;
+
+		// Disable breakpoints — default after GCB reset is 0 = "halt at PC=0".
+		apex_write_register(bar2, APEX_REG_SCALAR_BREAKPOINT,        0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_INFEED_BREAKPOINT,        0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_OUTFEED_BREAKPOINT,       0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_PARAMETER_POP_BREAKPOINT, 0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_AVDATA_POP_BREAKPOINT,    0xFFFFFFFFFFFFFFFFULL);
+		apex_write_register(bar2, APEX_REG_TILE_OP_BREAKPOINT,       0xFFFFFFFFFFFFFFFFULL);
+		DbgPrint("[%s] Breakpoints disabled\n", __FUNCTION__);
+
+		// TILE_CONFIG0 broadcast to all 7 tile groups, poll for acknowledgment.
+		// Must happen before tile run controls (run_controller.cc:118-128).
+		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
+		{
+			int tci;
+			for (tci = 0; tci < 1000; tci++) {
+				if (apex_read_register(bar2, APEX_REG_TILE_CONFIG0) == 0x7F) break;
+				KeStallExecutionProcessor(10);
+			}
+			DbgPrint("[%s] TILE_CONFIG0=0x7F confirmed after %d polls\n", __FUNCTION__, tci);
+		}
+
+		// TILE_DEEP_SLEEP: to_sleep_delay=2, to_wake_delay=30 (libedgetpu value).
+		// Prevents SRAM access before wake stabilization (default 0x501 is too short).
+		apex_write_register(bar2, APEX_REG_TILE_DEEP_SLEEP, 0x1E02ULL);
+
+		// Run control sequence per libedgetpu run_controller.cc DoRunControl().
+		// Phase 1: scalar-side units (SCALAR first).
+		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,        1);
+		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    1);
+		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);
+		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,        1);
+		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       1);
+		// Phase 2: tile-side units.
+		apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
+		apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
+		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
+		DbgPrint("[%s] Run controls set (all units kRunning)\n", __FUNCTION__);
+	}
 
 	// =====================================================================
 	// READBACK VERIFICATION — 실제로 레지스터에 뭐가 써있는지 확인
@@ -479,6 +558,14 @@ npudriverEvtDevicePrepareHardware(
 				DbgPrint("[RB] HIB_FIRST_ERROR(0x48700) = 0x%016llx  (faulting device VA)\n", firstErr);
 			}
 		}
+
+		// AXI quiesce — must be 0 for scalar→DMA internal CSR writes to work
+		DbgPrint("[RB] AXI_QUIESCE         = 0x%08x  (기대 0x0)\n",
+			apex_read_register_32(b, APEX_REG_AXI_QUIESCE));
+
+		// DMA pause — must be 0 for DMA to operate after reset
+		DbgPrint("[RB] USER_HIB_DMA_PAUSE  = 0x%llx  (기대 0x0)\n",
+			apex_read_register(b, APEX_REG_USER_HIB_DMA_PAUSE));
 
 		// SCU 상태 (cur_pwr_state bits[9:8] == 0이어야 active)
 		{
@@ -626,6 +713,27 @@ npudriverEvtFileCleanup(
 
 		DbgPrint("[%s] Locked pages cleaned up successfully\n", __FUNCTION__);
 	}
+
+	if (deviceContext->InferInputMdl != NULL) {
+		DbgPrint("[%s] WARNING: InferInputMdl still locked at cleanup\n", __FUNCTION__);
+		MmUnlockPages(deviceContext->InferInputMdl);
+		IoFreeMdl(deviceContext->InferInputMdl);
+		deviceContext->InferInputMdl = NULL;
+	}
+
+	if (deviceContext->InferOutputMdl != NULL) {
+		DbgPrint("[%s] WARNING: InferOutputMdl still locked at cleanup\n", __FUNCTION__);
+		MmUnlockPages(deviceContext->InferOutputMdl);
+		IoFreeMdl(deviceContext->InferOutputMdl);
+		deviceContext->InferOutputMdl = NULL;
+	}
+
+	if (deviceContext->InferScratchMdl != NULL) {
+		DbgPrint("[%s] WARNING: InferScratchMdl still locked at cleanup\n", __FUNCTION__);
+		MmUnlockPages(deviceContext->InferScratchMdl);
+		IoFreeMdl(deviceContext->InferScratchMdl);
+		deviceContext->InferScratchMdl = NULL;
+	}
 }
 
 // Coral
@@ -696,6 +804,13 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 		IoFreeMdl(pDevContext->InferOutputMdl);
 		pDevContext->InferOutputMdl = NULL;
 		DbgPrint("[%s] Output MDL unlocked\n", __FUNCTION__);
+	}
+
+	if (pDevContext->InferScratchMdl != NULL) {
+		MmUnlockPages(pDevContext->InferScratchMdl);
+		IoFreeMdl(pDevContext->InferScratchMdl);
+		pDevContext->InferScratchMdl = NULL;
+		DbgPrint("[%s] Scratch MDL unlocked\n", __FUNCTION__);
 	}
 
 	KeSetEvent(&pDevContext->InferCompleteEvent, IO_NO_INCREMENT, FALSE);

@@ -39,6 +39,7 @@ typedef struct _DEVICE_CONTEXT
 	// Inference MDL tracking (DPC에서 unlock)
 	PMDL InferInputMdl;                  // MDL for input image pages
 	PMDL InferOutputMdl;                 // MDL for output buffer pages
+	PMDL InferScratchMdl;                // MDL for scratch buffer pages
 
 	// Inference 완료 동기화 (IOCTL이 대기, DPC가 signal)
 	KEVENT InferCompleteEvent;           // Event for inference completion

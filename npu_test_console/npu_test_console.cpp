@@ -200,19 +200,109 @@ int main()
     std::cout << "Field patches to apply: " << model.patches.size() << std::endl;
     std::cout << "Input layer: " << model.input_layers[0].name << " (size: " << model.input_layers[0].size_bytes << " bytes)" << std::endl;
     std::cout << "Output layer: " << model.output_layers[0].name << " (size: " << model.output_layers[0].size_bytes << " bytes)" << std::endl;
+    
 
-    // 2. Calculate device VAs (input after bitstream, output after input)
-    const size_t INPUT_SIZE  = model.input_layers[0].size_bytes;
-    const size_t OUTPUT_SIZE = model.output_layers[0].size_bytes;
-    uint64_t input_va  = apex_fb::PageAlignUp(model.bitstream.size());
-    uint64_t output_va = input_va + apex_fb::PageAlignUp(INPUT_SIZE);
+    DWORD bytesReturned = 0;
 
-    std::cout << "Input device VA:  0x" << std::hex << input_va << std::dec << std::endl;
-    std::cout << "Output device VA: 0x" << std::hex << output_va << std::dec << std::endl;
+    // Phase 1: Parameter caching — load weights into on-chip SRAM via PARAMETER_CACHING executable
+    if (!model.param_bitstream.empty() && !model.parameters.empty()) {
+        std::cout << "\n--- Phase 1: Parameter Caching ---" << std::endl;
 
-    // 3. Patch bitstream with device VAs
-    std::cout << "Patching bitstream..." << std::endl;
-    apex_fb::PatchVAs(model, input_va, output_va);
+        // param_va: device VA for parameters data, immediately after exe1 bitstream
+        uint64_t param_va = apex_fb::PageAlignUp(model.param_bitstream.size());
+        apex_fb::PatchParamBitstreamVAs(model, param_va);
+        std::cout << "exe1 bitstream patched:" << std::endl;
+        apex_fb::DumpParamPatchedVAs(model);
+
+        void* pParamBitstreamBuf = AllocateAlignedMemory(model.param_bitstream.size(), 4096);
+        void* pParametersBuf     = AllocateAlignedMemory(model.parameters.size(), 4096);
+
+        if (pParamBitstreamBuf == nullptr || pParametersBuf == nullptr) {
+            std::cout << "Failed to allocate Phase 1 buffers" << std::endl;
+            if (pParamBitstreamBuf) FreeAlignedMemory(pParamBitstreamBuf);
+            if (pParametersBuf)     FreeAlignedMemory(pParametersBuf);
+            CloseHandle(handle);
+            CoUninitialize();
+            return 1;
+        }
+
+        memcpy(pParamBitstreamBuf, model.param_bitstream.data(), model.param_bitstream.size());
+        memcpy(pParametersBuf, model.parameters.data(), model.parameters.size());
+        std::cout << "Phase 1 buffers: bitstream=" << model.param_bitstream.size()
+                  << "B  parameters=" << model.parameters.size() << "B" << std::endl;
+
+        // Map exe1 bitstream at device VA 0x0
+        MAP_BUFFER_INPUT mapP1 = {};
+        mapP1.UserAddress = (UINT64)pParamBitstreamBuf;
+        mapP1.Size = model.param_bitstream.size();
+        bool p1Ok = DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapP1, sizeof(MAP_BUFFER_INPUT),
+                                    nullptr, 0, &bytesReturned, nullptr) != 0;
+        if (!p1Ok) {
+            std::cout << "Phase 1 IOCTL_MAP_BUFFER failed: " << GetLastError() << std::endl;
+            FreeAlignedMemory(pParametersBuf);
+            FreeAlignedMemory(pParamBitstreamBuf);
+            CloseHandle(handle);
+            CoUninitialize();
+            return 1;
+        }
+        std::cout << "Phase 1: exe1 bitstream mapped at device VA 0x0" << std::endl;
+
+        // Run PARAMETER_CACHING: kernel locks params, writes PTEs, submits IQ, polls done
+        IOCTL_PARAM_CACHE_INFO pci = {};
+        pci.ParamAddr     = (UINT64)pParametersBuf;
+        pci.ParamSize     = model.parameters.size();
+        pci.ParamDeviceVA = param_va;
+        pci.BitstreamSize = model.param_bitstream.size();
+        p1Ok = DeviceIoControl(handle, IOCTL_PARAM_CACHE, &pci, sizeof(IOCTL_PARAM_CACHE_INFO),
+                               nullptr, 0, &bytesReturned, nullptr) != 0;
+        std::cout << (p1Ok ? "IOCTL_PARAM_CACHE succeeded! Weights loaded into SRAM."
+                           : "IOCTL_PARAM_CACHE FAILED!") << std::endl;
+        if (!p1Ok) std::cout << "  error: " << GetLastError() << std::endl;
+
+        // Unmap exe1 bitstream (clears PTE[0..N1])
+        UNMAP_BUFFER_INPUT unmapP1 = {};
+        unmapP1.DeviceAddress = 0;
+        unmapP1.Size = model.param_bitstream.size();
+        DeviceIoControl(handle, IOCTL_UNMAP_BUFFER, &unmapP1, sizeof(UNMAP_BUFFER_INPUT),
+                        nullptr, 0, &bytesReturned, nullptr);
+
+        FreeAlignedMemory(pParametersBuf);
+        FreeAlignedMemory(pParamBitstreamBuf);
+
+        if (!p1Ok) {
+            CloseHandle(handle);
+            CoUninitialize();
+            return 1;
+        }
+        std::cout << "--- Phase 1 Complete ---\n" << std::endl;
+    } else {
+        std::cout << "No parameter caching needed (STAND_ALONE model)" << std::endl;
+    }
+
+    // 2. Calculate device VAs
+    //    Layout: [bitstream@0x0] [input@input_va] [output@output_va] [scratch@scratch_va]
+    const size_t INPUT_SIZE   = model.input_layers[0].size_bytes;
+    const size_t OUTPUT_SIZE  = model.total_output_size_bytes;  // all output layers, page-aligned
+    const size_t SCRATCH_SIZE = model.scratch_size_bytes;
+    uint64_t input_va   = apex_fb::PageAlignUp(model.bitstream.size());
+    uint64_t output_va  = input_va  + apex_fb::PageAlignUp(INPUT_SIZE);
+    uint64_t scratch_va = (SCRATCH_SIZE > 0)
+                          ? output_va + apex_fb::PageAlignUp(OUTPUT_SIZE)
+                          : 0;
+
+    std::cout << "Input device VA:   0x" << std::hex << input_va   << std::dec << std::endl;
+    std::cout << "Output device VA:  0x" << std::hex << output_va  << std::dec << std::endl;
+    std::cout << "Scratch device VA: 0x" << std::hex << scratch_va << std::dec
+              << " (size=" << SCRATCH_SIZE << ")" << std::endl;
+
+    // 3. Patch bitstream with all device VAs (must happen before MAP)
+    std::cout << "--- VA map (before patch) ---" << std::endl;
+    apex_fb::DumpPatchedVAs(model);
+
+    apex_fb::PatchVAs(model, input_va, output_va, 0, scratch_va);
+
+    std::cout << "--- VA map (after patch) ---" << std::endl;
+    apex_fb::DumpPatchedVAs(model);
     std::cout << "Bitstream patched successfully" << std::endl;
 
     // 4. Allocate page-aligned buffer and copy patched bitstream
@@ -231,8 +321,6 @@ int main()
     MAP_BUFFER_INPUT mapInput;
     mapInput.UserAddress = (UINT64)pModelBuffer;
     mapInput.Size = model.bitstream.size();
-
-    DWORD bytesReturned = 0;
 
     std::cout << "Mapping model buffer..." << std::endl;
     BOOL result = DeviceIoControl(
@@ -254,25 +342,35 @@ int main()
     }
     std::cout << "IOCTL_MAP_BUFFER succeeded!" << std::endl;
 
-    // 6. Allocate input image and output buffer
-    void* pImageBuf  = AllocateAlignedMemory(INPUT_SIZE, 4096);
-    void* pOutputBuf = AllocateAlignedMemory(OUTPUT_SIZE, 4096);
+    // 6. Allocate input image, output buffer, and scratch buffer
+    void* pImageBuf   = AllocateAlignedMemory(INPUT_SIZE, 4096);
+    void* pOutputBuf  = AllocateAlignedMemory(OUTPUT_SIZE, 4096);
+    void* pScratchBuf = (SCRATCH_SIZE > 0) ? AllocateAlignedMemory(SCRATCH_SIZE, 4096) : nullptr;
 
-    if (pImageBuf == nullptr || pOutputBuf == nullptr) {
-        std::cout << "Failed to allocate image/output buffers" << std::endl;
-        if (pImageBuf) FreeAlignedMemory(pImageBuf);
-        if (pOutputBuf) FreeAlignedMemory(pOutputBuf);
+    if (pImageBuf == nullptr || pOutputBuf == nullptr ||
+        (SCRATCH_SIZE > 0 && pScratchBuf == nullptr)) {
+        std::cout << "Failed to allocate image/output/scratch buffers" << std::endl;
+        if (pImageBuf)   FreeAlignedMemory(pImageBuf);
+        if (pOutputBuf)  FreeAlignedMemory(pOutputBuf);
+        if (pScratchBuf) FreeAlignedMemory(pScratchBuf);
         FreeAlignedMemory(pModelBuffer);
         CloseHandle(handle);
         return 1;
+    }
+
+    if (pScratchBuf) {
+        memset(pScratchBuf, 0, SCRATCH_SIZE);
+        std::cout << "Scratch buffer allocated at 0x" << std::hex << (UINT64)pScratchBuf
+                  << std::dec << " size: " << SCRATCH_SIZE << " bytes" << std::endl;
     }
 
     // Load real image
     std::cout << "Loading image from assets/aespa.jpg..." << std::endl;
     if (!LoadJpegToRGB(L".\\assets\\aespa.jpg", pImageBuf, 320, 320)) {
         std::cout << "Failed to load image" << std::endl;
-        FreeAlignedMemory(pImageBuf);
+        if (pScratchBuf) FreeAlignedMemory(pScratchBuf);
         FreeAlignedMemory(pOutputBuf);
+        FreeAlignedMemory(pImageBuf);
         FreeAlignedMemory(pModelBuffer);
         CloseHandle(handle);
         CoUninitialize();
@@ -294,8 +392,11 @@ int main()
     inferInput.OutputBufferSize  = OUTPUT_SIZE;
     inferInput.InputDeviceVA     = input_va;
     inferInput.OutputDeviceVA    = output_va;
-    inferInput.BitstreamDeviceVA = 0;  // Bitstream is at device VA 0x0
+    inferInput.BitstreamDeviceVA = 0;
     inferInput.BitstreamSize     = model.bitstream.size();
+    inferInput.ScratchAddr       = (UINT64)pScratchBuf;
+    inferInput.ScratchSize       = SCRATCH_SIZE;
+    inferInput.ScratchDeviceVA   = scratch_va;
 
     result = DeviceIoControl(
         handle,
@@ -313,6 +414,29 @@ int main()
     }
     else {
         std::cout << "IOCTL_INFER failed: " << GetLastError() << std::endl;
+    }
+
+    // Output buffer dump — check if TPU wrote anything regardless of timeout
+    {
+        const uint8_t* out = reinterpret_cast<const uint8_t*>(pOutputBuf);
+        const size_t dumpBytes = std::min(OUTPUT_SIZE, (size_t)64);
+
+        // Count non-zero bytes in the full output
+        size_t nonZero = 0;
+        for (size_t i = 0; i < OUTPUT_SIZE; i++)
+            if (out[i] != 0) nonZero++;
+
+        std::cout << "\n--- Output buffer (" << OUTPUT_SIZE << " bytes, "
+                  << nonZero << " non-zero) ---" << std::endl;
+
+        // Hex dump of first 64 bytes
+        std::cout << std::hex << std::setfill('0');
+        for (size_t i = 0; i < dumpBytes; i++) {
+            if (i % 16 == 0) std::cout << "  [" << std::setw(4) << i << "] ";
+            std::cout << std::setw(2) << (int)out[i] << " ";
+            if (i % 16 == 15) std::cout << "\n";
+        }
+        std::cout << std::dec << std::endl;
     }
 
     // 8. Unmap buffer
@@ -342,6 +466,7 @@ int main()
     // Cleanup
     FreeAlignedMemory(pImageBuf);
     FreeAlignedMemory(pOutputBuf);
+    if (pScratchBuf) FreeAlignedMemory(pScratchBuf);
     FreeAlignedMemory(pModelBuffer);
     CloseHandle(handle);
     CoUninitialize();

@@ -126,6 +126,7 @@
 #define APEX_REG_USER_HIB_FIRST_ERROR       0x48700  // HIB first error status
 #define APEX_REG_SCALAR_CORE_ERROR_STATUS   0x41a0   // Scalar Core error status
 #define APEX_REG_IDLEGENERATOR              0x4A000  // Idle state: 0xFFFFFFFF = all blocks idle
+#define APEX_REG_INFEED_PAGE_FAULT_ADDR     0x48738  // VA that triggered last INFEED MMU page fault
 
 // ========== User HIB DMA Pause (GCB 리셋 전후 DMA 일시정지 제어) ==========
 #define APEX_REG_USER_HIB_DMA_PAUSE     0x486D8  // write 1=pause, 0=unpause
