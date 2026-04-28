@@ -56,6 +56,17 @@ typedef struct _DEVICE_CONTEXT
 	UINT32  CachedParamPteIdx;           // First PTE index for params
 	UINT32  CachedParamPageCount;        // Number of param pages
 
+	// Cached PARAM_CACHE bitstream — kept mapped so IOCTL_INFER_WITH_PARAM can
+	// re-enqueue it back-to-back with the INFER bitstream in the same IQ batch.
+	// This is libedgetpu's pattern: PARAM_CACHE descriptor is submitted at every
+	// inference to "activate" the cached params; engines have no idle gap between
+	// the two bitstreams so they never auto-halt.
+	PMDL    CachedParamBitstreamMdl;     // MDL for locked param-bitstream pages
+	UINT64  CachedParamBitstreamDeviceVA;// device VA where the bitstream is mapped (typically 0x0)
+	UINT32  CachedParamBitstreamSize;    // bitstream size in bytes (e.g. 0x2650)
+	UINT32  CachedParamBitstreamPteIdx;  // First PTE index for the bitstream
+	UINT32  CachedParamBitstreamPageCount;// Number of pages occupied by the bitstream
+
 	// Inference 완료 동기화 (IOCTL이 대기, DPC가 signal)
 	KEVENT InferCompleteEvent;           // Event for inference completion
 

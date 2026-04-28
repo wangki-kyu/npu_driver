@@ -210,9 +210,11 @@ int main()
     // parameter buffer 를 참조함). Phase 1 가 없는 STAND_ALONE 모델에서는 0.
     uint64_t param_va = 0;
     void* pParametersBuf = nullptr;  // INFER 동안 살아있어야 함 (kernel MDL pinned)
+    bool useInferWithParam = false;  // Phase 1 가 있으면 IOCTL_INFER_WITH_PARAM 사용
 
     // Phase 1: Parameter caching — load weights into on-chip cache via PARAMETER_CACHING executable
     if (!model.param_bitstream.empty() && !model.parameters.empty()) {
+        useInferWithParam = true;
         std::cout << "\n--- Phase 1: Parameter Caching ---" << std::endl;
 
         // param_va: device VA for parameters data, immediately after exe1 bitstream
@@ -271,16 +273,11 @@ int main()
                            : "IOCTL_PARAM_CACHE FAILED!") << std::endl;
         if (!p1Ok) std::cout << "  error: " << GetLastError() << std::endl;
 
-        // Unmap exe1 bitstream (clears PTE[0..N1]) — params 는 여전히 PTE[N..]에 살아있음
-        UNMAP_BUFFER_INPUT unmapP1 = {};
-        unmapP1.DeviceAddress = 0;
-        unmapP1.Size = model.param_bitstream.size();
-        DeviceIoControl(handle, IOCTL_UNMAP_BUFFER, &unmapP1, sizeof(UNMAP_BUFFER_INPUT),
-                        nullptr, 0, &bytesReturned, nullptr);
-
-        FreeAlignedMemory(pParamBitstreamBuf);
-        // pParametersBuf 는 INFER 끝나고 free — kernel MDL 이 물리 페이지를 핀하고 있어도
-        // user-space VA 를 살려두는 게 안전.
+        // NOTE: Driver retains the PARAM bitstream (PTE[0..N1]) and its MDL after
+        // IOCTL_PARAM_CACHE — IOCTL_INFER_WITH_PARAM re-enqueues that descriptor
+        // back-to-back with INFER each call (libedgetpu pattern). DO NOT call
+        // IOCTL_UNMAP_BUFFER on the PARAM bitstream here, and DO NOT free the
+        // user buffer (driver MDL pins those pages until file handle close).
 
         if (!p1Ok) {
             FreeAlignedMemory(pParametersBuf);
@@ -410,8 +407,13 @@ int main()
     std::cout << "Image buffer allocated at 0x" << std::hex << (UINT64)pImageBuf << std::dec << std::endl;
     std::cout << "Output buffer allocated at 0x" << std::hex << (UINT64)pOutputBuf << std::dec << std::endl;
 
-    // 7. Call IOCTL_INFER
-    std::cout << "Calling IOCTL_INFER..." << std::endl;
+    // 7. Call IOCTL_INFER (or IOCTL_INFER_WITH_PARAM if Phase 1 ran).
+    //    INFER_WITH_PARAM tells the driver to enqueue the cached PARAM bitstream
+    //    descriptor immediately before INFER in the same IQ batch — libedgetpu
+    //    pattern that prevents engine auto-halt between PARAM_CACHE and INFER.
+    DWORD inferIoctl = useInferWithParam ? IOCTL_INFER_WITH_PARAM : IOCTL_INFER;
+    std::cout << "Calling " << (useInferWithParam ? "IOCTL_INFER_WITH_PARAM" : "IOCTL_INFER")
+              << "..." << std::endl;
     IOCTL_INFER_INFO inferInput = {};
     inferInput.InputImageAddr    = (UINT64)pImageBuf;
     inferInput.InputImageSize    = INPUT_SIZE;
@@ -427,7 +429,7 @@ int main()
 
     result = DeviceIoControl(
         handle,
-        IOCTL_INFER,
+        inferIoctl,
         &inferInput,
         sizeof(IOCTL_INFER_INFO),
         nullptr,
@@ -437,10 +439,10 @@ int main()
     );
 
     if (result) {
-        std::cout << "IOCTL_INFER succeeded!" << std::endl;
+        std::cout << "INFER succeeded!" << std::endl;
     }
     else {
-        std::cout << "IOCTL_INFER failed: " << GetLastError() << std::endl;
+        std::cout << "INFER failed: " << GetLastError() << std::endl;
     }
 
     // Output buffer dump — check if TPU wrote anything regardless of timeout

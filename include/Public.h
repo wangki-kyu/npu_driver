@@ -16,6 +16,14 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 #define IOCTL_PARAM_CACHE \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
 
+// Inference using a previously cached PARAM_CACHE bitstream. Driver enqueues
+// PARAM_CACHE descriptor + INFER descriptor back-to-back into the same IQ
+// batch (libedgetpu pattern) so the chip's INFEED/PARAM engines never see an
+// idle gap and never enter kHalted between the two. Same input struct as
+// IOCTL_INFER — driver pulls the param bitstream addr/size from device context.
+#define IOCTL_INFER_WITH_PARAM \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
+
 
 // parameter caching (Phase 1): load weights into on-chip SRAM via PARAMETER_CACHING executable
 typedef struct {

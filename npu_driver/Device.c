@@ -173,6 +173,28 @@ npudriverEvtDevicePrepareHardware(
 		return status;
 	}
 
+	// =================================================================
+	// SCU_CTRL_0: clear inactive PHY mode bits.
+	//   bits[10:8]  rg_pcie_inact_phy_mode (3 bits)  -> 0
+	//   bits[13:11] rg_usb_inact_phy_mode  (3 bits)  -> 0
+	// libedgetpu BeagleTopLevelHandler::Open() does this as the very first
+	// chip access. Without it, PCIe/USB PHY can stay in dormant mode and the
+	// chip's SCU silently rejects subsequent CSR writes (notably RUN_CONTROL).
+	// This is the missing step that explains why RUN_STATUS stays at 0
+	// across all engines after our PrepareHardware writes.
+	// =================================================================
+	{
+		UINT32 scu0Before = apex_read_register_32(deviceContext->Bar2BaseAddress,
+			APEX_REG_SCU_CTRL_0);
+		// Clear bits 8..13 (mask = 0x3F00 in lower 16 bits)
+		UINT32 scu0After = scu0Before & ~((UINT32)0x3F00);
+		apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_CTRL_0, scu0After);
+		UINT32 scu0Verify = apex_read_register_32(deviceContext->Bar2BaseAddress,
+			APEX_REG_SCU_CTRL_0);
+		DbgPrint("[%s] SCU_CTRL_0 PHY-mode clear: before=0x%08x after-write=0x%08x readback=0x%08x\n",
+			__FUNCTION__, scu0Before, scu0After, scu0Verify);
+	}
+
 	// Pre-reset: GCB 리셋 전에 반드시 수행해야 하는 HIB 엔진 초기화.
 	// 공식 coral.sys 분석 결과 이 시퀀스 없이는 처리 클럭 도메인이 게이팅된 채 유지되어
 	// TILE_CONFIG0 쓰기가 적용되지 않고 모든 RUN_STATUS가 0에서 변하지 않음.
@@ -283,36 +305,68 @@ npudriverEvtDevicePrepareHardware(
 		}
 	}
 
-	// rg_pwr_state_ovr SCU_3[27:26] = 0b10 (active, no clock gating override)
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x2, 2, 26);
+	// rg_pwr_state_ovr SCU_3[27:26] — 0x3 = all low-power modes disabled (max active).
+	// libedgetpu uses 0x2 if hw_clock_gating allowed, 0x3 if not. We set 0x3 so chip
+	// can never drop into Inactive or Sleep mode regardless of external triggers —
+	// keeps RUN_CONTROL writes effective and AXI bus alive.
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x3, 2, 26);
 	{
 		UINT32 scu3After = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
-		DbgPrint("[%s] SCU_3 after power-state override: 0x%08x\n", __FUNCTION__, scu3After);
+		DbgPrint("[%s] SCU_3 after power-state override (0x3=all-modes-off): 0x%08x\n",
+			__FUNCTION__, scu3After);
 	}
 
-	// Clear AXI quiesce — proper bit-precise RMW.
-	// Observation: blind whole-register write of 0 left bit 21 (0x00200000) stuck.
-	// gasket-driver does `gasket_read_modify_write_32(AXI_QUIESCE, 0x0, 1, 16)` —
-	// only bit 16 (axi_quiesce_request) is software-writable. Bit 21 is a STATUS
-	// mirror that follows bit 16 once SCU_2 rg_gated_gcb is 0x2 (force clock on).
-	// libedgetpu's DisableHardwareClockGate writes rg_gated_gcb=0x2 — NOT 0x0
-	// (which is "deprecated" per beagle_top_level_handler.cc:69, undefined behavior).
+	// Clear AXI quiesce — libedgetpu's two-step DisableSoftwareClockGate +
+	// DisableHardwareClockGate sequence (mmio_driver.cc DoOpen lines 4 & 5).
+	//
+	// Step A (DisableSoftwareClockGate):
+	//   SCU_2 bits[19:18] = 0  (rg_gated_gcb = no gating, normal mode)
+	//   AXI_QUIESCE bit 16   = 0
+	// Step B (DisableHardwareClockGate, after Step A):
+	//   SCU_2 bits[19:18] = 2  (rg_gated_gcb = force clock on, override gating)
+	//
+	// Going straight to bits=2 (as we did before) skips the "no gating" intermediate
+	// state and the chip's AXI logic doesn't release bit 21 (axi_quiesced status).
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
 		UINT32 aq0 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x\n", __FUNCTION__, aq0);
+		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x (bit21=%u bit16=%u)\n",
+			__FUNCTION__, aq0, (aq0 >> 21) & 1, (aq0 >> 16) & 1);
 
-		// Step 1: ensure rg_gated_gcb = 0x2 (force clock on), libedgetpu-style.
-		apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x2, 2, 18);
+		// Step A1: SCU_2 bits[19:18] = 0 (DisableSoftwareClockGate)
+		apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x0, 2, 18);
 		KeStallExecutionProcessor(100);
 
-		// Step 2: clear bit 16 of AXI_QUIESCE (axi_quiesce_request).
+		// Step A2: AXI_QUIESCE bit 16 = 0 (clear quiesce request)
 		apex_rmw_register_32(bar2, APEX_REG_AXI_QUIESCE, 0x0, 1, 16);
 		KeStallExecutionProcessor(100);
 
-		UINT32 aq1 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE after rg_gated_gcb=0x2 + bit16=0: 0x%08x\n",
-			__FUNCTION__, aq1);
+		UINT32 aqA = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+		DbgPrint("[%s] AXI_QUIESCE after Step A (gate=0, bit16=0): 0x%08x (bit21=%u)\n",
+			__FUNCTION__, aqA, (aqA >> 21) & 1);
+
+		// Step B: SCU_2 bits[19:18] = 2 (DisableHardwareClockGate, force on)
+		apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x2, 2, 18);
+		KeStallExecutionProcessor(100);
+
+		// Poll bit 21 to clear (axi_quiesced status follows axi_quiesce_request after
+		// clock gating is fully disabled).
+		{
+			int t;
+			for (t = 0; t < 1000; t++) {
+				UINT32 aq = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+				if ((aq & (1u << 21)) == 0) {
+					DbgPrint("[%s] AXI_QUIESCE bit 21 cleared after %d polls (val=0x%08x)\n",
+						__FUNCTION__, t, aq);
+					break;
+				}
+				KeStallExecutionProcessor(10);
+			}
+		}
+
+		UINT32 aqB = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+		DbgPrint("[%s] AXI_QUIESCE after Step B (gate=2, force on): 0x%08x (bit21=%u)\n",
+			__FUNCTION__, aqB, (aqB >> 21) & 1);
 	}
 
 	// Unpause DMA engines — the pause written before reset must be explicitly cleared.
@@ -323,12 +377,17 @@ npudriverEvtDevicePrepareHardware(
 	DbgPrint("[%s] GCB reset/quit-reset sequence complete\n", __FUNCTION__);
 
 	// ExitReset step 4 (libedgetpu beagle_top_level_handler.cc::QuitReset):
-	// Re-enable idle register after reset. IdleRegister bit[31]=disable_idle (0=on),
-	// bits[30:0]=counter. set_enable()+set_counter(1) → 0x1.
+	// IdleRegister: bit[31]=disable_idle (0=on, 1=off), bits[30:0]=counter.
+	// We DISABLE auto-idle (set bit31=1) so the chip does NOT power-gate INFEED/
+	// PARAM_POP after PARAM_CACHE bitstream completes. With idle enabled (0x1),
+	// engines drop to kHalted=4 during the IOCTL gap and refuse RUN_CONTROL
+	// writes — INFER then deadlocks because SCALAR can't dispatch to halted
+	// INFEED. libedgetpu submits PARAM_CACHE+INFER back-to-back so the gap is
+	// too short to trigger auto-idle, but our two-IOCTL flow has a real gap.
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x00000001ULL);
-		DbgPrint("[%s] IdleRegister → 0x1 (enabled, counter=1)\n", __FUNCTION__);
+		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x80000001ULL);
+		DbgPrint("[%s] IdleRegister → 0x80000001 (disable_idle=1, counter=1)\n", __FUNCTION__);
 
 		// Re-write HIB MMU config after GCB reset — these registers may have been
 		// cleared by the reset even though they were written in ApexPageTableInit().
@@ -598,6 +657,28 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[%s] HIB_ERROR after CTRL=0x1 = 0x%llx\n", __FUNCTION__, hibChk);
 	}
 
+	// Clear any stale IQ interrupt pending from previous driver instance.
+	// On driver reload the chip retains IQ_INT_STATUS=1 from the last run; if
+	// we don't W1C-ack it before unmasking, the very first MSI-X delivery
+	// after EvtInterruptEnable triggers an immediate ISR storm (no real
+	// completion, just leftover state).
+	{
+		UINT64 staleIq = apex_read_register(deviceContext->Bar2BaseAddress,
+			APEX_REG_INSTR_QUEUE_INT_STATUS);
+		UINT64 stalePending = apex_read_register(deviceContext->Bar2BaseAddress,
+			APEX_REG_WIRE_INT_PENDING);
+		DbgPrint("[%s] stale IQ_INT_STATUS=0x%llx WIRE_INT_PENDING=0x%llx — clearing\n",
+			__FUNCTION__, staleIq, stalePending);
+		if (staleIq) {
+			apex_write_register(deviceContext->Bar2BaseAddress,
+				APEX_REG_INSTR_QUEUE_INT_STATUS, staleIq);  // W1C
+		}
+		if (stalePending) {
+			apex_write_register(deviceContext->Bar2BaseAddress,
+				APEX_REG_WIRE_INT_PENDING, stalePending);   // W1C
+		}
+	}
+
 	// Step B: add sb_wr_enable (bit2)
 	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_CONTROL, 0x5);
 	DbgPrint("[%s] INSTR_QUEUE_CONTROL → 0x5 (enable + sb_wr_enable)\n", __FUNCTION__);
@@ -635,18 +716,24 @@ npudriverEvtDevicePrepareHardware(
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
 
-		// Disable breakpoints — default after GCB reset is 0 = "halt at PC=0".
-		// Readback showed SCALAR_BREAKPOINT latched only 0x7fff after writing all-Fs
-		// — the register is narrow (probably 15 bits = max PC range). Any value that
-		// is "well above any valid PC" disables breakpoints. Use 0x7fff explicitly so
-		// the readback matches the expectation and we know the write path works.
-		apex_write_register_32(bar2, APEX_REG_SCALAR_BREAKPOINT,        0x7FFF);
-		apex_write_register_32(bar2, APEX_REG_INFEED_BREAKPOINT,        0x7FFF);
-		apex_write_register_32(bar2, APEX_REG_OUTFEED_BREAKPOINT,       0x7FFF);
-		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_BREAKPOINT, 0x7FFF);
-		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_BREAKPOINT,    0x7FFF);
-		apex_write_register_32(bar2, APEX_REG_TILE_OP_BREAKPOINT,       0x7FFF);
-		DbgPrint("[%s] Breakpoints disabled (set to max-PC 0x7fff)\n", __FUNCTION__);
+		// DO NOT touch *_BREAKPOINT registers.
+		//
+		// libedgetpu (run_controller.cc, mmio_driver.cc) and gasket-driver
+		// (apex_driver.c) never write to scalarCoreBreakPoint, infeedBreakPoint,
+		// outfeedBreakPoint, opBreakPoint, etc. They leave the chip's POR default
+		// in place — which is "breakpoint disabled".
+		//
+		// Our previous code wrote 0x7FFF intending to "set max PC" but the register
+		// is 15-bit wide (readback always latched 0x7FFF), and 0x7FFF appears to be
+		// interpreted by chip as a real "halt when PC reaches 0x7FFF" threshold.
+		// That's why PARAM bitstream (9808 B, ~2452 instructions, PC stays low)
+		// completed fine while INFER bitstream (199776 B, ~50K instructions, PC
+		// crosses 0x7FFF) stalled forever — SCALAR hit the breakpoint mid-execution.
+		//
+		// Symptom that matches: COMPLETED stuck at 1 (PARAM done), SCALAR=kRun (1)
+		// for a long time but never reaches the bitstream's completion instruction.
+		DbgPrint("[%s] BREAKPOINT registers left at chip default (libedgetpu-style)\n",
+			__FUNCTION__);
 
 		// TILE_CONFIG0 broadcast to all 7 tile groups, poll for acknowledgment.
 		// Must happen before tile run controls (run_controller.cc:118-128).
@@ -700,13 +787,14 @@ npudriverEvtDevicePrepareHardware(
 			apex_read_register(b, APEX_REG_INSTR_QUEUE_SIZE));
 
 		// 아이들/슬립 설정 확인
-		DbgPrint("[RB] IDLEGENERATOR       = 0x%llx  (기대 0x1)\n",
+		DbgPrint("[RB] IDLEGENERATOR       = 0x%llx  (기대 0x80000001 disable_idle=1)\n",
 			apex_read_register(b, APEX_REG_IDLEGENERATOR));
 		DbgPrint("[RB] TILE_DEEP_SLEEP     = 0x%llx  (기대 0x1e02)\n",
 			apex_read_register(b, APEX_REG_TILE_DEEP_SLEEP));
 
-		// breakpoint 확인 (0이면 VA=0에서 halt됨)
-		DbgPrint("[RB] SCALAR_BREAKPOINT   = 0x%llx  (기대 0xffffffffffffffff)\n",
+		// breakpoint 확인 — POR default 그대로 두는 중. INFER stall 이 사라지면
+		// 이 값이 "disabled" 의미하는 chip default 임을 확인하는 데이터 포인트.
+		DbgPrint("[RB] SCALAR_BREAKPOINT   = 0x%llx  (POR default, no longer overwritten)\n",
 			apex_read_register(b, APEX_REG_SCALAR_BREAKPOINT));
 
 		// 인터럽트 설정 확인
@@ -1021,6 +1109,35 @@ npudriverEvtFileCleanup(
 		deviceContext->CachedParamPteIdx = 0;
 		deviceContext->CachedParamPageCount = 0;
 	}
+
+	// Cleanup cached PARAM bitstream (kept mapped for IOCTL_INFER_WITH_PARAM)
+	if (deviceContext->CachedParamBitstreamMdl != NULL) {
+		PVOID bar2 = deviceContext->Bar2BaseAddress;
+		UINT32 i;
+		DbgPrint("[%s] Releasing cached PARAM bitstream: PTE[%u..%u] (%u pages, MDL=%p)\n",
+			__FUNCTION__,
+			deviceContext->CachedParamBitstreamPteIdx,
+			deviceContext->CachedParamBitstreamPteIdx + deviceContext->CachedParamBitstreamPageCount - 1,
+			deviceContext->CachedParamBitstreamPageCount,
+			deviceContext->CachedParamBitstreamMdl);
+
+		if (bar2 != NULL) {
+			WdfSpinLockAcquire(deviceContext->PageTableLock);
+			for (i = 0; i < deviceContext->CachedParamBitstreamPageCount; i++) {
+				apex_write_register(bar2,
+					APEX_REG_PAGE_TABLE + ((deviceContext->CachedParamBitstreamPteIdx + i) * 8), 0);
+			}
+			WdfSpinLockRelease(deviceContext->PageTableLock);
+		}
+
+		MmUnlockPages(deviceContext->CachedParamBitstreamMdl);
+		IoFreeMdl(deviceContext->CachedParamBitstreamMdl);
+		deviceContext->CachedParamBitstreamMdl = NULL;
+		deviceContext->CachedParamBitstreamSize = 0;
+		deviceContext->CachedParamBitstreamPteIdx = 0;
+		deviceContext->CachedParamBitstreamPageCount = 0;
+		deviceContext->CachedParamBitstreamDeviceVA = 0;
+	}
 }
 
 // Coral
@@ -1072,7 +1189,18 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 		return FALSE;
 	}
 
-	// W1C: writing the pending bits clears them
+	// Ack BOTH the source (IQ_INT_STATUS) and the aggregator (WIRE_INT_PENDING)
+	// inside the ISR — must happen before we leave DIRQL or the chip re-asserts
+	// MSI-X immediately and we get an interrupt storm.
+	//
+	// Order matters: clear the source first (IQ_INT_STATUS) so the level-driven
+	// aggregator drops; then clear the aggregator latch (WIRE_INT_PENDING).
+	// IQ_INT_STATUS turns out to be W1C on this chip — writing 0 leaves the bit
+	// set and chip re-fires forever.
+	if (iqIntStatus != 0) {
+		apex_write_register(pDevContext->Bar2BaseAddress,
+			APEX_REG_INSTR_QUEUE_INT_STATUS, iqIntStatus);
+	}
 	apex_write_register(pDevContext->Bar2BaseAddress,
 					   APEX_REG_WIRE_INT_PENDING, pending);
 
@@ -1150,6 +1278,8 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 	PDEVICE_CONTEXT pDevContext = DeviceGetContext(device);
 
 	DbgPrint("[%s] DPC: Inference complete, unlocking pages\n", __FUNCTION__);
+	// (interrupt ack moved into ISR to prevent storm — clearing only in DPC
+	//  let the chip re-fire MSI-X before DPC ran)
 
 	if (pDevContext->InferInputMdl != NULL) {
 		MmUnlockPages(pDevContext->InferInputMdl);

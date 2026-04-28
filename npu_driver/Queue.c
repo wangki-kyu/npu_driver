@@ -113,6 +113,7 @@ VOID npudriverEvtIoDeviceControl(
 		}
 		break;
 	}
+	case IOCTL_INFER_WITH_PARAM:
 	case IOCTL_INFER:
 	{
 		WDFMEMORY inputMemory;
@@ -124,6 +125,19 @@ VOID npudriverEvtIoDeviceControl(
 		UINT32 pageCount;
 		UINT32 pteIdx;
 		UINT32 i;
+		// IOCTL_INFER_WITH_PARAM: enqueue cached PARAM bitstream descriptor BEFORE
+		// the INFER descriptor in the same IQ batch. libedgetpu pattern — chip's
+		// engines never see an idle gap between PARAM and INFER, so they don't
+		// auto-halt and don't need wake-up.
+		BOOLEAN withParam = (IoControlCode == IOCTL_INFER_WITH_PARAM);
+		if (withParam) {
+			if (pDevContext->CachedParamBitstreamMdl == NULL ||
+			    pDevContext->CachedParamBitstreamSize == 0) {
+				DbgPrint("[INFER_WITH_PARAM] No cached PARAM bitstream — call IOCTL_PARAM_CACHE first\n");
+				status = STATUS_INVALID_DEVICE_STATE;
+				break;
+			}
+		}
 
 		if (InputBufferLength < sizeof(IOCTL_INFER_INFO)) {
 			DbgPrint("[%s] Invalid input buffer size\n", __FUNCTION__);
@@ -300,75 +314,39 @@ VOID npudriverEvtIoDeviceControl(
 			WdfSpinLockRelease(pDevContext->PageTableLock);
 		}
 
-		// Wake engines back to kRun before INFER submission.
-		// PARAM_CACHE bitstream leaves PARAM_POP (and sometimes INFEED) at kHalted=0x4.
-		// libedgetpu's DoOpen calls DoRunControl(kMoveToRun) once at chip open and
-		// relies on engines staying kRun across submissions, but in our raw-bitstream
-		// flow the PARAMETER_CACHING bitstream halts engines at end. INFER's bitstream
-		// needs INFEED kRun to drive input DMA — without it the scalar core stalls
-		// silently (no MMU fault, just COMPLETED_HEAD frozen at PARAM_CACHE's value).
+		// Force ALL engines to kRun (RUN_CONTROL=1) — including tile/mesh/ring/
+		// outfeed/avdata which previous logs showed at status=0 (kIdle) before
+		// INFER. INFER bitstream assumes every engine is kRun; PARAM bitstream
+		// only wakes a subset (SCALAR/INFEED/PARAM_POP). libedgetpu does this
+		// once at DoOpen via run_controller.DoRunControl(kMoveToRun) but we've
+		// observed our chip silently ignoring those writes during PrepareHardware,
+		// so we re-issue here with a longer settle delay.
 		{
 			UINT32 scBefore     = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
 			UINT32 infeedBefore = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
 			UINT32 paramBefore  = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
 			UINT32 outBefore    = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
 			UINT32 avBefore     = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
-			DbgPrint("[INFER] wake-up before: SCALAR=0x%x INFEED=0x%x PARAM=0x%x OUTFEED=0x%x AVDATA=0x%x\n",
-				scBefore, infeedBefore, paramBefore, outBefore, avBefore);
+			UINT32 tileBefore   = apex_read_register_32(bar2, APEX_REG_TILE_OP_RUN_STATUS);
+			UINT32 m0Before     = (UINT32)apex_read_register(bar2, APEX_REG_MESH_BUS0_RUN_STATUS);
+			UINT32 rcBefore     = (UINT32)apex_read_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_STATUS);
+			UINT32 rpBefore     = (UINT32)apex_read_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_STATUS);
+			DbgPrint("[INFER] pre-wake: SC=0x%x IN=0x%x PA=0x%x OUT=0x%x AV=0x%x TILE=0x%x MESH=0x%x RC=0x%x RP=0x%x\n",
+				scBefore, infeedBefore, paramBefore, outBefore, avBefore,
+				tileBefore, m0Before, rcBefore, rpBefore);
 
-			// Step A: kMoveToIdle (0). RUN_CONTROL appears to be edge-triggered —
-			// rewriting 1 while register already holds 1 produced no transition
-			// in the previous run. Drop to 0 first to clear the latch.
-			apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,        0);
-			apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    0);
-			apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 0);
-			apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,        0);
-			apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       0);
-
+			// Confirm TILE_CONFIG0 first — engines may refuse RUN_CONTROL when tile
+			// config is wrong. Re-write to be safe.
 			apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
-			{
-				int tci;
-				for (tci = 0; tci < 1000; tci++) {
-					if (apex_read_register(bar2, APEX_REG_TILE_CONFIG0) == 0x7F) break;
-					KeStallExecutionProcessor(10);
-				}
-			}
-			apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            0);
-			apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     0);
-			apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     0);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          0);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          0);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          0);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          0);
-			apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 0);
-			apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 0);
-			apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  0);
+			KeStallExecutionProcessor(50);
 
-			KeStallExecutionProcessor(100);
-
-			UINT32 scMid     = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
-			UINT32 infeedMid = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
-			UINT32 paramMid  = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-			UINT32 outMid    = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
-			UINT32 avMid     = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
-			DbgPrint("[INFER] wake-up mid (after MoveToIdle=0): SCALAR=0x%x INFEED=0x%x PARAM=0x%x OUTFEED=0x%x AVDATA=0x%x\n",
-				scMid, infeedMid, paramMid, outMid, avMid);
-
-			// Step B: kMoveToRun (1) — now that register is 0, this should be a real edge.
-			apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,        1);
-			apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    1);
-			apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);
-			apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,        1);
-			apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       1);
-
-			apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
-			{
-				int tci;
-				for (tci = 0; tci < 1000; tci++) {
-					if (apex_read_register(bar2, APEX_REG_TILE_CONFIG0) == 0x7F) break;
-					KeStallExecutionProcessor(10);
-				}
-			}
+			// kMoveToRun(1) to EVERY engine, regardless of current status.
+			// Don't skip SCALAR — if it's already kRun the write is a no-op.
+			apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,             1);
+			apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,         1);
+			apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL,      1);
+			apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,             1);
+			apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,            1);
 			apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
 			apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
 			apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
@@ -380,15 +358,21 @@ VOID npudriverEvtIoDeviceControl(
 			apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
 			apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
 
-			KeStallExecutionProcessor(100);
+			// Settle. 1 ms — much longer than previous 200us.
+			KeStallExecutionProcessor(1000);
 
 			UINT32 scAfter     = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
 			UINT32 infeedAfter = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
 			UINT32 paramAfter  = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
 			UINT32 outAfter    = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
 			UINT32 avAfter     = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
-			DbgPrint("[INFER] wake-up after:  SCALAR=0x%x INFEED=0x%x PARAM=0x%x OUTFEED=0x%x AVDATA=0x%x\n",
-				scAfter, infeedAfter, paramAfter, outAfter, avAfter);
+			UINT32 tileAfter   = apex_read_register_32(bar2, APEX_REG_TILE_OP_RUN_STATUS);
+			UINT32 m0After     = (UINT32)apex_read_register(bar2, APEX_REG_MESH_BUS0_RUN_STATUS);
+			UINT32 rcAfter     = (UINT32)apex_read_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_STATUS);
+			UINT32 rpAfter     = (UINT32)apex_read_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_STATUS);
+			DbgPrint("[INFER] post-wake: SC=0x%x IN=0x%x PA=0x%x OUT=0x%x AV=0x%x TILE=0x%x MESH=0x%x RC=0x%x RP=0x%x\n",
+				scAfter, infeedAfter, paramAfter, outAfter, avAfter,
+				tileAfter, m0After, rcAfter, rpAfter);
 		}
 
 		// Verify PTE and queue config
@@ -426,7 +410,10 @@ VOID npudriverEvtIoDeviceControl(
 			apex_read_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_STATUS),
 			apex_read_register(bar2, APEX_REG_TILE_CONFIG0));
 
-		// 6. Submit HostQueueDescriptor to ring (INFER only)
+		// 6. Submit HostQueueDescriptor(s) to ring.
+		//    IOCTL_INFER:            single INFER descriptor.
+		//    IOCTL_INFER_WITH_PARAM: PARAM_CACHE descriptor + INFER descriptor
+		//                            back-to-back in the same TAIL update.
 		{
 			typedef struct {
 				UINT64 address;
@@ -435,23 +422,46 @@ VOID npudriverEvtIoDeviceControl(
 			} HOST_QUEUE_DESC;
 
 			HOST_QUEUE_DESC *ring = (HOST_QUEUE_DESC *)pDevContext->DescRingBase;
-			UINT32 slot = pDevContext->DescRingTail % 256;
-			ring[slot].address       = pInput->BitstreamDeviceVA;
-			ring[slot].size_in_bytes = (UINT32)pInput->BitstreamSize;
-			ring[slot].reserved      = 0;
-			KeMemoryBarrier();
 
-			pDevContext->DescRingTail++;
-			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
+			if (withParam) {
+				UINT32 slotP = pDevContext->DescRingTail % 256;
+				ring[slotP].address       = pDevContext->CachedParamBitstreamDeviceVA;
+				ring[slotP].size_in_bytes = pDevContext->CachedParamBitstreamSize;
+				ring[slotP].reserved      = 0;
 
-			UINT64 completed_head = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-			DbgPrint("[%s] Descriptor submitted: slot=%u VA=0x%llx size=0x%x TAIL=%u Completed Head=%llu\n",
-				__FUNCTION__, slot,
-				ring[slot].address, ring[slot].size_in_bytes, pDevContext->DescRingTail, completed_head);
+				UINT32 slotI = (pDevContext->DescRingTail + 1) % 256;
+				ring[slotI].address       = pInput->BitstreamDeviceVA;
+				ring[slotI].size_in_bytes = (UINT32)pInput->BitstreamSize;
+				ring[slotI].reserved      = 0;
+				KeMemoryBarrier();
 
-			UINT64 *rawRing = (UINT64 *)pDevContext->DescRingBase;
-			DbgPrint("[INFER] Ring slot raw: [0]=0x%llx [1]=0x%llx\n",
-				rawRing[slot * 2], rawRing[slot * 2 + 1]);
+				pDevContext->DescRingTail += 2;
+				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
+
+				UINT64 completed_head = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+				DbgPrint("[INFER_WITH_PARAM] PARAM slot=%u VA=0x%llx size=0x%x | INFER slot=%u VA=0x%llx size=0x%x | TAIL=%u Completed=%llu\n",
+					slotP, ring[slotP].address, ring[slotP].size_in_bytes,
+					slotI, ring[slotI].address, ring[slotI].size_in_bytes,
+					pDevContext->DescRingTail, completed_head);
+			} else {
+				UINT32 slot = pDevContext->DescRingTail % 256;
+				ring[slot].address       = pInput->BitstreamDeviceVA;
+				ring[slot].size_in_bytes = (UINT32)pInput->BitstreamSize;
+				ring[slot].reserved      = 0;
+				KeMemoryBarrier();
+
+				pDevContext->DescRingTail++;
+				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
+
+				UINT64 completed_head = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+				DbgPrint("[%s] Descriptor submitted: slot=%u VA=0x%llx size=0x%x TAIL=%u Completed Head=%llu\n",
+					__FUNCTION__, slot,
+					ring[slot].address, ring[slot].size_in_bytes, pDevContext->DescRingTail, completed_head);
+
+				UINT64 *rawRing = (UINT64 *)pDevContext->DescRingBase;
+				DbgPrint("[INFER] Ring slot raw: [0]=0x%llx [1]=0x%llx\n",
+					rawRing[slot * 2], rawRing[slot * 2 + 1]);
+			}
 		}
 
 		// Verify instruction queue state
@@ -735,6 +745,25 @@ VOID npudriverEvtIoDeviceControl(
 			pDevContext->CachedParamPageCount = 0;
 		}
 
+		// 0b. Release previously cached PARAM bitstream too (re-cache case)
+		if (pDevContext->CachedParamBitstreamMdl != NULL) {
+			DbgPrint("[PARAM_CACHE] Releasing previously cached bitstream: PTE[%u..%u]\n",
+				pDevContext->CachedParamBitstreamPteIdx,
+				pDevContext->CachedParamBitstreamPteIdx + pDevContext->CachedParamBitstreamPageCount - 1);
+			WdfSpinLockAcquire(pDevContext->PageTableLock);
+			for (i = 0; i < pDevContext->CachedParamBitstreamPageCount; i++) {
+				apex_write_register(bar2,
+					APEX_REG_PAGE_TABLE + ((pDevContext->CachedParamBitstreamPteIdx + i) * 8), 0);
+			}
+			WdfSpinLockRelease(pDevContext->PageTableLock);
+			MmUnlockPages(pDevContext->CachedParamBitstreamMdl);
+			IoFreeMdl(pDevContext->CachedParamBitstreamMdl);
+			pDevContext->CachedParamBitstreamMdl = NULL;
+			pDevContext->CachedParamBitstreamSize = 0;
+			pDevContext->CachedParamBitstreamPteIdx = 0;
+			pDevContext->CachedParamBitstreamPageCount = 0;
+		}
+
 		// 1. Lock parameter pages (hardware DMA reads them for PARAMETER_POP)
 		paramMdl = IoAllocateMdl((PVOID)pInput->ParamAddr, (ULONG)pInput->ParamSize, FALSE, FALSE, NULL);
 		if (paramMdl == NULL) {
@@ -763,104 +792,52 @@ VOID npudriverEvtIoDeviceControl(
 				((UINT64)pfnArray[i] << PAGE_SHIFT) | 1);
 		WdfSpinLockRelease(pDevContext->PageTableLock);
 
-		// === MAP-ONLY MODE ===
-		// BitstreamSize == 0 이면 PARAMETER_CACHING bitstream submit 을 skip.
-		// "PARAM_CACHE bitstream 끝의 halt 명령이 INFEED/PARAM 을 kHalted=0x4 로
-		// 떨어뜨려서 INFER 가 멈추는 게 진짜 원인인지" 검증용. params 는 PTE 에
-		// 매핑되니 INFER bitstream 의 BASE_ADDRESS_PARAMETER=0x3000 참조는 살아있음.
-		if (pInput->BitstreamSize == 0) {
-			DbgPrint("[PARAM_CACHE] MAP-ONLY mode (BitstreamSize=0): skipping exe1 submit\n");
-			status = STATUS_SUCCESS;
-			goto param_cache_retain;
-		}
-
-		UINT64 before_done = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-		UINT64 before_fetch = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
-		UINT32 before_infeed = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
-		UINT32 before_param = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-		DbgPrint("[PARAM_CACHE] before Submitted exe1: completed_head = %llu fetched=%llu\n", before_done, before_fetch);
-		DbgPrint("[PARAM_CACHE] before Submitted exe1: infeed = %lu param = %lu\n", before_infeed, before_param);
-
-		// 3. Submit exe1 descriptor (bitstream at device VA 0x0, already mapped via IOCTL_MAP_BUFFER)
-		{
-			//pDevContext->DescRingTail = 0;
-			typedef struct { UINT64 address; UINT32 size_in_bytes; UINT32 reserved; } HOST_QUEUE_DESC;
-			HOST_QUEUE_DESC *ring = (HOST_QUEUE_DESC *)pDevContext->DescRingBase;
-			UINT32 slot = pDevContext->DescRingTail % 256;
-			ring[slot].address       = 0;
-			ring[slot].size_in_bytes = (UINT32)pInput->BitstreamSize;
-			ring[slot].reserved      = 0;
-			KeMemoryBarrier();
-			pDevContext->DescRingTail++;
-			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
-			UINT64 done = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-			DbgPrint("[PARAM_CACHE] Submitted exe1: slot=%u size=0x%x TAIL=%u done=%llu\n",
-				slot, (UINT32)pInput->BitstreamSize, pDevContext->DescRingTail, done);
-		}
-
-		// 4. Poll IQ completion (PARAMETER_POP loads ~6MB, allow up to 10s)
-		{
-			int pollIdx;
-			status = STATUS_IO_TIMEOUT;
-			for (pollIdx = 0; pollIdx < 1000; pollIdx++) {
-				UINT64 done = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-				UINT64 fetched = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
-				UINT32 after_infeed = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
-				UINT32 after_param = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-
-				if ((UINT32)done >= pDevContext->DescRingTail) {
-					DbgPrint("[PARAM_CACHE] IQ completed after %d ms (COMPLETED=%llu TAIL=%u) fetched=%llu\n",
-						pollIdx, done, pDevContext->DescRingTail, fetched);
-					DbgPrint("[PARAM_CACHE] after Submitted exe1: infeed = %lu param = %lu\n", after_infeed, after_param);
-					status = STATUS_SUCCESS;
-					break;
-				}
-				if (pollIdx > 0 && pollIdx % 200 == 0) {
-					UINT32 paramSt = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-					UINT32 hibErr  = apex_read_register_32(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
-					DbgPrint("[PARAM_CACHE@%dms] PARAM_POP=0x%x COMPLETED=%llu HIB=0x%x done=%llu fetched=%llu\n",
-						pollIdx, paramSt, done, hibErr, done, fetched);
-					DbgPrint("[PARAM_CACHE] after Submitted exe1: infeed = %lu param = %lu\n", after_infeed, after_param);
-					if (hibErr != 0) {
-						DbgPrint("[PARAM_CACHE] HIB error during param load, aborting\n");
-						status = STATUS_UNSUCCESSFUL;
-						break;
-					}
-				}
-				{ LARGE_INTEGER d; d.QuadPart = -10000LL; KeDelayExecutionThread(KernelMode, FALSE, &d); }
-			}
-			if (!NT_SUCCESS(status)) {
-				UINT32 paramSt = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-				UINT32 hibErr  = apex_read_register_32(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
-				DbgPrint("[PARAM_CACHE] FAILED: PARAM_POP=0x%x HIB=0x%x status=0x%x\n",
-					paramSt, hibErr, status);
-			}
-		}
-
-		// libedgetpu mmio_driver.cc 는 PARAM/INFER descriptor 사이에서 IQ 나 run control 을
-		// 만지지 않는다. 단지 다음 descriptor 를 enqueue 할 뿐. 우리도 동일하게 둔다.
-		// (이전의 IQ disable/enable, run control toggle 등은 모두 의미 없는 것으로 판명.)
-		// PARAM 후 status block 을 readonly 로 한 번 찍어 진단 흔적만 남긴다.
-		if (NT_SUCCESS(status) && pDevContext->StatusBlockBase != NULL) {
-			UINT64 *sb = (UINT64 *)pDevContext->StatusBlockBase;
-			DbgPrint("[PARAM_CACHE] Done: sb[0]=0x%llx sb[1]=0x%llx COMPLETED=0x%llx FETCHED=0x%llx WIRE=0x%llx IQ_INT=0x%llx\n",
-				sb[0], sb[1],
-				apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD),
-				apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD),
-				apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING),
-				apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_STATUS));
-		}
+		// === MAPPING-ONLY MODE (always) ===
+		//
+		// libedgetpu pattern: MapParameters() only stages params + bitstream into
+		// the chip's address space — it does NOT submit the PARAM bitstream to
+		// the IQ. Submission happens only in RunInference(), where PARAM and
+		// INFER descriptors are enqueued back-to-back.
+		//
+		// We follow the same pattern: IOCTL_PARAM_CACHE only locks pages and
+		// programs PTEs. IOCTL_INFER_WITH_PARAM submits both descriptors. This
+		// keeps engines in their PrepareHardware-set kRun/kIdle state until the
+		// first inference runs, so kHalted=4 doesn't get latched between PARAM
+		// and INFER.
+		DbgPrint("[PARAM_CACHE] MAPPING-ONLY: PTEs registered, bitstream locked, NO chip submit\n");
+		status = STATUS_SUCCESS;
 
 		// 5. INFER 가 같은 PARAM_VA 를 참조하므로 PTE 와 lock 을 유지한다.
 		//    libedgetpu MapParameters() 패턴: parameters 는 driver lifetime 동안 매핑.
 		//    cleanup 은 npudriverEvtFileCleanup 또는 다음 PARAM_CACHE 호출 시.
-	param_cache_retain:
+		//
+		//    또한 PARAM bitstream MDL (LockedModelMdl) 의 ownership 도 driver 가
+		//    이어받아 IOCTL_INFER_WITH_PARAM 에서 매번 IQ 에 다시 enqueue 할 수
+		//    있도록 함. test_console 은 PARAM bitstream 을 IOCTL_UNMAP_BUFFER 하지
+		//    않아야 하며 (driver 가 cleanup 까지 유지), driver 가 LockedModelMdl=NULL
+		//    로 만들어 다음 IOCTL_UNMAP_BUFFER 가 잘못 unlock 하는 것도 방지.
 		if (NT_SUCCESS(status)) {
 			pDevContext->CachedParamMdl       = paramMdl;
 			pDevContext->CachedParamPteIdx    = pteIdx;
 			pDevContext->CachedParamPageCount = pageCount;
 			DbgPrint("[PARAM_CACHE] Cached params retained: PTE[%u..%u] (%u pages, MDL=%p)\n",
 				pteIdx, pteIdx + pageCount - 1, pageCount, paramMdl);
+
+			// Transfer PARAM bitstream MDL ownership from LockedModelMdl to
+			// CachedParamBitstreamMdl. Bitstream is at deviceVA=0 (PTE[0..N]).
+			if (pDevContext->LockedModelMdl != NULL && pInput->BitstreamSize > 0) {
+				UINT32 bsPageCount = (UINT32)((pInput->BitstreamSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
+				pDevContext->CachedParamBitstreamMdl       = pDevContext->LockedModelMdl;
+				pDevContext->CachedParamBitstreamDeviceVA  = 0;
+				pDevContext->CachedParamBitstreamSize      = (UINT32)pInput->BitstreamSize;
+				pDevContext->CachedParamBitstreamPteIdx    = 0;
+				pDevContext->CachedParamBitstreamPageCount = bsPageCount;
+				pDevContext->LockedModelMdl  = NULL;
+				pDevContext->LockedModelSize = 0;
+				DbgPrint("[PARAM_CACHE] Cached bitstream retained: PTE[0..%u] DeviceVA=0x0 size=0x%x MDL=%p\n",
+					bsPageCount - 1, (UINT32)pInput->BitstreamSize,
+					pDevContext->CachedParamBitstreamMdl);
+			}
 		} else {
 			// 실패 시에는 즉시 정리
 			WdfSpinLockAcquire(pDevContext->PageTableLock);

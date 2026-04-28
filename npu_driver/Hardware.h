@@ -148,6 +148,7 @@
 
 // ========== System Control Unit (SCU) ==========
 #define APEX_REG_SCU_BASE                   0x1A300
+#define APEX_REG_SCU_CTRL_0                 (APEX_REG_SCU_BASE + 0x0C)  // PHY inactive mode bits
 #define APEX_REG_SCU_2                      (APEX_REG_SCU_BASE + 0x14)
 #define APEX_REG_SCU_3                      (APEX_REG_SCU_BASE + 0x18)
 #define APEX_REG_AXI_QUIESCE                (APEX_REG_SCU_BASE + 0x2C)
