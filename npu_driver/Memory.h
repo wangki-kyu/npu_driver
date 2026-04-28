@@ -9,7 +9,7 @@ NTSTATUS ApexPageTableMap(
     _In_ WDFDEVICE Device,
     _In_ PVOID UserBuffer,
     _In_ SIZE_T Size,
-    _Out_ UINT64 *DeviceAddress
+    _Inout_ UINT64 *DeviceAddress  // in: requested device VA (page-aligned); 0 = legacy "VA 0"
 );
 
 NTSTATUS ApexPageTableUnmap(

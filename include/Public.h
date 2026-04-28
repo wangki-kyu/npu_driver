@@ -42,11 +42,13 @@ typedef struct IOCTL_INFER_INFO {
 
 // IOCTL input/output structures
 typedef struct {
-    UINT64 UserAddress;  // User buffer virtual address
-    UINT64 Size;         // Size in bytes
+    UINT64 UserAddress;     // User buffer virtual address
+    UINT64 Size;            // Size in bytes
+    UINT64 DeviceAddress;   // Requested device VA (must be page-aligned). Driver writes
+                            // PTE[DeviceAddress>>12 .. ] for the user pages.
 } MAP_BUFFER_INPUT;
 
 typedef struct {
-    UINT64 DeviceAddress;  // Device virtual address to unmap
-    UINT64 Size;           // Size in bytes
+    UINT64 DeviceAddress;   // Device virtual address to unmap
+    UINT64 Size;            // Size in bytes
 } UNMAP_BUFFER_INPUT;

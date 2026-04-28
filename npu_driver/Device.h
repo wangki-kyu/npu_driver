@@ -15,8 +15,10 @@ typedef struct _DEVICE_CONTEXT
 	PVOID Bar2BaseAddress;	// MmMapIoSpace
 	ULONG Bar2Length;		//
 
-	// Interrupt
-	WDFINTERRUPT Interrupts[1];
+	// Interrupt — chip allocates 4 MSI-X vectors. We register all 4 so that
+	// whichever vector chip targets, our ISR receives it. The single ISR uses
+	// MessageID to disambiguate.
+	WDFINTERRUPT Interrupts[4];
 
 	// Page table for model/data memory mapping
 	PVOID PageTableBase;                 // Page table kernel VA
@@ -41,6 +43,13 @@ typedef struct _DEVICE_CONTEXT
 	PMDL InferOutputMdl;                 // MDL for output buffer pages
 	PMDL InferScratchMdl;                // MDL for scratch buffer pages
 
+	// Cached parameters from IOCTL_PARAM_CACHE — kept mapped during INFER.
+	// libedgetpu MapParameters() 패턴: 모든 executable 의 파라미터는 driver lifetime 동안
+	// 매핑 유지. INFER bitstream 의 BASE_ADDRESS_PARAMETER 패치가 같은 VA 를 참조함.
+	PMDL    CachedParamMdl;              // MDL for locked param pages (NULL = none)
+	UINT32  CachedParamPteIdx;           // First PTE index for params
+	UINT32  CachedParamPageCount;        // Number of param pages
+
 	// Inference 완료 동기화 (IOCTL이 대기, DPC가 signal)
 	KEVENT InferCompleteEvent;           // Event for inference completion
 
@@ -52,6 +61,9 @@ typedef struct _DEVICE_CONTEXT
 	// Status block (hardware DMA-writes completion info here, PTE slot 6143)
 	PVOID   StatusBlockBase;     // kernel VA (NonPagedPoolNx, 4KB)
 	UINT64  StatusBlockDeviceVA; // device virtual address seen by hardware
+
+	// ISR diagnostic counter (incremented on every ISR call, including spurious)
+	volatile LONG IsrCallCount;
 
 	ULONG PrivateDeviceData;  // just a placeholder
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
@@ -72,5 +84,8 @@ EVT_WDF_FILE_CLEANUP npudriverEvtFileCleanup;
 EVT_WDF_INTERRUPT_ISR npudriverEvtInterruptIsr;
 
 EVT_WDF_INTERRUPT_DPC npudriverEvtInterruptDpc;
+
+EVT_WDF_INTERRUPT_ENABLE  npudriverEvtInterruptEnable;
+EVT_WDF_INTERRUPT_DISABLE npudriverEvtInterruptDisable;
 
 EXTERN_C_END

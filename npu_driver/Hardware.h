@@ -114,7 +114,7 @@
 #define APEX_REG_INSTR_QUEUE_FETCHED_HEAD    0x485b0  // hw fetch progress
 #define APEX_REG_INSTR_QUEUE_COMPLETED_HEAD  0x485b8  // hw completion progress
 #define APEX_REG_INSTR_QUEUE_INT_CONTROL     0x485c0  // interrupt control
-#define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (write 0 to clear)
+#define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (W1C: write 1 to clear)
 
 // ========== SC_HOST Interrupt Control ==========
 #define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 1 = enable SC_HOST completion interrupt

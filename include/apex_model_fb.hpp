@@ -25,6 +25,7 @@ struct FieldPatch {
     int32_t offset_bit;
     platforms::darwinn::Description desc;
     platforms::darwinn::Position    position;
+    std::string name;  // layer name for per-output VA matching
 };
 
 struct LayerInfo {
@@ -229,6 +230,7 @@ inline ApexModelFb LoadModel(const std::string& path) {
             p.offset_bit = fo->offset_bit();
             p.desc       = fo->meta()->desc();
             p.position   = fo->meta()->position();
+            if (fo->meta()->name()) p.name = fo->meta()->name()->str();
 
             if (p.offset_bit / 8 + 4 <= (int32_t)model.bitstream.size()) {
                 model.patches.push_back(p);
@@ -340,15 +342,15 @@ inline ApexModelFb LoadModel(const std::string& path) {
     return model;
 }
 
-// Dump all VA fields found in the bitstream patches (call after PatchVAs to see final values).
-// Prints INPUT, OUTPUT, PARAMETER, SCRATCH VAs and scratch_size_bytes.
-// PARAMETER should point into bitstream (0x0~bitstream_size); SCRATCH must be allocated & mapped.
 inline void DumpPatchedVAs(const ApexModelFb& model) {
     using namespace platforms::darwinn;
     uint64_t input_lo = 0, input_hi = 0;
-    uint64_t output_lo = 0, output_hi = 0;
     uint64_t param_lo = 0, param_hi = 0;
     uint64_t scratch_lo = 0, scratch_hi = 0;
+
+    // per-output layer: lo/hi pair indexed by output_layers order
+    std::vector<uint64_t> out_lo(model.output_layers.size(), 0);
+    std::vector<uint64_t> out_hi(model.output_layers.size(), 0);
 
     for (const auto& p : model.patches) {
         if (p.offset_bit / 8 + 4 > (int32_t)model.bitstream.size()) continue;
@@ -359,7 +361,13 @@ inline void DumpPatchedVAs(const ApexModelFb& model) {
         case Description_BASE_ADDRESS_INPUT_ACTIVATION:
             if (lo) input_lo = val; else input_hi = val; break;
         case Description_BASE_ADDRESS_OUTPUT_ACTIVATION:
-            if (lo) output_lo = val; else output_hi = val; break;
+            for (size_t i = 0; i < model.output_layers.size(); i++) {
+                if (model.output_layers[i].name == p.name) {
+                    if (lo) out_lo[i] = val; else out_hi[i] = val;
+                    break;
+                }
+            }
+            break;
         case Description_BASE_ADDRESS_PARAMETER:
             if (lo) param_lo = val; else param_hi = val; break;
         case Description_BASE_ADDRESS_SCRATCH:
@@ -370,14 +378,16 @@ inline void DumpPatchedVAs(const ApexModelFb& model) {
 
     auto va64 = [](uint64_t hi, uint64_t lo) { return (hi << 32) | lo; };
     std::cout << std::hex << std::setfill('0');
-    std::cout << "  INPUT   VA: 0x" << std::setw(16) << va64(input_hi,   input_lo)   << std::endl;
-    std::cout << "  OUTPUT  VA: 0x" << std::setw(16) << va64(output_hi,  output_lo)  << std::endl;
-    std::cout << "  PARAM   VA: 0x" << std::setw(16) << va64(param_hi,   param_lo)   << std::endl;
+    std::cout << "  INPUT   VA: 0x" << std::setw(16) << va64(input_hi, input_lo) << std::endl;
+    for (size_t i = 0; i < model.output_layers.size(); i++)
+        std::cout << "  OUTPUT[" << i << "] VA: 0x" << std::setw(16) << va64(out_hi[i], out_lo[i])
+                  << "  (" << model.output_layers[i].name << ")" << std::endl;
+    std::cout << "  PARAM   VA: 0x" << std::setw(16) << va64(param_hi, param_lo)   << std::endl;
     std::cout << "  SCRATCH VA: 0x" << std::setw(16) << va64(scratch_hi, scratch_lo) << std::endl;
     std::cout << std::dec;
     std::cout << "  scratch_size_bytes: " << model.scratch_size_bytes << std::endl;
     if (model.scratch_size_bytes > 0 && va64(scratch_hi, scratch_lo) == 0)
-        std::cout << "  WARNING: scratch_size > 0 but SCRATCH VA = 0 — scratch buffer not allocated/patched!" << std::endl;
+        std::cout << "  WARNING: scratch_size > 0 but SCRATCH VA = 0" << std::endl;
 }
 
 inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
@@ -387,7 +397,16 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
         uint64_t va = 0;
         switch (p.desc) {
         case Description_BASE_ADDRESS_INPUT_ACTIVATION:  va = input_va;   break;
-        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: va = output_va;  break;
+        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: {
+            // match by layer name to compute per-layer device VA
+            uint64_t cur = output_va;
+            for (const auto& layer : model.output_layers) {
+                if (layer.name == p.name) { va = cur; break; }
+                cur += PageAlignUp(layer.size_bytes);
+            }
+            if (va == 0) va = output_va;  // fallback for single-output or unnamed
+            break;
+        }
         case Description_BASE_ADDRESS_PARAMETER:         va = param_va;   break;
         case Description_BASE_ADDRESS_SCRATCH:           va = scratch_va; break;
         default: continue;

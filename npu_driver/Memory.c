@@ -112,12 +112,13 @@ NTSTATUS ApexPageTableMap(
     _In_ WDFDEVICE Device,
     _In_ PVOID UserBuffer,
     _In_ SIZE_T Size,
-    _Out_ UINT64 *DeviceAddress)
+    _Inout_ UINT64 *DeviceAddress)
 {
     PDEVICE_CONTEXT pDevContext;
     PMDL mdl = NULL;
     PPFN_NUMBER pfnArray = NULL;
     UINT32 pageCount;
+    UINT32 startPte;
     UINT32 i;
     APEX_PTE *pte;
     PHYSICAL_ADDRESS physAddr;
@@ -136,12 +137,19 @@ NTSTATUS ApexPageTableMap(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // Caller-specified device VA must be page-aligned. Determines starting PTE index.
+    if ((*DeviceAddress & (PAGE_SIZE - 1)) != 0) {
+        DbgPrint("[%s] DeviceAddress 0x%llx not page-aligned\n", __FUNCTION__, *DeviceAddress);
+        return STATUS_INVALID_PARAMETER;
+    }
+    startPte = (UINT32)(*DeviceAddress >> PAGE_SHIFT);
+
     // Calculate number of pages needed
     pageCount = (UINT32)((Size + PAGE_SIZE - 1) / PAGE_SIZE);
 
-    if (pageCount > pDevContext->PageTableSize) {
-        DbgPrint("[%s] Buffer too large: %lu pages > %lu available\n",
-                 __FUNCTION__, pageCount, pDevContext->PageTableSize);
+    if (startPte + pageCount > pDevContext->PageTableSize) {
+        DbgPrint("[%s] Mapping out of range: PTE[%lu..%lu] > %lu\n",
+                 __FUNCTION__, startPte, startPte + pageCount - 1, pDevContext->PageTableSize);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -171,19 +179,19 @@ NTSTATUS ApexPageTableMap(
     DbgPrint("[MAP] HIB_ERROR before PTE loop = 0x%llx\n",
         apex_read_register(pDevContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
 
-    // Write page table entries to hardware
+    // Write page table entries to hardware at requested PTE range
     for (i = 0; i < pageCount; i++) {
         physAddr.QuadPart = pfnArray[i] << PAGE_SHIFT;
 
-        pte[i].address = physAddr.QuadPart & 0x0FFFFFFFFFFFFF;  // 40-bit address
-        pte[i].status = PTE_INUSE;
-        pte[i].dma_direction = 0;  // DMA_BIDIRECTIONAL
+        pte[startPte + i].address = physAddr.QuadPart & 0x0FFFFFFFFFFFFF;  // 40-bit address
+        pte[startPte + i].status = PTE_INUSE;
+        pte[startPte + i].dma_direction = 0;  // DMA_BIDIRECTIONAL
 
         // Write to BAR2 page table register
         apex_write_register(
             pDevContext->Bar2BaseAddress,
-            APEX_REG_PAGE_TABLE + (i * 8),
-            pte[i].address | 0x1  // Set PTE_INUSE bit
+            APEX_REG_PAGE_TABLE + ((startPte + i) * 8),
+            pte[startPte + i].address | 0x1  // Set PTE_INUSE bit
         );
     }
 
@@ -191,20 +199,15 @@ NTSTATUS ApexPageTableMap(
         apex_read_register(pDevContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
 
     // MMU translation is activated by page_table_init=1 (written in ApexPageTableInit).
-    // There is no separate translation_enable register in Beagle hardware.
-
     WdfSpinLockRelease(pDevContext->PageTableLock);
 
-    // Device virtual address starts at 0
-    *DeviceAddress = 0;
-
-    // Keep MDL locked - will unlock in cleanup
+    // Keep MDL locked - will unlock in cleanup. (Single-slot tracking is a legacy
+    // limitation; multiple concurrent maps overwrite the slot. Caller responsible.)
     pDevContext->LockedModelMdl = mdl;
     pDevContext->LockedModelSize = Size;
 
-    DbgPrint("[%s] Mapped %lu pages: UserBuffer=%p, DeviceAddr=0x%llx\n",
-             __FUNCTION__, pageCount, UserBuffer, *DeviceAddress);
-    DbgPrint("[%s] Pages locked and will remain locked during inference\n", __FUNCTION__);
+    DbgPrint("[%s] Mapped %lu pages: UserBuffer=%p, DeviceAddr=0x%llx PTE[%lu..%lu]\n",
+             __FUNCTION__, pageCount, UserBuffer, *DeviceAddress, startPte, startPte + pageCount - 1);
     DbgPrint("[%s] Saved MDL: %p, Size: 0x%llx\n", __FUNCTION__, mdl, Size);
 
     return STATUS_SUCCESS;
@@ -229,10 +232,12 @@ NTSTATUS ApexPageTableUnmap(
         return STATUS_DEVICE_NOT_READY;
     }
 
+    UINT32 startPte = (UINT32)(DeviceAddress >> PAGE_SHIFT);
     pageCount = (UINT32)((Size + PAGE_SIZE - 1) / PAGE_SIZE);
 
-    if (pageCount > pDevContext->PageTableSize) {
-        DbgPrint("[%s] Invalid page count: %lu\n", __FUNCTION__, pageCount);
+    if (startPte + pageCount > pDevContext->PageTableSize) {
+        DbgPrint("[%s] Invalid range: PTE[%lu..%lu]\n",
+                 __FUNCTION__, startPte, startPte + pageCount - 1);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -240,21 +245,21 @@ NTSTATUS ApexPageTableUnmap(
 
     WdfSpinLockAcquire(pDevContext->PageTableLock);
 
-    // Clear page table entries
+    // Clear page table entries at device VA
     for (i = 0; i < pageCount; i++) {
-        pte[i].status = PTE_FREE;
+        pte[startPte + i].status = PTE_FREE;
 
         apex_write_register(
             pDevContext->Bar2BaseAddress,
-            APEX_REG_PAGE_TABLE + (i * 8),
+            APEX_REG_PAGE_TABLE + ((startPte + i) * 8),
             0
         );
     }
 
     WdfSpinLockRelease(pDevContext->PageTableLock);
 
-    DbgPrint("[%s] Unmapped %lu pages at device address 0x%llx\n",
-             __FUNCTION__, pageCount, DeviceAddress);
+    DbgPrint("[%s] Unmapped %lu pages at device VA 0x%llx PTE[%lu..%lu]\n",
+             __FUNCTION__, pageCount, DeviceAddress, startPte, startPte + pageCount - 1);
 
     return STATUS_SUCCESS;
 }

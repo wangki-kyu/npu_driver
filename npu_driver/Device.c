@@ -50,6 +50,11 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 		deviceContext->InferInputMdl = NULL;
 		deviceContext->InferOutputMdl = NULL;
 
+		// Cached parameter MDL (IOCTL_PARAM_CACHE 가 채움)
+		deviceContext->CachedParamMdl = NULL;
+		deviceContext->CachedParamPteIdx = 0;
+		deviceContext->CachedParamPageCount = 0;
+
 		// Initialize descriptor ring fields
 		deviceContext->DescRingBase = NULL;
 		deviceContext->DescRingDeviceVA = 0;
@@ -60,17 +65,28 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 		// Initialize inference completion event
 		KeInitializeEvent(&deviceContext->InferCompleteEvent, NotificationEvent, FALSE);
 
-		// Create interrupt handler
+		// Create interrupt handlers for all 4 MSI-X vectors that chip exposes.
+		// Same ISR/DPC for all — MessageID parameter in ISR distinguishes which
+		// vector fired. Without registering all 4, Windows may route chip's
+		// interrupt to a vector with no handler → ISR never fires.
 		{
-			WDF_INTERRUPT_CONFIG interruptConfig;
-			WDF_INTERRUPT_CONFIG_INIT(&interruptConfig,
-				npudriverEvtInterruptIsr,
-				npudriverEvtInterruptDpc);
-			status = WdfInterruptCreate(device, &interruptConfig,
-				WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->Interrupts[0]);
-			if (!NT_SUCCESS(status)) {
-				DbgPrint("[%s] WdfInterruptCreate failed: 0x%x\n", __FUNCTION__, status);
-				return status;
+			deviceContext->IsrCallCount = 0;
+			for (ULONG i = 0; i < 4; ++i) {
+				WDF_INTERRUPT_CONFIG interruptConfig;
+				WDF_INTERRUPT_CONFIG_INIT(&interruptConfig,
+					npudriverEvtInterruptIsr,
+					npudriverEvtInterruptDpc);
+				interruptConfig.EvtInterruptEnable  = npudriverEvtInterruptEnable;
+				interruptConfig.EvtInterruptDisable = npudriverEvtInterruptDisable;
+				status = WdfInterruptCreate(device, &interruptConfig,
+					WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->Interrupts[i]);
+				if (!NT_SUCCESS(status)) {
+					DbgPrint("[%s] WdfInterruptCreate[%lu] failed: 0x%x\n",
+						__FUNCTION__, i, status);
+					return status;
+				}
+				DbgPrint("[%s] WdfInterruptCreate[%lu] OK (Interrupts[%lu]=%p)\n",
+					__FUNCTION__, i, i, deviceContext->Interrupts[i]);
 			}
 		}
 
@@ -180,7 +196,11 @@ npudriverEvtDevicePrepareHardware(
 
 	DbgPrint("[%s] Starting GCB quit-reset sequence\n", __FUNCTION__);
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x0, 2, 14); // Disable RAM shutdown
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x0, 2, 18); // Disable clock gate
+	// rg_gated_gcb (SCU_2 bits[19:18]) — libedgetpu values:
+	//   0x0 = deprecated, 0x1 = hardware clock gated, 0x2 = no clock gating (force on)
+	// 0x0 (deprecated) puts GCB in undefined gating state — large bitstreams (INFER)
+	// stall mid-execution. 0x2 (force on) matches DisableHardwareClockGate().
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 18); // rg_gated_gcb = no clock gating
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 2);  // Exit reset
 
 	// Wait for RAM enable to complete (bit 6 of SCU_3 should clear)
@@ -228,12 +248,49 @@ npudriverEvtDevicePrepareHardware(
 	// Clear AXI quiesce — MUST happen after quit-reset, before run controls.
 	// If left set, scalar core cannot push DMA descriptors to INFEED/OUTFEED via
 	// internal AXI bus: engines do exactly ONE DMA (the pre-quiesce one) then halt at 0x4.
+	//
+	// Observation: simple write of 0 does NOT clear bit 21 (0x00200000) on this board.
+	// The bit appears to be either W1C, or driven by another source (SCU clock gate).
+	// Try in sequence: (a) write 0, (b) W1C the stuck bits, (c) RMW SCU_2 rg_gated_gcb
+	// to 0x0 (gasket-driver style un-gate), then re-read.
 	{
-		UINT32 aqBefore = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x\n", __FUNCTION__, aqBefore);
-		apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AXI_QUIESCE, 0);
-		UINT32 aqAfter = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE after clear: 0x%08x\n", __FUNCTION__, aqAfter);
+		PVOID bar2 = deviceContext->Bar2BaseAddress;
+		UINT32 aq0 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x\n", __FUNCTION__, aq0);
+
+		// (a) plain zero write
+		apex_write_register_32(bar2, APEX_REG_AXI_QUIESCE, 0);
+		UINT32 aq1 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+		DbgPrint("[%s] AXI_QUIESCE after plain 0 write: 0x%08x\n", __FUNCTION__, aq1);
+
+		// (b) W1C — write back the bits that were set, attempting to clear
+		if (aq1 != 0) {
+			apex_write_register_32(bar2, APEX_REG_AXI_QUIESCE, aq1);
+			UINT32 aq2 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+			DbgPrint("[%s] AXI_QUIESCE after W1C(0x%08x): 0x%08x\n", __FUNCTION__, aq1, aq2);
+		}
+
+		// (c) gasket-driver style: rg_gated_gcb = 0x0 (un-gate via SCU_2 bits[19:18]).
+		// libedgetpu uses 0x2 (force-on); gasket uses 0x0 (deprecated per libedgetpu but
+		// what gasket actually writes when un-gating). Some chips need 0x0 to actually
+		// release internal AXI quiesce. Try this if bit 21 still stuck.
+		UINT32 aqStillStuck = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+		if (aqStillStuck != 0) {
+			DbgPrint("[%s] AXI_QUIESCE still 0x%08x — trying rg_gated_gcb=0x0 (gasket style)\n",
+				__FUNCTION__, aqStillStuck);
+			apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x0, 2, 18); // rg_gated_gcb = 0
+			KeStallExecutionProcessor(100);
+
+			// Try plain zero write again after clock gate change
+			apex_write_register_32(bar2, APEX_REG_AXI_QUIESCE, 0);
+			UINT32 aq3 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
+			DbgPrint("[%s] AXI_QUIESCE after gasket-style un-gate + write 0: 0x%08x\n",
+				__FUNCTION__, aq3);
+
+			// Restore libedgetpu-style force-on if user prefers (commented out — leave 0x0
+			// in place to match gasket behavior unless we learn this breaks something)
+			// apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x2, 2, 18);
+		}
 	}
 
 	// Unpause DMA engines — the pause written before reset must be explicitly cleared.
@@ -457,13 +514,17 @@ npudriverEvtDevicePrepareHardware(
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
 
 		// Disable breakpoints — default after GCB reset is 0 = "halt at PC=0".
-		apex_write_register(bar2, APEX_REG_SCALAR_BREAKPOINT,        0xFFFFFFFFFFFFFFFFULL);
-		apex_write_register(bar2, APEX_REG_INFEED_BREAKPOINT,        0xFFFFFFFFFFFFFFFFULL);
-		apex_write_register(bar2, APEX_REG_OUTFEED_BREAKPOINT,       0xFFFFFFFFFFFFFFFFULL);
-		apex_write_register(bar2, APEX_REG_PARAMETER_POP_BREAKPOINT, 0xFFFFFFFFFFFFFFFFULL);
-		apex_write_register(bar2, APEX_REG_AVDATA_POP_BREAKPOINT,    0xFFFFFFFFFFFFFFFFULL);
-		apex_write_register(bar2, APEX_REG_TILE_OP_BREAKPOINT,       0xFFFFFFFFFFFFFFFFULL);
-		DbgPrint("[%s] Breakpoints disabled\n", __FUNCTION__);
+		// Readback showed SCALAR_BREAKPOINT latched only 0x7fff after writing all-Fs
+		// — the register is narrow (probably 15 bits = max PC range). Any value that
+		// is "well above any valid PC" disables breakpoints. Use 0x7fff explicitly so
+		// the readback matches the expectation and we know the write path works.
+		apex_write_register_32(bar2, APEX_REG_SCALAR_BREAKPOINT,        0x7FFF);
+		apex_write_register_32(bar2, APEX_REG_INFEED_BREAKPOINT,        0x7FFF);
+		apex_write_register_32(bar2, APEX_REG_OUTFEED_BREAKPOINT,       0x7FFF);
+		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_BREAKPOINT, 0x7FFF);
+		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_BREAKPOINT,    0x7FFF);
+		apex_write_register_32(bar2, APEX_REG_TILE_OP_BREAKPOINT,       0x7FFF);
+		DbgPrint("[%s] Breakpoints disabled (set to max-PC 0x7fff)\n", __FUNCTION__);
 
 		// TILE_CONFIG0 broadcast to all 7 tile groups, poll for acknowledgment.
 		// Must happen before tile run controls (run_controller.cc:118-128).
@@ -734,6 +795,32 @@ npudriverEvtFileCleanup(
 		IoFreeMdl(deviceContext->InferScratchMdl);
 		deviceContext->InferScratchMdl = NULL;
 	}
+
+	// Cleanup cached parameters (kept mapped throughout file handle lifetime)
+	if (deviceContext->CachedParamMdl != NULL) {
+		PVOID bar2 = deviceContext->Bar2BaseAddress;
+		UINT32 i;
+		DbgPrint("[%s] Releasing cached parameters: PTE[%u..%u] (%u pages)\n",
+			__FUNCTION__,
+			deviceContext->CachedParamPteIdx,
+			deviceContext->CachedParamPteIdx + deviceContext->CachedParamPageCount - 1,
+			deviceContext->CachedParamPageCount);
+
+		if (bar2 != NULL) {
+			WdfSpinLockAcquire(deviceContext->PageTableLock);
+			for (i = 0; i < deviceContext->CachedParamPageCount; i++) {
+				apex_write_register(bar2,
+					APEX_REG_PAGE_TABLE + ((deviceContext->CachedParamPteIdx + i) * 8), 0);
+			}
+			WdfSpinLockRelease(deviceContext->PageTableLock);
+		}
+
+		MmUnlockPages(deviceContext->CachedParamMdl);
+		IoFreeMdl(deviceContext->CachedParamMdl);
+		deviceContext->CachedParamMdl = NULL;
+		deviceContext->CachedParamPteIdx = 0;
+		deviceContext->CachedParamPageCount = 0;
+	}
 }
 
 // Coral
@@ -756,31 +843,71 @@ VOID npudriverReadTemperature(WDFDEVICE Device)
 
 BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 {
-	UNREFERENCED_PARAMETER(MessageID);
-
 	WDFDEVICE device = WdfInterruptGetDevice(Interrupt);
 	PDEVICE_CONTEXT pDevContext = DeviceGetContext(device);
 
+	// Unconditional log: even spurious calls (pending==0) get traced so we can
+	// verify whether MSI-X is delivering anything at all. Counter survives
+	// across calls so we see total interrupt fire count.
+	InterlockedIncrement(&pDevContext->IsrCallCount);
+	LONG callNum = pDevContext->IsrCallCount;
+
 	if (pDevContext->Bar2BaseAddress == NULL) {
+		DbgPrint("[ISR#%d] called with MessageID=%lu but BAR2 not mapped — return FALSE\n",
+			callNum, MessageID);
 		return FALSE;
 	}
 
 	UINT64 pending = apex_read_register(pDevContext->Bar2BaseAddress,
 									   APEX_REG_WIRE_INT_PENDING);
+	UINT64 iqIntStatus = apex_read_register(pDevContext->Bar2BaseAddress,
+											APEX_REG_INSTR_QUEUE_INT_STATUS);
+
+	// Always log entry — pending==0 case included
+	DbgPrint("[ISR#%d] MessageID=%lu pending=0x%llx iq_int=0x%llx\n",
+		callNum, MessageID, pending, iqIntStatus);
+
 	if (pending == 0) {
+		// Not our interrupt (or already cleared). Tell KMDF to try other handlers.
 		return FALSE;
 	}
 
-	UINT64 iqIntStatus = apex_read_register(pDevContext->Bar2BaseAddress,
-											APEX_REG_INSTR_QUEUE_INT_STATUS);
-	DbgPrint("[%s] Interrupt pending: 0x%llx iq_int_status=0x%llx\n",
-			 __FUNCTION__, pending, iqIntStatus);
-
+	// W1C: writing the pending bits clears them
 	apex_write_register(pDevContext->Bar2BaseAddress,
 					   APEX_REG_WIRE_INT_PENDING, pending);
 
 	WdfInterruptQueueDpcForIsr(Interrupt);
 	return TRUE;
+}
+
+NTSTATUS npudriverEvtInterruptEnable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
+{
+	UNREFERENCED_PARAMETER(Interrupt);
+	PDEVICE_CONTEXT pDevContext = DeviceGetContext(Device);
+	DbgPrint("[%s] KMDF enabling MSI-X — chip-side routing already done in PrepareHardware\n",
+		__FUNCTION__);
+	if (pDevContext->Bar2BaseAddress != NULL) {
+		PVOID bar2 = pDevContext->Bar2BaseAddress;
+		DbgPrint("[ENABLE] WIRE_INT_MASK=0x%llx WIRE_INT_PENDING=0x%llx IQ_INT_STATUS=0x%llx IQ_INT_CTRL=0x%llx SC_HOST_INT_CTRL=0x%llx\n",
+			apex_read_register(bar2, APEX_REG_WIRE_INT_MASK),
+			apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING),
+			apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_STATUS),
+			apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_CONTROL),
+			apex_read_register(bar2, APEX_REG_SC_HOST_INT_CONTROL));
+		DbgPrint("[ENABLE] TOP_LEVEL_INTVECCTL=0x%llx INSTR_QUEUE_INTVECCTL=0x%llx SC_HOST_INTVECCTL=0x%llx\n",
+			apex_read_register(bar2, APEX_REG_TOP_LEVEL_INTVECCTL),
+			apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INTVECCTL),
+			apex_read_register(bar2, APEX_REG_SC_HOST_INTVECCTL));
+	}
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS npudriverEvtInterruptDisable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
+{
+	UNREFERENCED_PARAMETER(Interrupt);
+	UNREFERENCED_PARAMETER(Device);
+	DbgPrint("[%s] KMDF disabling MSI-X\n", __FUNCTION__);
+	return STATUS_SUCCESS;
 }
 
 VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)

@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 #include <fstream>
+#include <cmath>
 
 // Must define NOMINMAX before including Windows.h to avoid macro conflicts with std::max/min
 #define NOMINMAX
@@ -204,18 +205,24 @@ int main()
 
     DWORD bytesReturned = 0;
 
-    // Phase 1: Parameter caching — load weights into on-chip SRAM via PARAMETER_CACHING executable
+    // PARAM device VA — INFER bitstream 도 같은 값으로 패치되어야 한다 (libedgetpu
+    // MapParameters 패턴: PARAMETER_CACHING / main 양쪽 executable 이 같은 device VA 의
+    // parameter buffer 를 참조함). Phase 1 가 없는 STAND_ALONE 모델에서는 0.
+    uint64_t param_va = 0;
+    void* pParametersBuf = nullptr;  // INFER 동안 살아있어야 함 (kernel MDL pinned)
+
+    // Phase 1: Parameter caching — load weights into on-chip cache via PARAMETER_CACHING executable
     if (!model.param_bitstream.empty() && !model.parameters.empty()) {
         std::cout << "\n--- Phase 1: Parameter Caching ---" << std::endl;
 
         // param_va: device VA for parameters data, immediately after exe1 bitstream
-        uint64_t param_va = apex_fb::PageAlignUp(model.param_bitstream.size());
+        param_va = apex_fb::PageAlignUp(model.param_bitstream.size());
         apex_fb::PatchParamBitstreamVAs(model, param_va);
         std::cout << "exe1 bitstream patched:" << std::endl;
         apex_fb::DumpParamPatchedVAs(model);
 
         void* pParamBitstreamBuf = AllocateAlignedMemory(model.param_bitstream.size(), 4096);
-        void* pParametersBuf     = AllocateAlignedMemory(model.parameters.size(), 4096);
+        pParametersBuf           = AllocateAlignedMemory(model.parameters.size(), 4096);
 
         if (pParamBitstreamBuf == nullptr || pParametersBuf == nullptr) {
             std::cout << "Failed to allocate Phase 1 buffers" << std::endl;
@@ -231,10 +238,11 @@ int main()
         std::cout << "Phase 1 buffers: bitstream=" << model.param_bitstream.size()
                   << "B  parameters=" << model.parameters.size() << "B" << std::endl;
 
-        // Map exe1 bitstream at device VA 0x0
+        // Map exe1 bitstream at device VA 0x0 (PTE[0..N1])
         MAP_BUFFER_INPUT mapP1 = {};
         mapP1.UserAddress = (UINT64)pParamBitstreamBuf;
         mapP1.Size = model.param_bitstream.size();
+        mapP1.DeviceAddress = 0;
         bool p1Ok = DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapP1, sizeof(MAP_BUFFER_INPUT),
                                     nullptr, 0, &bytesReturned, nullptr) != 0;
         if (!p1Ok) {
@@ -247,29 +255,35 @@ int main()
         }
         std::cout << "Phase 1: exe1 bitstream mapped at device VA 0x0" << std::endl;
 
-        // Run PARAMETER_CACHING: kernel locks params, writes PTEs, submits IQ, polls done
+        // ===== FULL PARAMETER_CACHING MODE =====
+        // PARAMETER_CACHING bitstream 을 IQ 에 제출 → 하드웨어가 weights 를 on-chip
+        // SRAM 으로 DMA 해 캐시. 이게 INFER 의 전제 조건. 끝에 halt 명령으로 INFEED/
+        // PARAM 이 kHalted=0x4 로 떨어지지만, on-chip 에는 weights 가 올라가있음.
+        // INFER 진입 직전 엔진을 깨우는 방법을 찾는 게 다음 과제.
         IOCTL_PARAM_CACHE_INFO pci = {};
         pci.ParamAddr     = (UINT64)pParametersBuf;
         pci.ParamSize     = model.parameters.size();
         pci.ParamDeviceVA = param_va;
-        pci.BitstreamSize = model.param_bitstream.size();
+        pci.BitstreamSize = model.param_bitstream.size();  // ← bitstream 정상 제출
         p1Ok = DeviceIoControl(handle, IOCTL_PARAM_CACHE, &pci, sizeof(IOCTL_PARAM_CACHE_INFO),
                                nullptr, 0, &bytesReturned, nullptr) != 0;
-        std::cout << (p1Ok ? "IOCTL_PARAM_CACHE succeeded! Weights loaded into SRAM."
+        std::cout << (p1Ok ? "IOCTL_PARAM_CACHE succeeded! Weights cached on-chip."
                            : "IOCTL_PARAM_CACHE FAILED!") << std::endl;
         if (!p1Ok) std::cout << "  error: " << GetLastError() << std::endl;
 
-        // Unmap exe1 bitstream (clears PTE[0..N1])
+        // Unmap exe1 bitstream (clears PTE[0..N1]) — params 는 여전히 PTE[N..]에 살아있음
         UNMAP_BUFFER_INPUT unmapP1 = {};
         unmapP1.DeviceAddress = 0;
         unmapP1.Size = model.param_bitstream.size();
         DeviceIoControl(handle, IOCTL_UNMAP_BUFFER, &unmapP1, sizeof(UNMAP_BUFFER_INPUT),
                         nullptr, 0, &bytesReturned, nullptr);
 
-        FreeAlignedMemory(pParametersBuf);
         FreeAlignedMemory(pParamBitstreamBuf);
+        // pParametersBuf 는 INFER 끝나고 free — kernel MDL 이 물리 페이지를 핀하고 있어도
+        // user-space VA 를 살려두는 게 안전.
 
         if (!p1Ok) {
+            FreeAlignedMemory(pParametersBuf);
             CloseHandle(handle);
             CoUninitialize();
             return 1;
@@ -279,16 +293,19 @@ int main()
         std::cout << "No parameter caching needed (STAND_ALONE model)" << std::endl;
     }
 
-    // 2. Calculate device VAs
-    //    Layout: [bitstream@0x0] [input@input_va] [output@output_va] [scratch@scratch_va]
+    // 2. Calculate device VAs — params 영역 (PTE[3..1502], 0x3000~0x5DF000) 과 충돌 금지.
+    //    INFER bitstream 을 params 뒤로 이동: [params@0x3000] ... [bitstream@bitstream_va] [input] [output] [scratch]
     const size_t INPUT_SIZE   = model.input_layers[0].size_bytes;
     const size_t OUTPUT_SIZE  = model.total_output_size_bytes;  // all output layers, page-aligned
     const size_t SCRATCH_SIZE = model.scratch_size_bytes;
-    uint64_t input_va   = apex_fb::PageAlignUp(model.bitstream.size());
-    uint64_t output_va  = input_va  + apex_fb::PageAlignUp(INPUT_SIZE);
+    // 0x600000 = 6MB, params (0x3000~0x5DEB00, ~6MB) 끝나고 충분한 여유
+    uint64_t bitstream_va = 0x600000ULL;
+    uint64_t input_va   = bitstream_va + apex_fb::PageAlignUp(model.bitstream.size());
+    uint64_t output_va  = input_va     + apex_fb::PageAlignUp(INPUT_SIZE);
     uint64_t scratch_va = (SCRATCH_SIZE > 0)
                           ? output_va + apex_fb::PageAlignUp(OUTPUT_SIZE)
                           : 0;
+    std::cout << "Bitstream device VA: 0x" << std::hex << bitstream_va << std::dec << std::endl;
 
     std::cout << "Input device VA:   0x" << std::hex << input_va   << std::dec << std::endl;
     std::cout << "Output device VA:  0x" << std::hex << output_va  << std::dec << std::endl;
@@ -299,7 +316,10 @@ int main()
     std::cout << "--- VA map (before patch) ---" << std::endl;
     apex_fb::DumpPatchedVAs(model);
 
-    apex_fb::PatchVAs(model, input_va, output_va, 0, scratch_va);
+    // INFER bitstream 도 PARAMETER_CACHING 과 같은 device VA 로 PARAM 패치 (libedgetpu
+    // single_tpu_request.cc:77 + instruction_buffers.cc:79~ 패턴: 양쪽 executable 이
+    // 같은 parameter_device_buffer.device_address() 를 link 함).
+    apex_fb::PatchVAs(model, input_va, output_va, param_va, scratch_va);
 
     std::cout << "--- VA map (after patch) ---" << std::endl;
     apex_fb::DumpPatchedVAs(model);
@@ -317,10 +337,11 @@ int main()
     std::cout << "Model buffer allocated at 0x" << std::hex << (UINT64)pModelBuffer
               << std::dec << " size: " << model.bitstream.size() << " bytes" << std::endl;
 
-    // 5. Map patched bitstream
-    MAP_BUFFER_INPUT mapInput;
+    // 5. Map patched bitstream at bitstream_va (params 뒤쪽 — PTE 충돌 방지)
+    MAP_BUFFER_INPUT mapInput = {};
     mapInput.UserAddress = (UINT64)pModelBuffer;
     mapInput.Size = model.bitstream.size();
+    mapInput.DeviceAddress = bitstream_va;
 
     std::cout << "Mapping model buffer..." << std::endl;
     BOOL result = DeviceIoControl(
@@ -364,9 +385,15 @@ int main()
                   << std::dec << " size: " << SCRATCH_SIZE << " bytes" << std::endl;
     }
 
-    // Load real image
-    std::cout << "Loading image from assets/aespa.jpg..." << std::endl;
-    if (!LoadJpegToRGB(L".\\assets\\aespa.jpg", pImageBuf, 320, 320)) {
+    // Load real image — dimension은 모델에서 동적으로 도출.
+    // 24bpp RGB 가정 (3 channels). square 이미지 가정 (224x224, 300x300, 320x320 등).
+    UINT imgSide = static_cast<UINT>(std::sqrt(static_cast<double>(INPUT_SIZE) / 3.0));
+    if (imgSide * imgSide * 3 != INPUT_SIZE) {
+        std::cout << "WARNING: input size " << INPUT_SIZE
+                  << " is not square*3 — falling back to imgSide=" << imgSide << std::endl;
+    }
+    std::cout << "Loading image from assets/aespa.jpg... (target " << imgSide << "x" << imgSide << ")" << std::endl;
+    if (!LoadJpegToRGB(L".\\assets\\aespa.jpg", pImageBuf, imgSide, imgSide)) {
         std::cout << "Failed to load image" << std::endl;
         if (pScratchBuf) FreeAlignedMemory(pScratchBuf);
         FreeAlignedMemory(pOutputBuf);
@@ -392,7 +419,7 @@ int main()
     inferInput.OutputBufferSize  = OUTPUT_SIZE;
     inferInput.InputDeviceVA     = input_va;
     inferInput.OutputDeviceVA    = output_va;
-    inferInput.BitstreamDeviceVA = 0;
+    inferInput.BitstreamDeviceVA = bitstream_va;
     inferInput.BitstreamSize     = model.bitstream.size();
     inferInput.ScratchAddr       = (UINT64)pScratchBuf;
     inferInput.ScratchSize       = SCRATCH_SIZE;
@@ -439,10 +466,10 @@ int main()
         std::cout << std::dec << std::endl;
     }
 
-    // 8. Unmap buffer
+    // 8. Unmap INFER bitstream (params 는 driver 가 FileCleanup 에서 해제)
     std::cout << "Unmapping model buffer..." << std::endl;
     UNMAP_BUFFER_INPUT unmapInput;
-    unmapInput.DeviceAddress = 0;
+    unmapInput.DeviceAddress = bitstream_va;
     unmapInput.Size = model.bitstream.size();
 
     result = DeviceIoControl(
@@ -463,12 +490,14 @@ int main()
         std::cout << "IOCTL_UNMAP_BUFFER failed: " << GetLastError() << std::endl;
     }
 
-    // Cleanup
+    // Cleanup — CloseHandle 이 driver 의 FileCleanup 을 트리거해 CachedParamMdl 을
+    // 안전하게 unlock 한 뒤 파라미터 user buffer 를 free.
     FreeAlignedMemory(pImageBuf);
     FreeAlignedMemory(pOutputBuf);
     if (pScratchBuf) FreeAlignedMemory(pScratchBuf);
     FreeAlignedMemory(pModelBuffer);
     CloseHandle(handle);
+    if (pParametersBuf) FreeAlignedMemory(pParametersBuf);
     CoUninitialize();
 
     std::cout << "Test completed!" << std::endl;
