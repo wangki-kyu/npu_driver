@@ -1,6 +1,7 @@
 #include "Driver.h"
 #include "Memory.h"
 #include "Queue.h"
+#include <wdmguid.h>   // GUID_BUS_INTERFACE_STANDARD
 
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text(PAGE, npudriverCreateDevice)
@@ -10,6 +11,7 @@
 
 NTSTATUS npudriverSettingResourceInfo(WDFDEVICE Device, WDFCMRESLIST ResourceList);
 VOID npudriverReadTemperature(WDFDEVICE Device);
+NTSTATUS npudriverDumpMsixCapability(WDFDEVICE Device);
 
 NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 {
@@ -45,6 +47,8 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 		deviceContext->LockedModelMdl = NULL;
 		deviceContext->LockedModelSize = 0;
 		deviceContext->DeviceStatus = DEVICE_STATUS_DEAD;
+		deviceContext->Bar0BaseAddress = NULL;
+		deviceContext->Bar0Length = 0;
 
 		// Initialize inference MDLs
 		deviceContext->InferInputMdl = NULL;
@@ -129,14 +133,45 @@ npudriverEvtDevicePrepareHardware(
 	npudriverSettingResourceInfo(Device, ResourceList);
 	npudriverReadTemperature(Device);
 
+	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
+
+	// =============================================================
+	// SAVE MSI-X table BEFORE any chip reset.
+	//
+	// Reason: GCB reset (RAM shutdown -> RAM enable) wipes chip's
+	// internal SRAM that backs BAR2+0x46800. Windows wrote MSI host
+	// addr/data into this region during PCI enumeration. If we don't
+	// restore them after reset, chip cannot DMA MSI TLPs to host APIC
+	// -> no interrupts ever fire. Linux gasket handles this via
+	// gasket_interrupt_reinit_msix(). Windows KMDF does NOT auto-replay
+	// MSI-X programming after our chip-private reset, so we mirror it.
+	// =============================================================
+	if (deviceContext->Bar2BaseAddress) {
+		ULONG i;
+		DbgPrint("[%s] MSI-X SAVE (pre-reset) — reading BAR2+0x%x for 4 vectors\n",
+			__FUNCTION__, APEX_REG_KERNEL_HIB_MSIX_TABLE);
+		for (i = 0; i < APEX_INTERRUPT_COUNT; i++) {
+			ULONG ent = APEX_REG_KERNEL_HIB_MSIX_TABLE + i * APEX_MSIX_VECTOR_SIZE;
+			deviceContext->SavedMsixTable[i*4 + 0] = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 0);
+			deviceContext->SavedMsixTable[i*4 + 1] = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 4);
+			deviceContext->SavedMsixTable[i*4 + 2] = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 8);
+			deviceContext->SavedMsixTable[i*4 + 3] = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 12);
+			DbgPrint("[MSIX-SAVE] vec[%lu] addr=0x%08x_%08x data=0x%08x ctrl=0x%x\n",
+				i,
+				deviceContext->SavedMsixTable[i*4 + 1],
+				deviceContext->SavedMsixTable[i*4 + 0],
+				deviceContext->SavedMsixTable[i*4 + 2],
+				deviceContext->SavedMsixTable[i*4 + 3]);
+		}
+		deviceContext->MsixTableSaved = TRUE;
+	}
+
 	// Initialize page table for memory mapping
 	status = ApexPageTableInit(Device);
 	if (!NT_SUCCESS(status)) {
 		DbgPrint("[%s] ApexPageTableInit failed: 0x%x\n", __FUNCTION__, status);
 		return status;
 	}
-
-	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
 
 	// Pre-reset: GCB 리셋 전에 반드시 수행해야 하는 HIB 엔진 초기화.
 	// 공식 coral.sys 분석 결과 이 시퀀스 없이는 처리 클럭 도메인이 게이팅된 채 유지되어
@@ -194,6 +229,16 @@ npudriverEvtDevicePrepareHardware(
 		}
 	}
 
+	// EnableReset step 5 (libedgetpu beagle_top_level_handler.cc:221-223):
+	// Clear BULK credit by pulsing LSBs of gcbb_credit0 register.
+	// Without this pulse, the AXI bridge between host and GCB keeps stale BULK credits
+	// from the previous device session — scalar core's first DMA push to INFEED then
+	// hangs internally, and INFEED auto-halts to kHalted=0x4. This is the prime suspect
+	// for "INFEED stuck at kHalted after PARAM_CACHE" symptom we've been chasing.
+	DbgPrint("[%s] Pulsing gcbb_credit0 to clear stale BULK credit\n", __FUNCTION__);
+	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_GCBB_CREDIT0, 0xF);
+	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_GCBB_CREDIT0, 0x0);
+
 	DbgPrint("[%s] Starting GCB quit-reset sequence\n", __FUNCTION__);
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x0, 2, 14); // Disable RAM shutdown
 	// rg_gated_gcb (SCU_2 bits[19:18]) — libedgetpu values:
@@ -245,52 +290,29 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[%s] SCU_3 after power-state override: 0x%08x\n", __FUNCTION__, scu3After);
 	}
 
-	// Clear AXI quiesce — MUST happen after quit-reset, before run controls.
-	// If left set, scalar core cannot push DMA descriptors to INFEED/OUTFEED via
-	// internal AXI bus: engines do exactly ONE DMA (the pre-quiesce one) then halt at 0x4.
-	//
-	// Observation: simple write of 0 does NOT clear bit 21 (0x00200000) on this board.
-	// The bit appears to be either W1C, or driven by another source (SCU clock gate).
-	// Try in sequence: (a) write 0, (b) W1C the stuck bits, (c) RMW SCU_2 rg_gated_gcb
-	// to 0x0 (gasket-driver style un-gate), then re-read.
+	// Clear AXI quiesce — proper bit-precise RMW.
+	// Observation: blind whole-register write of 0 left bit 21 (0x00200000) stuck.
+	// gasket-driver does `gasket_read_modify_write_32(AXI_QUIESCE, 0x0, 1, 16)` —
+	// only bit 16 (axi_quiesce_request) is software-writable. Bit 21 is a STATUS
+	// mirror that follows bit 16 once SCU_2 rg_gated_gcb is 0x2 (force clock on).
+	// libedgetpu's DisableHardwareClockGate writes rg_gated_gcb=0x2 — NOT 0x0
+	// (which is "deprecated" per beagle_top_level_handler.cc:69, undefined behavior).
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
 		UINT32 aq0 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
 		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x\n", __FUNCTION__, aq0);
 
-		// (a) plain zero write
-		apex_write_register_32(bar2, APEX_REG_AXI_QUIESCE, 0);
+		// Step 1: ensure rg_gated_gcb = 0x2 (force clock on), libedgetpu-style.
+		apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x2, 2, 18);
+		KeStallExecutionProcessor(100);
+
+		// Step 2: clear bit 16 of AXI_QUIESCE (axi_quiesce_request).
+		apex_rmw_register_32(bar2, APEX_REG_AXI_QUIESCE, 0x0, 1, 16);
+		KeStallExecutionProcessor(100);
+
 		UINT32 aq1 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE after plain 0 write: 0x%08x\n", __FUNCTION__, aq1);
-
-		// (b) W1C — write back the bits that were set, attempting to clear
-		if (aq1 != 0) {
-			apex_write_register_32(bar2, APEX_REG_AXI_QUIESCE, aq1);
-			UINT32 aq2 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-			DbgPrint("[%s] AXI_QUIESCE after W1C(0x%08x): 0x%08x\n", __FUNCTION__, aq1, aq2);
-		}
-
-		// (c) gasket-driver style: rg_gated_gcb = 0x0 (un-gate via SCU_2 bits[19:18]).
-		// libedgetpu uses 0x2 (force-on); gasket uses 0x0 (deprecated per libedgetpu but
-		// what gasket actually writes when un-gating). Some chips need 0x0 to actually
-		// release internal AXI quiesce. Try this if bit 21 still stuck.
-		UINT32 aqStillStuck = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		if (aqStillStuck != 0) {
-			DbgPrint("[%s] AXI_QUIESCE still 0x%08x — trying rg_gated_gcb=0x0 (gasket style)\n",
-				__FUNCTION__, aqStillStuck);
-			apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x0, 2, 18); // rg_gated_gcb = 0
-			KeStallExecutionProcessor(100);
-
-			// Try plain zero write again after clock gate change
-			apex_write_register_32(bar2, APEX_REG_AXI_QUIESCE, 0);
-			UINT32 aq3 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-			DbgPrint("[%s] AXI_QUIESCE after gasket-style un-gate + write 0: 0x%08x\n",
-				__FUNCTION__, aq3);
-
-			// Restore libedgetpu-style force-on if user prefers (commented out — leave 0x0
-			// in place to match gasket behavior unless we learn this breaks something)
-			// apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x2, 2, 18);
-		}
+		DbgPrint("[%s] AXI_QUIESCE after rg_gated_gcb=0x2 + bit16=0: 0x%08x\n",
+			__FUNCTION__, aq1);
 	}
 
 	// Unpause DMA engines — the pause written before reset must be explicitly cleared.
@@ -327,15 +349,44 @@ npudriverEvtDevicePrepareHardware(
 						   APEX_REG_SC_HOST_INTVECCTL, 0);
 		DbgPrint("[%s] SC_HOST_INTVECCTL set to route to MSI-X vector 0\n", __FUNCTION__);
 
-		// SC_HOST_INT_CONTROL: enable the SC_HOST completion interrupt source
+		// SC_HOST_INT_CONTROL: enable ALL 4 SC_HOST completion interrupts (kNumInterrupts=4
+		// per scalar_core_controller.cc:32; libedgetpu writes (1<<4)-1=0xF, NOT 1).
 		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_SC_HOST_INT_CONTROL, 1);
-		DbgPrint("[%s] SC_HOST_INT_CONTROL → 1 (interrupt enabled)\n", __FUNCTION__);
+						   APEX_REG_SC_HOST_INT_CONTROL, 0xF);
+		DbgPrint("[%s] SC_HOST_INT_CONTROL → 0xF (4 SC_HOST interrupts enabled)\n", __FUNCTION__);
+
+		// TOP_LEVEL_INT_CONTROL: enable top-level aggregator (libedgetpu writes 0xF).
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_TOP_LEVEL_INT_CONTROL, 0xF);
+		DbgPrint("[%s] TOP_LEVEL_INT_CONTROL → 0xF\n", __FUNCTION__);
+
+		// FATAL_ERR_INT_CONTROL: enable fatal-error interrupt so HIB errors notify host.
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_FATAL_ERR_INT_CONTROL, 1);
+		DbgPrint("[%s] FATAL_ERR_INT_CONTROL → 1\n", __FUNCTION__);
+
+		// DMA_BURST_LIMITER: libedgetpu explicitly writes 0 here at chip open
+		// (mmio_driver.cc:288-295). Default is unspecified; chip may stall on long bursts.
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_DMA_BURST_LIMITER, 0);
+		DbgPrint("[%s] DMA_BURST_LIMITER → 0 (explicit)\n", __FUNCTION__);
 
 		// INSTR_QUEUE_INTVECCTL: route instruction queue interrupt to MSI-X vector 0
 		apex_write_register(deviceContext->Bar2BaseAddress,
 						   APEX_REG_INSTR_QUEUE_INTVECCTL, 0);
 		DbgPrint("[%s] INSTR_QUEUE_INTVECCTL → MSI-X vector 0\n", __FUNCTION__);
+
+		// Other queue/error INTVECCTL — gasket routes each to a unique vector but
+		// since we register only 4 vectors and all collapse to same handler, route to 0.
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_INPUT_ACTV_QUEUE_INTVECCTL, 0);
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_PARAM_QUEUE_INTVECCTL, 0);
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_OUTPUT_ACTV_QUEUE_INTVECCTL, 0);
+		apex_write_register(deviceContext->Bar2BaseAddress,
+						   APEX_REG_FATAL_ERR_INTVECCTL, 0);
+		DbgPrint("[%s] INPUT/PARAM/OUTPUT_ACTV/FATAL_ERR INTVECCTL → vector 0\n", __FUNCTION__);
 
 		// INSTR_QUEUE_INT_CONTROL: enable IQ completion interrupt (host_queue.h:84-85).
 		// Without this, IQ_INT_STATUS stays 0 and WIRE_INT_PENDING never fires for IQ.
@@ -354,6 +405,77 @@ npudriverEvtDevicePrepareHardware(
 		apex_write_register(deviceContext->Bar2BaseAddress,
 						   APEX_REG_WIRE_INT_MASK, 0);
 		DbgPrint("[%s] WIRE_INT_MASK cleared (interrupts unmasked)\n", __FUNCTION__);
+
+		// =====================================================================
+		// MSI-X TABLE UNMASK — chip-private MSI-X table at BAR2+0x46800.
+		// Read PCI MSI-X capability directly from PCI config space to discover
+		// the *real* table BIR/Offset that Windows uses. If chip's BAR2+0x46800
+		// table stays zero, it's because Windows pointed MSI-X somewhere else.
+		npudriverDumpMsixCapability(Device);
+
+		// =============================================================
+		// RESTORE MSI-X table (pair to the SAVE done before GCB reset).
+		// Without this, chip's BAR2+0x46800 RAM is full of zeros and the
+		// chip's MSI engine has no idea where to DMA the TLP to.
+		// =============================================================
+		if (deviceContext->MsixTableSaved) {
+			ULONG i;
+			DbgPrint("[%s] MSI-X RESTORE (post-reset) — writing 4 saved entries\n",
+				__FUNCTION__);
+			for (i = 0; i < APEX_INTERRUPT_COUNT; i++) {
+				ULONG ent = APEX_REG_KERNEL_HIB_MSIX_TABLE + i * APEX_MSIX_VECTOR_SIZE;
+				apex_write_register_32(deviceContext->Bar2BaseAddress, ent + 0,
+					deviceContext->SavedMsixTable[i*4 + 0]);
+				apex_write_register_32(deviceContext->Bar2BaseAddress, ent + 4,
+					deviceContext->SavedMsixTable[i*4 + 1]);
+				apex_write_register_32(deviceContext->Bar2BaseAddress, ent + 8,
+					deviceContext->SavedMsixTable[i*4 + 2]);
+				// vector_ctrl restored without the mask bit — the explicit
+				// mask-clear below also forces this to 0.
+				apex_write_register_32(deviceContext->Bar2BaseAddress, ent + 12, 0);
+				DbgPrint("[MSIX-REST] vec[%lu] wrote addr=0x%08x_%08x data=0x%08x\n",
+					i,
+					deviceContext->SavedMsixTable[i*4 + 1],
+					deviceContext->SavedMsixTable[i*4 + 0],
+					deviceContext->SavedMsixTable[i*4 + 2]);
+			}
+		}
+
+		// Apex chip places its MSI-X table inside BAR2 (NOT in standard PCI cap space).
+		// Linux gasket explicitly clears mask bits because pci_enable_msix_exact does
+		// not touch chip-private tables (gasket_interrupt.c::force_msix_interrupt_unmasking).
+		// Windows KMDF likewise does NOT touch this region — without this, the chip
+		// silently drops every MSI-X TLP and our ISR is never called.
+		// Layout: 16 bytes per vector, mask bit at byte offset +12 (MSIX_MASK_BIT_OFFSET).
+		// =====================================================================
+		{
+			ULONG i;
+			for (i = 0; i < APEX_INTERRUPT_COUNT; i++) {
+				ULONG mask_off = APEX_REG_KERNEL_HIB_MSIX_TABLE
+				                 + APEX_MSIX_MASK_BIT_OFFSET
+				                 + i * APEX_MSIX_VECTOR_SIZE;
+				apex_write_register_32(deviceContext->Bar2BaseAddress, mask_off, 0);
+			}
+			DbgPrint("[%s] MSI-X table mask bits cleared for %u vectors (BAR2+0x4680C..)\n",
+				__FUNCTION__, APEX_INTERRUPT_COUNT);
+
+			// FULL MSI-X table dump — entry layout (16 bytes each):
+			//   +0:  msg_addr_lo (host MSI address low)
+			//   +4:  msg_addr_hi (host MSI address high)
+			//   +8:  msg_data    (data Windows wants written by chip)
+			//   +12: vector_ctrl (bit 0 = mask)
+			// If addr/data are 0, Windows did NOT discover this MSI-X table —
+			// chip can't send TLP because it doesn't know where to send.
+			for (i = 0; i < APEX_INTERRUPT_COUNT; i++) {
+				ULONG ent = APEX_REG_KERNEL_HIB_MSIX_TABLE + i * APEX_MSIX_VECTOR_SIZE;
+				UINT32 alo = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 0);
+				UINT32 ahi = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 4);
+				UINT32 data= apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 8);
+				UINT32 mb  = apex_read_register_32(deviceContext->Bar2BaseAddress, ent + 12);
+				DbgPrint("[MSIX] vector[%u] addr=0x%08x_%08x data=0x%08x mask=0x%x\n",
+					i, ahi, alo, data, mb);
+			}
+		}
 
 		// gasket driver: poll both PAGE_TABLE_INIT and MSIX_TABLE_INIT together.
 		// Both must be non-zero before the HIB is considered fully initialized.
@@ -636,6 +758,33 @@ npudriverEvtDevicePrepareHardware(
 		}
 	}
 
+	// BAR0 dump — find where Windows actually wrote MSI address/data.
+	// Standard PCI MSI-X capability points to a BAR (often a separate one). For this
+	// chip, BAR0 (length 0x4000) is the suspected location. If addr/data here are
+	// non-zero we mirror them into the chip-private BAR2+0x46800 table.
+	if (deviceContext->Bar0BaseAddress != NULL) {
+		ULONG i;
+		DbgPrint("[BAR0] dumping first 32 dwords of BAR0 (len=0x%x):\n",
+			deviceContext->Bar0Length);
+		for (i = 0; i < 32; i++) {
+			UINT32 v = *(volatile UINT32*)((PUCHAR)deviceContext->Bar0BaseAddress + i*4);
+			if ((i % 4) == 0) DbgPrint("[BAR0+0x%03x] ", i*4);
+			DbgPrint("%08x ", v);
+			if ((i % 4) == 3) DbgPrint("\n");
+		}
+		DbgPrint("[BAR0 as MSI-X table — 4 entries x 16 bytes]:\n");
+		for (i = 0; i < 4; i++) {
+			UINT32 alo = *(volatile UINT32*)((PUCHAR)deviceContext->Bar0BaseAddress + i*16 + 0);
+			UINT32 ahi = *(volatile UINT32*)((PUCHAR)deviceContext->Bar0BaseAddress + i*16 + 4);
+			UINT32 dat = *(volatile UINT32*)((PUCHAR)deviceContext->Bar0BaseAddress + i*16 + 8);
+			UINT32 ctl = *(volatile UINT32*)((PUCHAR)deviceContext->Bar0BaseAddress + i*16 + 12);
+			DbgPrint("[BAR0 MSIX] vec[%u] addr=0x%08x_%08x data=0x%08x ctrl=0x%x\n",
+				i, ahi, alo, dat, ctl);
+		}
+	} else {
+		DbgPrint("[BAR0] NOT MAPPED — Windows did not expose BAR0 as a memory resource\n");
+	}
+
 	DbgPrint("[%s] Exit\n", __FUNCTION__);
 
 	return STATUS_SUCCESS;
@@ -663,7 +812,40 @@ NTSTATUS npudriverSettingResourceInfo(WDFDEVICE Device, WDFCMRESLIST ResourceLis
 			continue;
 		}
 
-		DbgPrint("[%s] Resource[%lu]: Type=%lu", __FUNCTION__, i, descriptor->Type);
+		DbgPrint("[%s] Resource[%lu]: Type=%lu (raw flags=0x%x)\n",
+			__FUNCTION__, i, descriptor->Type, descriptor->Flags);
+
+		// Type=129 = CmResourceTypeNonArbitrated(0x80) | CmResourceTypeMemory(0x01).
+		// PCI bus driver exposes MSI-X table location via raw/non-arbitrated memory
+		// descriptors. Map and dump these — they likely contain the MSI-X table
+		// the chip uses but Windows places it in a region we never mapped.
+		if (descriptor->Type == 129 || descriptor->Type == CmResourceTypeMemoryLarge) {
+			DbgPrint("[%s] Resource[%lu] (raw mem) Start=0x%llx Length=0x%lx Flags=0x%x\n",
+				__FUNCTION__, i,
+				descriptor->u.Memory.Start.QuadPart,
+				descriptor->u.Memory.Length,
+				descriptor->Flags);
+			// Try mapping a small one (likely MSI-X table size: 4 entries * 16 = 64 bytes
+			// or PBA ~ also small)
+			if (descriptor->u.Memory.Length > 0 && descriptor->u.Memory.Length <= 0x10000) {
+				PVOID raw = MmMapIoSpace(descriptor->u.Memory.Start,
+				                         descriptor->u.Memory.Length, MmNonCached);
+				if (raw) {
+					ULONG j;
+					ULONG nDw = (ULONG)min(descriptor->u.Memory.Length / 4, 32);
+					DbgPrint("[Res%lu] mapped @%p, dumping %lu dwords:\n", i, raw, nDw);
+					for (j = 0; j < nDw; j++) {
+						UINT32 v = *(volatile UINT32*)((PUCHAR)raw + j*4);
+						if ((j % 4) == 0) DbgPrint("[Res%lu+0x%03x] ", i, j*4);
+						DbgPrint("%08x ", v);
+						if ((j % 4) == 3) DbgPrint("\n");
+					}
+					MmUnmapIoSpace(raw, descriptor->u.Memory.Length);
+				} else {
+					DbgPrint("[Res%lu] MmMapIoSpace failed\n", i);
+				}
+			}
+		}
 
 		switch (descriptor->Type) {
 		case CmResourceTypeMemory:
@@ -671,7 +853,7 @@ NTSTATUS npudriverSettingResourceInfo(WDFDEVICE Device, WDFCMRESLIST ResourceLis
 				descriptor->u.Memory.Start.QuadPart,
 				descriptor->u.Memory.Length);
 
-			// save BAR2 
+			// save BAR2
 			if (descriptor->u.Memory.Length == 0x100000) {
 				deviceContext->Bar2Length = descriptor->u.Memory.Length;
 
@@ -680,6 +862,18 @@ NTSTATUS npudriverSettingResourceInfo(WDFDEVICE Device, WDFCMRESLIST ResourceLis
 					descriptor->u.Memory.Length,
 					MmNonCached
 				);
+			}
+			// save BAR0 (length 0x4000) — diagnostic. Standard PCI MSI-X table likely lives here.
+			else if (descriptor->u.Memory.Length == 0x4000) {
+				deviceContext->Bar0Length = descriptor->u.Memory.Length;
+				deviceContext->Bar0BaseAddress = MmMapIoSpace(
+					descriptor->u.Memory.Start,
+					descriptor->u.Memory.Length,
+					MmNonCached
+				);
+				DbgPrint("[%s] BAR0 mapped: VA=%p PA=0x%llx len=0x%x\n",
+					__FUNCTION__, deviceContext->Bar0BaseAddress,
+					descriptor->u.Memory.Start.QuadPart, descriptor->u.Memory.Length);
 			}
 
 			break;
@@ -742,6 +936,12 @@ npudriverEvtDeviceReleaseHardware(
 		MmUnmapIoSpace(deviceContext->Bar2BaseAddress, deviceContext->Bar2Length);
 		deviceContext->Bar2BaseAddress = NULL;
 		DbgPrint("[%s] BAR2 unmapped\n", __FUNCTION__);
+	}
+
+	if (deviceContext->Bar0BaseAddress != NULL) {
+		MmUnmapIoSpace(deviceContext->Bar0BaseAddress, deviceContext->Bar0Length);
+		deviceContext->Bar0BaseAddress = NULL;
+		DbgPrint("[%s] BAR0 unmapped\n", __FUNCTION__);
 	}
 
 	deviceContext->DeviceStatus = DEVICE_STATUS_DEAD;
@@ -882,10 +1082,26 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 
 NTSTATUS npudriverEvtInterruptEnable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
 {
-	UNREFERENCED_PARAMETER(Interrupt);
 	PDEVICE_CONTEXT pDevContext = DeviceGetContext(Device);
-	DbgPrint("[%s] KMDF enabling MSI-X — chip-side routing already done in PrepareHardware\n",
-		__FUNCTION__);
+	DbgPrint("[%s] KMDF enabling interrupt\n", __FUNCTION__);
+
+	// KMDF 1.15's WDF_INTERRUPT_INFO does NOT expose MessageAddress/MessageData
+	// (those fields exist in newer KMDF but not 1.15). We can still see if the
+	// interrupt is MessageSignaled (true=MSI-X, false=line-based) and which message
+	// number Windows assigned. If MessageSignaled=false, we know MSI-X is not even
+	// active — that alone is critical info.
+	WDF_INTERRUPT_INFO info;
+	WDF_INTERRUPT_INFO_INIT(&info);
+	WdfInterruptGetInfo(Interrupt, &info);
+
+	DbgPrint("[ENABLE] InterruptInfo: MessageSignaled=%d Vector=%lu MessageNumber=%lu Irql=%u Mode=%d Polarity=%d\n",
+		info.MessageSignaled, info.Vector, info.MessageNumber,
+		info.Irql, info.Mode, info.Polarity);
+
+	if (!info.MessageSignaled) {
+		DbgPrint("[ENABLE] WARNING: interrupt is LINE-BASED, not MSI-X — chip's MSI-X table will never be populated by Windows\n");
+	}
+
 	if (pDevContext->Bar2BaseAddress != NULL) {
 		PVOID bar2 = pDevContext->Bar2BaseAddress;
 		DbgPrint("[ENABLE] WIRE_INT_MASK=0x%llx WIRE_INT_PENDING=0x%llx IQ_INT_STATUS=0x%llx IQ_INT_CTRL=0x%llx SC_HOST_INT_CTRL=0x%llx\n",
@@ -898,7 +1114,23 @@ NTSTATUS npudriverEvtInterruptEnable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
 			apex_read_register(bar2, APEX_REG_TOP_LEVEL_INTVECCTL),
 			apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INTVECCTL),
 			apex_read_register(bar2, APEX_REG_SC_HOST_INTVECCTL));
+
+		// Snapshot the chip's MSI-X table again at this point — by now Windows
+		// MAY have populated it (timing matters). If still 0, Windows really
+		// isn't writing it; we'd need to read PCI config space MSI-X capability
+		// and find where Windows stashed message addr/data.
+		ULONG i;
+		for (i = 0; i < APEX_INTERRUPT_COUNT; i++) {
+			ULONG ent = APEX_REG_KERNEL_HIB_MSIX_TABLE + i * APEX_MSIX_VECTOR_SIZE;
+			UINT32 alo = apex_read_register_32(bar2, ent + 0);
+			UINT32 ahi = apex_read_register_32(bar2, ent + 4);
+			UINT32 dat = apex_read_register_32(bar2, ent + 8);
+			UINT32 ctl = apex_read_register_32(bar2, ent + 12);
+			DbgPrint("[ENABLE-MSIX] vec[%lu] addr=0x%08x_%08x data=0x%08x ctrl=0x%x\n",
+				i, ahi, alo, dat, ctl);
+		}
 	}
+
 	return STATUS_SUCCESS;
 }
 
@@ -942,5 +1174,97 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 
 	KeSetEvent(&pDevContext->InferCompleteEvent, IO_NO_INCREMENT, FALSE);
 	DbgPrint("[%s] InferCompleteEvent set\n", __FUNCTION__);
+}
+
+// ============================================================================
+// PCI configuration space walk to find the standard MSI-X capability (id=0x11).
+// Returns BIR (0..5 = BAR0..BAR5) and Table Offset within that BAR. This tells
+// us authoritatively where Windows placed the MSI-X table — without guessing.
+//
+// If chip's BAR2+0x46800 table is empty after this, it's because Windows wrote
+// addr/data into the BAR/offset reported here. We can then either (a) mirror
+// those values into chip's BAR2+0x46800, or (b) point chip at the real table.
+// ============================================================================
+NTSTATUS npudriverDumpMsixCapability(WDFDEVICE Device)
+{
+	BUS_INTERFACE_STANDARD bus = { 0 };
+	NTSTATUS status;
+	UCHAR hdr[64];
+	UCHAR cap[16];
+	UCHAR capPtr;
+	int safety;
+	UINT16 vendorId, deviceId, statusReg;
+	ULONG bytes;
+
+	status = WdfFdoQueryForInterface(
+		Device,
+		&GUID_BUS_INTERFACE_STANDARD,
+		(PINTERFACE)&bus,
+		sizeof(BUS_INTERFACE_STANDARD),
+		1, NULL);
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("[MSIX-CAP] WdfFdoQueryForInterface(BUS_INTERFACE_STANDARD) failed 0x%x\n", status);
+		return status;
+	}
+
+	bytes = bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, hdr, 0, 64);
+	if (bytes < 64) {
+		DbgPrint("[MSIX-CAP] GetBusData hdr failed (got %lu bytes)\n", bytes);
+		bus.InterfaceDereference(bus.Context);
+		return STATUS_UNSUCCESSFUL;
+	}
+
+	vendorId  = *(UINT16*)(hdr + 0x00);
+	deviceId  = *(UINT16*)(hdr + 0x02);
+	statusReg = *(UINT16*)(hdr + 0x06);
+	capPtr    = hdr[0x34];
+
+	DbgPrint("[MSIX-CAP] PCI VID=0x%04x DID=0x%04x Status=0x%04x CapPtr=0x%02x\n",
+		vendorId, deviceId, statusReg, capPtr);
+
+	if (!(statusReg & 0x10)) {  // PCI_STATUS_CAPABILITIES_LIST = 0x10
+		DbgPrint("[MSIX-CAP] device reports no capabilities list\n");
+		bus.InterfaceDereference(bus.Context);
+		return STATUS_NOT_FOUND;
+	}
+
+	safety = 32;
+	while (capPtr && capPtr != 0xFF && safety-- > 0) {
+		bytes = bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, cap, capPtr, 12);
+		if (bytes < 12) {
+			DbgPrint("[MSIX-CAP] read cap@0x%02x failed (got %lu)\n", capPtr, bytes);
+			break;
+		}
+		DbgPrint("[MSIX-CAP] cap@0x%02x id=0x%02x next=0x%02x msgctrl=0x%04x dw1=0x%08x dw2=0x%08x\n",
+			capPtr, cap[0], cap[1],
+			*(UINT16*)(cap + 2),
+			*(UINT32*)(cap + 4),
+			*(UINT32*)(cap + 8));
+
+		if (cap[0] == 0x11) {  // PCI_CAPABILITY_ID_MSIX
+			UINT16 msgCtrl = *(UINT16*)(cap + 2);
+			UINT32 tblBO   = *(UINT32*)(cap + 4);
+			UINT32 pbaBO   = *(UINT32*)(cap + 8);
+			UINT8  tblBir  = (UINT8)(tblBO & 0x7);
+			UINT32 tblOff  = tblBO & ~0x7u;
+			UINT8  pbaBir  = (UINT8)(pbaBO & 0x7);
+			UINT32 pbaOff  = pbaBO & ~0x7u;
+			UINT16 tblSize = (msgCtrl & 0x7FF) + 1;
+			BOOLEAN enabled = (msgCtrl & 0x8000) ? TRUE : FALSE;
+			BOOLEAN funcMask= (msgCtrl & 0x4000) ? TRUE : FALSE;
+
+			DbgPrint("[MSIX-CAP] *** MSI-X *** size=%u enabled=%u funcMask=%u\n",
+				tblSize, enabled, funcMask);
+			DbgPrint("[MSIX-CAP]   Table  BIR=%u Offset=0x%x  (BAR%u + 0x%x)\n",
+				tblBir, tblOff, tblBir, tblOff);
+			DbgPrint("[MSIX-CAP]   PBA    BIR=%u Offset=0x%x  (BAR%u + 0x%x)\n",
+				pbaBir, pbaOff, pbaBir, pbaOff);
+			break;
+		}
+		capPtr = cap[1];
+	}
+
+	bus.InterfaceDereference(bus.Context);
+	return STATUS_SUCCESS;
 }
 

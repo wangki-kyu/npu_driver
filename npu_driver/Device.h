@@ -15,6 +15,12 @@ typedef struct _DEVICE_CONTEXT
 	PVOID Bar2BaseAddress;	// MmMapIoSpace
 	ULONG Bar2Length;		//
 
+	// BAR0 — diagnostic mapping. Windows may have placed MSI-X table here per
+	// standard PCI MSI-X capability. We map and dump to find where MSI address/data
+	// actually live so we can mirror them into chip's BAR2 MSI-X table at 0x46800.
+	PVOID Bar0BaseAddress;
+	ULONG Bar0Length;
+
 	// Interrupt — chip allocates 4 MSI-X vectors. We register all 4 so that
 	// whichever vector chip targets, our ISR receives it. The single ISR uses
 	// MessageID to disambiguate.
@@ -64,6 +70,13 @@ typedef struct _DEVICE_CONTEXT
 
 	// ISR diagnostic counter (incremented on every ISR call, including spurious)
 	volatile LONG IsrCallCount;
+
+	// MSI-X table snapshot taken at PrepareHardware entry (before GCB reset wipes
+	// chip's internal SRAM that backs BAR2+0x46800). Restored just before the
+	// mask-bit clear so the chip has Windows-programmed addr/data again.
+	// Mirrors Linux gasket_interrupt_reinit_msix() behavior.
+	UINT32 SavedMsixTable[4 * 4];        // 4 vectors x {addr_lo, addr_hi, data, ctrl}
+	BOOLEAN MsixTableSaved;
 
 	ULONG PrivateDeviceData;  // just a placeholder
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;

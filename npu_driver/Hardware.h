@@ -117,7 +117,21 @@
 #define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (W1C: write 1 to clear)
 
 // ========== SC_HOST Interrupt Control ==========
-#define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 1 = enable SC_HOST completion interrupt
+#define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 0xF = enable all 4 SC_HOST completion interrupts (kNumInterrupts=4)
+#define APEX_REG_TOP_LEVEL_INT_CONTROL      0x486b0  // write 0xF = enable top-level aggregator interrupts
+#define APEX_REG_FATAL_ERR_INT_CONTROL      0x486c0  // write 1 = enable fatal-error interrupt
+#define APEX_REG_DMA_BURST_LIMITER          0x487a8  // axi DMA burst limiter (write 0 explicitly)
+
+// ========== MSI-X table inside BAR2 ==========
+// Apex chip places its MSI-X table at BAR2+0x46800 instead of standard PCI capability space.
+// Each entry is 16 bytes; mask bit lives at offset +12 of each entry.
+// Linux gasket explicitly clears these mask bits because pci_enable_msix_exact does not
+// (gasket_interrupt.c::force_msix_interrupt_unmasking, line 249).
+// Windows KMDF does NOT touch this region — we must do it ourselves or no MSI-X TLP is emitted.
+#define APEX_REG_KERNEL_HIB_MSIX_TABLE      0x46800
+#define APEX_MSIX_VECTOR_SIZE               16
+#define APEX_MSIX_MASK_BIT_OFFSET           12
+#define APEX_INTERRUPT_COUNT                4   // we register 4 vectors
 
 // ========== Status & Debug ==========
 #define APEX_REG_OMC0_D0                    0x01a0d0  // Temperature sensor
@@ -137,6 +151,12 @@
 #define APEX_REG_SCU_2                      (APEX_REG_SCU_BASE + 0x14)
 #define APEX_REG_SCU_3                      (APEX_REG_SCU_BASE + 0x18)
 #define APEX_REG_AXI_QUIESCE                (APEX_REG_SCU_BASE + 0x2C)
+
+// ========== CB Bridge (AXI bridge between Coral host and GCB) ==========
+// libedgetpu beagle_csr_offsets.h: kBeagleCbBridgeCsrOffsets
+// EnableReset 끝에 BULK credit pulse (0xF then 0x0) 가 필요. 안 하면 stale credit
+// 으로 scalar 의 첫 DMA push 가 internal hang → INFEED 자동 halt.
+#define APEX_REG_GCBB_CREDIT0               0x1907C  // BULK credit register
 
 // page table
 #define APEX_PAGE_TABLE_ENTRIES    8192
