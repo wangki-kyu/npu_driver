@@ -168,6 +168,74 @@ VOID npudriverEvtIoDeviceControl(
 				__FUNCTION__, pDevContext->IsrCallCount);
 		}
 
+		// =========================================================
+		// BITSTREAM PATCH VERIFICATION
+		// Dump first 256 B of the INFER bitstream the chip will read,
+		// then scan whole bitstream for the four patch values that
+		// userspace claims it patched in (INPUT/OUTPUT[0]/OUTPUT[1]/PARAM).
+		// If any are missing, OUTFEED/INFEED will write/read at chip
+		// defaults (often 0) and we silently get a 0-output buffer.
+		// pDevContext->LockedModelMdl tracks the most recent
+		// IOCTL_MAP_BUFFER, which after PARAM_CACHE was the INFER
+		// bitstream MAP — so it's exactly what we want here.
+		// =========================================================
+		if (pDevContext->LockedModelMdl != NULL) {
+			PUCHAR bskva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+				pDevContext->LockedModelMdl, NormalPagePriority);
+			ULONG bsLen = (ULONG)pDevContext->LockedModelSize;
+			if (bskva != NULL) {
+				DbgPrint("[BS-DUMP] kernel VA=%p size=%lu (0x%lx) deviceVA=0x%llx\n",
+					bskva, bsLen, bsLen, pInput->BitstreamDeviceVA);
+				DbgPrint("[BS-DUMP] [00] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					bskva[0],  bskva[1],  bskva[2],  bskva[3],  bskva[4],  bskva[5],  bskva[6],  bskva[7],
+					bskva[8],  bskva[9],  bskva[10], bskva[11], bskva[12], bskva[13], bskva[14], bskva[15]);
+				DbgPrint("[BS-DUMP] [10] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					bskva[16], bskva[17], bskva[18], bskva[19], bskva[20], bskva[21], bskva[22], bskva[23],
+					bskva[24], bskva[25], bskva[26], bskva[27], bskva[28], bskva[29], bskva[30], bskva[31]);
+				DbgPrint("[BS-DUMP] [20] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					bskva[32], bskva[33], bskva[34], bskva[35], bskva[36], bskva[37], bskva[38], bskva[39],
+					bskva[40], bskva[41], bskva[42], bskva[43], bskva[44], bskva[45], bskva[46], bskva[47]);
+				DbgPrint("[BS-DUMP] [30] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					bskva[48], bskva[49], bskva[50], bskva[51], bskva[52], bskva[53], bskva[54], bskva[55],
+					bskva[56], bskva[57], bskva[58], bskva[59], bskva[60], bskva[61], bskva[62], bskva[63]);
+
+				// Scan whole bitstream for 32-bit LE patch values.  Apex
+				// patches are dword-aligned in the bitstream, so we step
+				// in 4-byte units.  Report up to 4 hits per pattern.
+				{
+					UINT32 patterns[5] = {
+						(UINT32)pInput->InputDeviceVA,   // 0x631000
+						(UINT32)pInput->OutputDeviceVA,  // 0x67c000
+						(UINT32)(pInput->OutputDeviceVA + 0x2000), // 0x67e000 (OUTPUT[1])
+						0x3000u,                         // PARAM device VA
+						(UINT32)pInput->BitstreamDeviceVA // 0x600000 self-base
+					};
+					const char *names[5] = {"INPUT", "OUTPUT[0]", "OUTPUT[1]", "PARAM", "BITSTREAM_SELF"};
+					ULONG p, off, hits;
+					for (p = 0; p < 5; p++) {
+						hits = 0;
+						for (off = 0; off + 4 <= bsLen; off += 4) {
+							UINT32 v = *(UINT32 *)(bskva + off);
+							if (v == patterns[p]) {
+								if (hits < 4) {
+									DbgPrint("[BS-SCAN]   %s=0x%x found at off=0x%lx\n",
+										names[p], patterns[p], off);
+								}
+								hits++;
+							}
+						}
+						DbgPrint("[BS-SCAN] %s 0x%08x: %lu hit(s)%s\n",
+							names[p], patterns[p], hits,
+							(hits == 0) ? "  *** NOT FOUND — patch missing? ***" : "");
+					}
+				}
+			} else {
+				DbgPrint("[BS-DUMP] MmGetSystemAddressForMdlSafe(LockedModelMdl) returned NULL\n");
+			}
+		} else {
+			DbgPrint("[BS-DUMP] LockedModelMdl is NULL — bitstream MDL not retained, skipping verification\n");
+		}
+
 		// 1. Allocate and lock input image
 		inputImageMdl = IoAllocateMdl((PVOID)pInput->InputImageAddr,
 									   (ULONG)pInput->InputImageSize, FALSE, FALSE, NULL);
@@ -241,6 +309,14 @@ VOID npudriverEvtIoDeviceControl(
 		pDevContext->InferInputMdl   = inputImageMdl;
 		pDevContext->InferOutputMdl  = outputBufferMdl;
 		pDevContext->InferScratchMdl = scratchMdl;
+		// Save device VAs / sizes for DPC-time diagnostics.
+		pDevContext->InferOutputDeviceVA = pInput->OutputDeviceVA;
+		pDevContext->InferOutputSize     = pInput->OutputBufferSize;
+		pDevContext->InferInputDeviceVA  = pInput->InputDeviceVA;
+		pDevContext->InferInputSize      = pInput->InputImageSize;
+		// Reset cumulative ISR pending-bit log for this inference.
+		pDevContext->IsrSeenPendingBits = 0;
+		pDevContext->LastIsrWirePending = 0;
 		KeClearEvent(&pDevContext->InferCompleteEvent);
 
 		// 4. Register input image pages in page table
@@ -295,6 +371,25 @@ VOID npudriverEvtIoDeviceControl(
 				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr | 1);
 			}
 			WdfSpinLockRelease(pDevContext->PageTableLock);
+
+			// SENTINEL FILL: pre-fill the locked output pages with 0xCC so we
+			// can tell after inference whether OUTFEED actually wrote anything.
+			//   bytes still 0xCC after inference -> OUTFEED never wrote
+			//   bytes are 0x00                    -> OUTFEED wrote zeros (real
+			//                                        but useless inference output)
+			//   bytes are something else          -> OUTFEED wrote real data
+			{
+				PUCHAR outKva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+					outputBufferMdl, NormalPagePriority);
+				if (outKva != NULL) {
+					RtlFillMemory(outKva, (SIZE_T)pInput->OutputBufferSize, 0xCC);
+					DbgPrint("[%s] Output buffer pre-filled with 0xCC (size=%llu) at kVA=%p\n",
+						__FUNCTION__, pInput->OutputBufferSize, outKva);
+				} else {
+					DbgPrint("[%s] WARNING: cannot map output MDL to kernel VA — sentinel skipped\n",
+						__FUNCTION__);
+				}
+			}
 		}
 
 		// 5b. Register scratch buffer pages in page table
@@ -391,6 +486,18 @@ VOID npudriverEvtIoDeviceControl(
 
 		// 
 		//UINT64 pteValue = apex_read_register(bar2, APEX_REG_PAGE_TABLE + (0 * 8));
+
+		// === HIB credit dump (PRE-INFER-SUBMIT) — does descriptor submission
+		// itself consume credits?  If credits drop to 0 here, OUTFEED can't
+		// emit host writes during inference.
+		{
+			UINT32 c0 = apex_read_register_32(bar2, APEX_REG_HIB_INSTRUCTION_CREDITS);
+			UINT32 c1 = apex_read_register_32(bar2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
+			UINT32 c2 = apex_read_register_32(bar2, APEX_REG_HIB_PARAM_CREDITS);
+			UINT32 c3 = apex_read_register_32(bar2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+			DbgPrint("[CREDITS@PRE-INFER]   instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
+				c0, c1, c2, c3);
+		}
 
 		// Pre-submit engine state — 데이터/타일 엔진이 실제 kRunning 인지 확인
 		DbgPrint("[INFER] pre-submit SCALAR=0x%x AVDATA=0x%x OUTFEED=0x%x INFEED=0x%x PARAM=0x%x IQ_INT=0x%llx WIRE=0x%llx\n",
@@ -517,8 +624,14 @@ VOID npudriverEvtIoDeviceControl(
 		}
 
 		if (status == STATUS_TIMEOUT) {
-			// Stage 1 expired — check IQ completion first.
-			// COMPLETED_HEAD is a ring index that wraps at queue_size; compare wrapped TAIL.
+			// Stage 1 expired — check inference completion.
+			//
+			// IMPORTANT: COMPLETED == TAIL alone is NOT sufficient.  IQ COMPLETED
+			// advances when the chip *fetches* a descriptor and dispatches it to
+			// the engines; SCALAR may still be executing the bitstream.  We saw
+			// this empirically: ISR fired at 6 ms with COMPLETED=2 == TAIL=2 but
+			// SCALAR/INFEED were still kRun(1).  Real "inference complete" is
+			// SCALAR==kIdle(0) (or kHalted(4) on fault).
 			UINT32 iqSize        = (UINT32)apex_read_register(bar2, APEX_REG_INSTR_QUEUE_SIZE);
 			UINT32 expectedDone  = pDevContext->DescRingTail & (iqSize - 1);
 			UINT32 scStatus50ms  = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
@@ -527,21 +640,23 @@ VOID npudriverEvtIoDeviceControl(
 			DbgPrint("[50MS] SCALAR_RUN_STATUS=0x%x COMPLETED=0x%llx expected=%u TAIL=%u HIB_ERROR=0x%llx\n",
 				scStatus50ms, completed50ms, expectedDone, pDevContext->DescRingTail, hibErr50ms);
 
-			// Fast path: IQ already completed during stage 1 wait
-			if ((UINT32)completed50ms == expectedDone) {
-				DbgPrint("[50MS] IQ completed (COMPLETED=%llu == expected=%u TAIL=%u) — inference done\n",
-					completed50ms, expectedDone, pDevContext->DescRingTail);
+			// Fast path: SCALAR already terminal (kIdle or kHalted) AND IQ done
+			if ((UINT32)completed50ms == expectedDone &&
+			    (scStatus50ms == 0 || scStatus50ms == 4)) {
+				DbgPrint("[50MS] inference truly done (COMPLETED=%llu SC=0x%x)\n",
+					completed50ms, scStatus50ms);
 				status = STATUS_SUCCESS;
 			}
 
-			// Stage 2: poll COMPLETED_HEAD until == expectedDone (max 5s)
+			// Stage 2: poll until SCALAR is in {kIdle, kHalted} AND IQ done (max 5s)
 			if (status == STATUS_TIMEOUT) {
 				int pollIdx;
 				for (pollIdx = 0; pollIdx < 1000; pollIdx++) {
 					UINT64 done = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-					if ((UINT32)done == expectedDone) {
-						DbgPrint("[POLL] IQ completed after %d ms (COMPLETED=%llu == expected=%u TAIL=%u)\n",
-							50 + pollIdx, done, expectedDone, pDevContext->DescRingTail);
+					UINT32 sc   = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+					if ((UINT32)done == expectedDone && (sc == 0 || sc == 4)) {
+						DbgPrint("[POLL] inference done after %d ms (COMPLETED=%llu SC=0x%x TAIL=%u)\n",
+							50 + pollIdx, done, sc, pDevContext->DescRingTail);
 						status = STATUS_SUCCESS;
 						break;
 					}
@@ -574,6 +689,85 @@ VOID npudriverEvtIoDeviceControl(
 				DbgPrint("[DONE] ISR call count AFTER INFER: %d\n", pDevContext->IsrCallCount);
 				if (hibErr & 1ULL)
 					DbgPrint("[DONE]   inbound_page_fault at device VA 0x%llx\n", firstErr);
+
+				// HIB credit dump (POST-INFER) — did credits decrement during
+				// inference?  Compare with PRE-INFER snapshot.  output==0 here
+				// + PRE-INFER == 0 confirms outbound credit gate was the issue.
+				{
+					UINT32 c0 = apex_read_register_32(bar2, APEX_REG_HIB_INSTRUCTION_CREDITS);
+					UINT32 c1 = apex_read_register_32(bar2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
+					UINT32 c2 = apex_read_register_32(bar2, APEX_REG_HIB_PARAM_CREDITS);
+					UINT32 c3 = apex_read_register_32(bar2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+					DbgPrint("[CREDITS@POST-INFER]  instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
+						c0, c1, c2, c3);
+				}
+
+				// Status block dump at completion time
+				if (pDevContext->StatusBlockBase != NULL) {
+					UINT64 *sb = (UINT64 *)pDevContext->StatusBlockBase;
+					DbgPrint("[DONE-SB] StatusBlock: [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
+						sb[0], sb[1], sb[2], sb[3]);
+				}
+
+				// Output buffer kernel-side dump BEFORE unlock — catches the case
+				// where chip claims SC==kIdle but OUTFEED never actually wrote.
+				if (pDevContext->InferOutputMdl != NULL) {
+					PMDL outMdl    = pDevContext->InferOutputMdl;
+					UINT64 outVA   = pDevContext->InferOutputDeviceVA;
+					UINT64 outSize = pDevContext->InferOutputSize;
+					UINT32 outPteIdx = (UINT32)(outVA >> PAGE_SHIFT);
+					UINT32 outPageCnt = (UINT32)((outSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
+					PPFN_NUMBER outPfn = MmGetMdlPfnArray(outMdl);
+
+					// Verify PTE readback for first up-to-4 output pages.
+					{
+						UINT32 vc = (outPageCnt < 4) ? outPageCnt : 4;
+						UINT32 ii;
+						for (ii = 0; ii < vc; ii++) {
+							UINT64 expectPA  = (UINT64)outPfn[ii] << PAGE_SHIFT;
+							UINT64 readPA    = apex_read_register(bar2,
+								APEX_REG_PAGE_TABLE + ((outPteIdx + ii) * 8));
+							UINT64 readPaNoF = readPA & ~1ULL;
+							DbgPrint("[DONE-PTE] OUTPUT PTE[%u+%u] expect=0x%llx read=0x%llx %s\n",
+								outPteIdx, ii, expectPA, readPaNoF,
+								(readPaNoF == expectPA) ? "OK" : "MISMATCH");
+						}
+					}
+
+					// Map locked output pages, scan first 16 KB for non-zero, dump 64B.
+					{
+						PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(outMdl, NormalPagePriority);
+						if (kva != NULL) {
+							ULONG dumpLen = (outSize < 64) ? (ULONG)outSize : 64;
+							ULONG scanLen = (outSize < 0x4000) ? (ULONG)outSize : 0x4000;
+							ULONG j;
+							ULONG nz = 0;
+							for (j = 0; j < scanLen; j++) {
+								if (kva[j] != 0) nz++;
+							}
+							DbgPrint("[DONE-OUT] kernel VA=%p outVA=0x%llx size=%llu nonzero(first %lu B)=%lu\n",
+								kva, outVA, outSize, scanLen, nz);
+							DbgPrint("[DONE-OUT] [00] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+								kva[0],  kva[1],  kva[2],  kva[3],  kva[4],  kva[5],  kva[6],  kva[7],
+								kva[8],  kva[9],  kva[10], kva[11], kva[12], kva[13], kva[14], kva[15]);
+							if (dumpLen > 16) {
+								DbgPrint("[DONE-OUT] [10] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+									kva[16], kva[17], kva[18], kva[19], kva[20], kva[21], kva[22], kva[23],
+									kva[24], kva[25], kva[26], kva[27], kva[28], kva[29], kva[30], kva[31]);
+							}
+							// Also dump near OUTPUT[1] (device VA 0x67e000 = +0x2000 = +8192 bytes)
+							if (outSize >= 0x2010) {
+								DbgPrint("[DONE-OUT] [@+0x2000 OUTPUT[1] start] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+									kva[0x2000], kva[0x2001], kva[0x2002], kva[0x2003],
+									kva[0x2004], kva[0x2005], kva[0x2006], kva[0x2007],
+									kva[0x2008], kva[0x2009], kva[0x200a], kva[0x200b],
+									kva[0x200c], kva[0x200d], kva[0x200e], kva[0x200f]);
+							}
+						} else {
+							DbgPrint("[DONE-OUT] MmGetSystemAddressForMdlSafe returned NULL\n");
+						}
+					}
+				}
 
 				if (pDevContext->InferInputMdl) {
 					MmUnlockPages(pDevContext->InferInputMdl);

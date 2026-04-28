@@ -227,6 +227,22 @@ npudriverEvtDevicePrepareHardware(
 		}
 	}
 
+	// === HIB credit dump (PRE-RESET) — diagnose whether GCB reset wipes ===
+	// these the same way it wipes the MSI-X table.  Hypothesis: POR default
+	// is non-zero, RAM shutdown clears them, libedgetpu/gasket never write
+	// them, so after reset OUTFEED has no outbound DMA credit and host
+	// writes are silently dropped.  Compare values across the 4 dump
+	// points to confirm.
+	{
+		PVOID b2 = deviceContext->Bar2BaseAddress;
+		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
+		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
+		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
+		UINT32 c3 = apex_read_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+		DbgPrint("[CREDITS@PRE-RESET]   instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
+			c0, c1, c2, c3);
+	}
+
 	// Reset and quit-reset sequence to enable GCB (Global Clock Block)
 	// This is required for the scalar core to be operational
 	DbgPrint("[%s] Starting GCB reset sequence\n", __FUNCTION__);
@@ -375,6 +391,17 @@ npudriverEvtDevicePrepareHardware(
 	DbgPrint("[%s] USER_HIB_DMA_PAUSE cleared (DMA unpaused)\n", __FUNCTION__);
 
 	DbgPrint("[%s] GCB reset/quit-reset sequence complete\n", __FUNCTION__);
+
+	// === HIB credit dump (POST-RESET) — should we see zeros here? ===
+	{
+		PVOID b2 = deviceContext->Bar2BaseAddress;
+		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
+		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
+		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
+		UINT32 c3 = apex_read_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+		DbgPrint("[CREDITS@POST-RESET]  instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
+			c0, c1, c2, c3);
+	}
 
 	// ExitReset step 4 (libedgetpu beagle_top_level_handler.cc::QuitReset):
 	// IdleRegister: bit[31]=disable_idle (0=on, 1=off), bits[30:0]=counter.
@@ -873,6 +900,49 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[BAR0] NOT MAPPED — Windows did not expose BAR0 as a memory resource\n");
 	}
 
+	// === HIB credit dump (END-OF-PREPARE-HARDWARE, BEFORE explicit fix) ===
+	{
+		PVOID b2 = deviceContext->Bar2BaseAddress;
+		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
+		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
+		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
+		UINT32 c3 = apex_read_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+		DbgPrint("[CREDITS@PREPARE-END-PRE-FIX] instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
+			c0, c1, c2, c3);
+	}
+
+	// =========================================================
+	// FIX: Initialize output_actv_credits explicitly.
+	// On Apex/Beagle the POR default of output_actv_credits is 0,
+	// which gates ALL OUTFEED -> HIB outbound DMA writes.  libedgetpu/
+	// gasket never write this register because their host POR somehow
+	// has it set; ours doesn't.  Empirically observed (4 dump points,
+	// PRE-RESET through POST-INFER all read 0x0).
+	//
+	// Match the POR values of the other three credit registers so the
+	// outbound path has the same "permission" as inbound:
+	//   instr   = 0x800 (POR observed)
+	//   input   = 0x800 (POR observed)
+	//   param   = 0x1000 (POR observed)
+	//   output  = 0x800 (we pick — same as input/instr; if too few,
+	//                    OUTFEED stalls; if too many, no harm).
+	// =========================================================
+	{
+		PVOID b2 = deviceContext->Bar2BaseAddress;
+		apex_write_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS,  0x00000800);
+		apex_write_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS,   0x00000800);
+		apex_write_register_32(b2, APEX_REG_HIB_PARAM_CREDITS,        0x00001000);
+		apex_write_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS,  0x00000800);
+		DbgPrint("[CREDITS-FIX] wrote instr=0x800 input=0x800 param=0x1000 output=0x800\n");
+
+		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
+		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
+		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
+		UINT32 c3 = apex_read_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+		DbgPrint("[CREDITS@PREPARE-END] instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
+			c0, c1, c2, c3);
+	}
+
 	DbgPrint("[%s] Exit\n", __FUNCTION__);
 
 	return STATUS_SUCCESS;
@@ -1189,6 +1259,12 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 		return FALSE;
 	}
 
+	// Capture pending bits BEFORE we W1C-ack them — DPC needs to know what fired.
+	// Specifically: bit 0x1 (IQ_INT) alone == descriptors fetched but engines may
+	// still be running.  Real INFER completion includes bit 0x1000 (SC_HOST).
+	pDevContext->LastIsrWirePending = pending;
+	InterlockedOr(&pDevContext->IsrSeenPendingBits, (LONG)(pending & 0xFFFFFFFF));
+
 	// Ack BOTH the source (IQ_INT_STATUS) and the aggregator (WIRE_INT_PENDING)
 	// inside the ISR — must happen before we leave DIRQL or the chip re-asserts
 	// MSI-X immediately and we get an interrupt storm.
@@ -1276,10 +1352,138 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 
 	WDFDEVICE device = WdfInterruptGetDevice(Interrupt);
 	PDEVICE_CONTEXT pDevContext = DeviceGetContext(device);
+	PVOID bar2 = pDevContext->Bar2BaseAddress;
 
 	DbgPrint("[%s] DPC: Inference complete, unlocking pages\n", __FUNCTION__);
 	// (interrupt ack moved into ISR to prevent storm — clearing only in DPC
 	//  let the chip re-fire MSI-X before DPC ran)
+
+	// ============================================================
+	// DPC-time diagnostics — must run BEFORE we unlock the MDLs.
+	// Once MDLs are unlocked the kernel VA mapping is gone and the
+	// host pages can move/page-out, so this is our only window to
+	// (a) read engine RunStatus right after completion,
+	// (b) verify PTE readback still points at the right host PFNs,
+	// (c) dump the first bytes OUTFEED actually wrote into host RAM.
+	//
+	// NB: IQ_INT (WIRE bit 0x1) alone fires when descriptors are
+	// fetched, NOT when SCALAR finishes executing them.  Real done
+	// signal is bit 0x1000 (SC_HOST).  If SCALAR is still running
+	// here we MUST NOT unlock — unlocking before OUTFEED writes back
+	// causes inbound page faults (we saw this in ISR#3, HIB_ERR=0x1).
+	// ============================================================
+	UINT32 scStat = 0, outStat = 0;
+	if (bar2 != NULL) {
+		UINT32 inStat;
+		UINT32 avStat;
+		UINT64 iqDone;
+		UINT64 iqIntSt;
+		UINT64 wirePend;
+		UINT64 hibErr;
+		UINT64 hibFirst;
+		scStat   = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+		inStat   = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
+		outStat  = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+		avStat   = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
+		iqDone   = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+		iqIntSt  = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_STATUS);
+		wirePend = apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING);
+		hibErr   = apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
+		hibFirst = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
+		DbgPrint("[DPC-DIAG] SC=0x%x IN=0x%x OUT=0x%x AV=0x%x | IQ_DONE=%llu IQ_INT=0x%llx WIRE_NOW=0x%llx WIRE_ISR=0x%llx SEEN=0x%x | HIB_ERR=0x%llx HIB_FIRST=0x%llx\n",
+			scStat, inStat, outStat, avStat,
+			iqDone, iqIntSt, wirePend,
+			pDevContext->LastIsrWirePending,
+			(UINT32)pDevContext->IsrSeenPendingBits,
+			hibErr, hibFirst);
+		// hint: SC=0 OUT=0 -> all engines parked normally (real done)
+		//       SC=1 -> still running, this DPC is premature, defer
+		//       SC=4 (kHalted) -> halted, error completion
+		//       HIB_ERR bit 0  -> page fault at HIB_FIRST device VA
+	}
+
+	// Status block dump — chip DMA-writes progress here.  Worth seeing once
+	// per DPC even when premature, since values may transition while we wait.
+	if (pDevContext->StatusBlockBase != NULL) {
+		UINT64 *sb = (UINT64 *)pDevContext->StatusBlockBase;
+		DbgPrint("[DPC-SB] StatusBlock: [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
+			sb[0], sb[1], sb[2], sb[3]);
+	}
+
+	// PREMATURE-DPC GATE.
+	// If SCALAR is still running (status==1 kRun, 2 kSingleStep, 3 kHalting)
+	// AND no fault has been latched, the bitstream isn't done.  Don't unlock,
+	// don't signal — chip will fire another interrupt (likely WIRE bit 0x1000
+	// SC_HOST_INT) when SCALAR truly parks; that DPC will do the unlock.
+	//
+	// Treat status 0 (kIdle) and 4 (kHalted) as "terminal" — fine to unlock.
+	// kHalted may indicate fault; we still need to unlock and signal the
+	// IOCTL so the user sees STATUS_SUCCESS or the fault path runs.
+	if (bar2 != NULL && scStat != 0 && scStat != 4) {
+		DbgPrint("[DPC] PREMATURE: SCALAR=0x%x OUTFEED=0x%x — deferring unlock until next interrupt\n",
+			scStat, outStat);
+		return; // keep MDLs locked, keep event unsignaled
+	}
+
+	if (pDevContext->InferOutputMdl != NULL && bar2 != NULL) {
+		PMDL outMdl   = pDevContext->InferOutputMdl;
+		UINT64 outVA   = pDevContext->InferOutputDeviceVA;
+		UINT64 outSize = pDevContext->InferOutputSize;
+		UINT32 pteIdx  = (UINT32)(outVA >> PAGE_SHIFT);
+		UINT32 pageCnt = (UINT32)((outSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
+		PPFN_NUMBER pfn = MmGetMdlPfnArray(outMdl);
+
+		// (a) PTE readback for first up-to-4 output pages
+		{
+			UINT32 vc = (pageCnt < 4) ? pageCnt : 4;
+			UINT32 ii;
+			for (ii = 0; ii < vc; ii++) {
+				UINT64 expectPA  = (UINT64)pfn[ii] << PAGE_SHIFT;
+				UINT64 readPA    = apex_read_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + ii) * 8));
+				UINT64 readPaNoF = readPA & ~1ULL;
+				DbgPrint("[DPC-PTE] OUTPUT PTE[%u+%u] expect=0x%llx read=0x%llx %s\n",
+					pteIdx, ii, expectPA, readPaNoF,
+					(readPaNoF == expectPA) ? "OK" : "MISMATCH");
+			}
+		}
+
+		// (b) Map locked output pages into kernel VA, scan first 16 KB for
+		//     non-zero, dump first 64 bytes.
+		{
+			PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(outMdl, NormalPagePriority);
+			if (kva != NULL) {
+				ULONG dumpLen = (outSize < 64) ? (ULONG)outSize : 64;
+				ULONG scanLen = (outSize < 0x4000) ? (ULONG)outSize : 0x4000;
+				ULONG j;
+				ULONG nz = 0;
+				for (j = 0; j < scanLen; j++) {
+					if (kva[j] != 0) nz++;
+				}
+				DbgPrint("[DPC-OUT] kernel VA=%p outVA=0x%llx size=%llu nonzero(first %lu B)=%lu\n",
+					kva, outVA, outSize, scanLen, nz);
+				DbgPrint("[DPC-OUT] [00] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					kva[0],  kva[1],  kva[2],  kva[3],  kva[4],  kva[5],  kva[6],  kva[7],
+					kva[8],  kva[9],  kva[10], kva[11], kva[12], kva[13], kva[14], kva[15]);
+				if (dumpLen > 16) {
+					DbgPrint("[DPC-OUT] [10] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						kva[16], kva[17], kva[18], kva[19], kva[20], kva[21], kva[22], kva[23],
+						kva[24], kva[25], kva[26], kva[27], kva[28], kva[29], kva[30], kva[31]);
+				}
+				if (dumpLen > 32) {
+					DbgPrint("[DPC-OUT] [20] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						kva[32], kva[33], kva[34], kva[35], kva[36], kva[37], kva[38], kva[39],
+						kva[40], kva[41], kva[42], kva[43], kva[44], kva[45], kva[46], kva[47]);
+				}
+				if (dumpLen > 48) {
+					DbgPrint("[DPC-OUT] [30] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						kva[48], kva[49], kva[50], kva[51], kva[52], kva[53], kva[54], kva[55],
+						kva[56], kva[57], kva[58], kva[59], kva[60], kva[61], kva[62], kva[63]);
+				}
+			} else {
+				DbgPrint("[DPC-OUT] MmGetSystemAddressForMdlSafe returned NULL — cannot dump output bytes\n");
+			}
+		}
+	}
 
 	if (pDevContext->InferInputMdl != NULL) {
 		MmUnlockPages(pDevContext->InferInputMdl);

@@ -49,6 +49,13 @@ typedef struct _DEVICE_CONTEXT
 	PMDL InferOutputMdl;                 // MDL for output buffer pages
 	PMDL InferScratchMdl;                // MDL for scratch buffer pages
 
+	// Saved for DPC-time diagnostics (read OUTFEED status, dump output buffer
+	// from kernel VA, verify PTE readback) BEFORE we unlock the output MDL.
+	UINT64 InferOutputDeviceVA;          // device VA where OUTFEED writes results
+	UINT64 InferOutputSize;              // output buffer size in bytes
+	UINT64 InferInputDeviceVA;           // input device VA (for symmetric PTE check)
+	UINT64 InferInputSize;               // input buffer size in bytes
+
 	// Cached parameters from IOCTL_PARAM_CACHE — kept mapped during INFER.
 	// libedgetpu MapParameters() 패턴: 모든 executable 의 파라미터는 driver lifetime 동안
 	// 매핑 유지. INFER bitstream 의 BASE_ADDRESS_PARAMETER 패치가 같은 VA 를 참조함.
@@ -81,6 +88,16 @@ typedef struct _DEVICE_CONTEXT
 
 	// ISR diagnostic counter (incremented on every ISR call, including spurious)
 	volatile LONG IsrCallCount;
+
+	// Last WIRE_INT_PENDING read by ISR — captured before W1C ack so DPC can see
+	// which interrupt source fired even though the register was cleared at DIRQL.
+	volatile UINT64 LastIsrWirePending;
+
+	// OR-accumulated pending bits across all ISR fires for the current INFER.
+	// IOCTL_INFER zeros this at submission; ISR ORs the pending word in.  The
+	// "real inference complete" signal is bit 0x1000 (SC_HOST_INT); IQ-fetch
+	// completion alone (bit 0x1) fires too early (engines still kRun).
+	volatile LONG IsrSeenPendingBits;
 
 	// MSI-X table snapshot taken at PrepareHardware entry (before GCB reset wipes
 	// chip's internal SRAM that backs BAR2+0x46800). Restored just before the

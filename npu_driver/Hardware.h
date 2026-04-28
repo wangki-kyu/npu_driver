@@ -133,6 +133,15 @@
 #define APEX_MSIX_MASK_BIT_OFFSET           12
 #define APEX_INTERRUPT_COUNT                4   // we register 4 vectors
 
+// ========== HIB credit registers (DebugHibUserCsrOffsets - never written by libedgetpu) ==========
+// Hypothesis: GCB reset (RAM shutdown) wipes these the same way it wipes the
+// MSI-X table at 0x46800.  POR default may be non-zero (host-default credits)
+// but we have to verify by reading before/after reset.
+#define APEX_REG_HIB_INSTRUCTION_CREDITS    0x48740
+#define APEX_REG_HIB_INPUT_ACTV_CREDITS     0x48748
+#define APEX_REG_HIB_PARAM_CREDITS          0x48750
+#define APEX_REG_HIB_OUTPUT_ACTV_CREDITS    0x48758  // suspected outbound credit gate
+
 // ========== Status & Debug ==========
 #define APEX_REG_OMC0_D0                    0x01a0d0  // Temperature sensor
 #define APEX_REG_USER_HIB_ERROR_STATUS      0x486f0  // HIB error status (beagle_csr_offsets.h)
