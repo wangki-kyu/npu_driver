@@ -1,7 +1,14 @@
 {
   "permissions": {
     "allow": [
-      "Bash(xargs grep *)"
+      "Bash(xargs grep *)",
+      "Read(//tmp/**)",
+      "Bash(mkdir -p /tmp/research)",
+      "Bash(curl *)",
+      "Bash(cygpath -w /tmp/beagle_top_level_interrupt_manager.cc)",
+      "Bash(gh api *)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:api.github.com)"
     ]
   }
 }

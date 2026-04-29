@@ -390,7 +390,7 @@ int main()
                   << " is not square*3 — falling back to imgSide=" << imgSide << std::endl;
     }
     std::cout << "Loading image from assets/aespa.jpg... (target " << imgSide << "x" << imgSide << ")" << std::endl;
-    if (!LoadJpegToRGB(L".\\assets\\aespa.jpg", pImageBuf, imgSide, imgSide)) {
+    if (!LoadJpegToRGB(L".\\assets\\karina.jpg", pImageBuf, imgSide, imgSide)) {
         std::cout << "Failed to load image" << std::endl;
         if (pScratchBuf) FreeAlignedMemory(pScratchBuf);
         FreeAlignedMemory(pOutputBuf);

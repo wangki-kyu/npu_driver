@@ -191,7 +191,7 @@ NTSTATUS ApexPageTableMap(
         apex_write_register(
             pDevContext->Bar2BaseAddress,
             APEX_REG_PAGE_TABLE + ((startPte + i) * 8),
-            pte[startPte + i].address | 0x1  // Set PTE_INUSE bit
+            pte[startPte + i].address | 0x1  // Set PTE_INUSE bit (valid)
         );
     }
 

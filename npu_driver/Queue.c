@@ -354,6 +354,81 @@ VOID npudriverEvtIoDeviceControl(
 						vaFirstQword);
 				}
 			}
+
+			// ============================================================
+			// INPUT-CHK: pre-submit verification dump.
+			// 1) Per-page first8 / last8 byte dump for first up-to-4 pages
+			//    AND the very last page (so we know the tail of the buffer
+			//    isn't garbage).
+			// 2) XOR-fold checksum over the entire input region — saved in
+			//    DEVICE_CONTEXT for post-DONE comparison.
+			// Combined with [POLL@*ms] INFEED=kRun observation and the
+			// post-DONE INPUT-VERIFY line, this gives high confidence that
+			// the chip's INFEED read the exact host bytes we placed.
+			// ============================================================
+			{
+				PUCHAR kvAddr = (PUCHAR)MmGetSystemAddressForMdlSafe(inputImageMdl, NormalPagePriority);
+				if (kvAddr != NULL && pInput->InputImageSize > 0) {
+					SIZE_T totalSize = (SIZE_T)pInput->InputImageSize;
+					UINT32 dumpFirstN = pageCount < 4 ? pageCount : 4;
+					UINT32 pp;
+
+					for (pp = 0; pp < dumpFirstN; pp++) {
+						PUCHAR p = kvAddr + pp * PAGE_SIZE;
+						SIZE_T base = (SIZE_T)pp * PAGE_SIZE;
+						SIZE_T tail = base + PAGE_SIZE - 8;
+						if (tail + 8 > totalSize) tail = (totalSize >= 8) ? totalSize - 8 : 0;
+						PUCHAR pt = kvAddr + tail;
+						DbgPrint("[INPUT-CHK] page[%u] first8=%02x %02x %02x %02x %02x %02x %02x %02x  last8(@0x%llx)=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+							pp,
+							p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+							(UINT64)tail,
+							pt[0], pt[1], pt[2], pt[3], pt[4], pt[5], pt[6], pt[7]);
+					}
+
+					// Also dump first8 of LAST page (tail of buffer) so we know
+					// the registered PA range covers the whole image.
+					if (pageCount > dumpFirstN) {
+						UINT32 last = pageCount - 1;
+						PUCHAR pl = kvAddr + (SIZE_T)last * PAGE_SIZE;
+						DbgPrint("[INPUT-CHK] page[%u] (last) first8=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+							last,
+							pl[0], pl[1], pl[2], pl[3], pl[4], pl[5], pl[6], pl[7]);
+					}
+
+					// XOR-fold: 8-byte stride sum (fast, fits in DPC budget even
+					// for 300KB image — ~38K ops). The folded value is invariant
+					// to the order of bytes only within each 8-byte qword, but
+					// a single byte change anywhere flips the result.
+					{
+						UINT64 chk = 0;
+						SIZE_T qwordCount = totalSize / 8;
+						SIZE_T q;
+						for (q = 0; q < qwordCount; q++) {
+							chk ^= ((UINT64*)kvAddr)[q];
+						}
+						// Tail bytes (size not multiple of 8): include them as a
+						// shifted partial qword so they still affect the sum.
+						{
+							SIZE_T tailStart = qwordCount * 8;
+							UINT64 tailQ = 0;
+							SIZE_T t;
+							for (t = tailStart; t < totalSize; t++) {
+								tailQ |= ((UINT64)kvAddr[t]) << ((t - tailStart) * 8);
+							}
+							chk ^= tailQ;
+						}
+						pDevContext->InputChecksumPreSubmit = chk;
+						pDevContext->InputChecksumByteCount = (UINT64)totalSize;
+						DbgPrint("[INPUT-CHK] xor-fold pre-submit = 0x%016llX over %llu bytes (%lu pages)\n",
+							chk, (UINT64)totalSize, pageCount);
+					}
+				} else {
+					pDevContext->InputChecksumPreSubmit = 0;
+					pDevContext->InputChecksumByteCount = 0;
+					DbgPrint("[INPUT-CHK] WARNING: cannot map input MDL — skipping pre-submit checksum\n");
+				}
+			}
 		}
 
 		// 5. Register output buffer pages in page table
@@ -368,7 +443,11 @@ VOID npudriverEvtIoDeviceControl(
 			WdfSpinLockAcquire(pDevContext->PageTableLock);
 			for (i = 0; i < pageCount; i++) {
 				UINT64 physAddr = ((UINT64)pfnArray[i] << PAGE_SHIFT);
-				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr | 1);
+				// EXPERIMENT: drop |1 valid-bit ONLY for OUTPUT PTEs.  Hypothesis:
+				// the LSB might be a "read-allowed" flag and chip refuses to write
+				// to a PTE marked read-only.  All other PTEs (DescRing, SB, Input,
+				// Param, etc.) keep |1 since they need to be readable.
+				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr);
 			}
 			WdfSpinLockRelease(pDevContext->PageTableLock);
 
@@ -505,6 +584,11 @@ VOID npudriverEvtIoDeviceControl(
 		npudriverDumpPciCommand(device, "pre-submit");
 		npudriverDumpPciAer(device, "pre-submit");
 
+		// MINI CSR SWEEP — dump all named registers right before kicking
+		// inference; we dump again at post-DONE.  User diffs by eye / grep
+		// to find which registers chip touched during inference.
+		npudriverDumpKnownCsrs(pDevContext, "pre-submit");
+
 		// AXI write credit shim counters — these are R/O statistics maintained by
 		// the chip's internal AXI master.  By dumping pre-submit and post-DONE we
 		// can determine if the chip even attempted outbound AXI writes during
@@ -619,6 +703,8 @@ VOID npudriverEvtIoDeviceControl(
 		// Early poll: catch INFEED/OUTFEED/fault transitions in first 20ms
 		{
 			int qi;
+			UINT32 infeedRunTicks = 0;
+			UINT32 outfeedRunTicks = 0;
 			for (qi = 0; qi < 20; qi++) {
 				LARGE_INTEGER d; d.QuadPart = -10000LL; // 1ms
 				KeDelayExecutionThread(KernelMode, FALSE, &d);
@@ -628,10 +714,16 @@ VOID npudriverEvtIoDeviceControl(
 				UINT32 hibErr   = apex_read_register_32(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
 				UINT64 faultVA  = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
 				UINT64 infFault = apex_read_register(bar2, APEX_REG_INFEED_PAGE_FAULT_ADDR);
+				if (inf == 1) infeedRunTicks++;
+				if (out == 1) outfeedRunTicks++;
 				DbgPrint("[POLL@%dms] INFEED=0x%x OUTFEED=0x%x AVDATA=0x%x | HIB_ERR=0x%x FAULT_VA=0x%llx INFEED_FAULT=0x%llx\n",
 					qi + 1, inf, out, avd, hibErr, faultVA, infFault);
 				if (hibErr != 0 || out != 0) break;
 			}
+			// kRun tick summary — INFEED kRun for >=1ms is strong evidence the
+			// engine actually pulled input from host RAM; otherwise it never ran.
+			DbgPrint("[INPUT-CHK] INFEED kRun ticks=%u  OUTFEED kRun ticks=%u  (each tick ≈1ms)\n",
+				infeedRunTicks, outfeedRunTicks);
 		}
 
 		// 7. Wait for inference completion — 2-stage: 50ms then 950ms
@@ -728,6 +820,10 @@ VOID npudriverEvtIoDeviceControl(
 					DbgPrint("[AXI@post-DONE] aw_insertion=0x%x w_insertion=0x%x aw_occupancy=0x%x w_occupancy=0x%x\n",
 						awIns, wIns, awOcc, wOcc);
 				}
+
+				// MINI CSR SWEEP — dump the same named registers post-DONE.
+				// User diffs the [CSR@pre-submit] vs [CSR@post-DONE] lines.
+				npudriverDumpKnownCsrs(pDevContext, "post-DONE");
 
 				// HIB credit dump (POST-INFER) — did credits decrement during
 				// inference?  Compare with PRE-INFER snapshot.  output==0 here
@@ -871,6 +967,55 @@ VOID npudriverEvtIoDeviceControl(
 							sz > 0x67900a ? kva[0x67900a] : 0, sz > 0x67900b ? kva[0x67900b] : 0,
 							sz > 0x67900c ? kva[0x67900c] : 0, sz > 0x67900d ? kva[0x67900d] : 0,
 							sz > 0x67900e ? kva[0x67900e] : 0, sz > 0x67900f ? kva[0x67900f] : 0);
+					}
+				}
+
+				// ============================================================
+				// INPUT-VERIFY: post-DONE re-read of input image.
+				// Recompute XOR-fold checksum of the input region and compare
+				// against pre-submit value.
+				//   PASS  → chip did not write into input region (host RAM
+				//           contents stable).  Combined with INFEED kRun
+				//           observation + PTE readback OK earlier, this is
+				//           strong indirect evidence chip read OUR bytes.
+				//   CHANGED → chip stray-wrote into input region — bug
+				//             (PTE points wrong / chip thinks output VA is
+				//             input VA / etc).
+				// ============================================================
+				if (pDevContext->InferInputMdl != NULL && pDevContext->InputChecksumByteCount > 0) {
+					PUCHAR ikva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+						pDevContext->InferInputMdl, NormalPagePriority);
+					if (ikva != NULL) {
+						SIZE_T totalSize = (SIZE_T)pDevContext->InputChecksumByteCount;
+						UINT64 chkPre = pDevContext->InputChecksumPreSubmit;
+
+						// Same XOR-fold algorithm as pre-submit
+						UINT64 chk = 0;
+						SIZE_T qwordCount = totalSize / 8;
+						SIZE_T q;
+						for (q = 0; q < qwordCount; q++) {
+							chk ^= ((UINT64*)ikva)[q];
+						}
+						{
+							SIZE_T tailStart = qwordCount * 8;
+							UINT64 tailQ = 0;
+							SIZE_T t;
+							for (t = tailStart; t < totalSize; t++) {
+								tailQ |= ((UINT64)ikva[t]) << ((t - tailStart) * 8);
+							}
+							chk ^= tailQ;
+						}
+
+						DbgPrint("[INPUT-VERIFY] xor-fold post-DONE = 0x%016llX (pre=0x%016llX) → %s\n",
+							chk, chkPre,
+							(chk == chkPre) ? "PASS (host RAM stable)" : "CHANGED (chip stray-wrote!)");
+
+						// Also dump first 8 bytes of page[0] for visual sanity
+						DbgPrint("[INPUT-VERIFY] page[0] first8 post-DONE=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+							ikva[0], ikva[1], ikva[2], ikva[3],
+							ikva[4], ikva[5], ikva[6], ikva[7]);
+					} else {
+						DbgPrint("[INPUT-VERIFY] WARNING: cannot map input MDL post-DONE\n");
 					}
 				}
 

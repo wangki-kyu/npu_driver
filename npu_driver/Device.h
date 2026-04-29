@@ -94,10 +94,23 @@ typedef struct _DEVICE_CONTEXT
 	volatile UINT64 LastIsrWirePending;
 
 	// OR-accumulated pending bits across all ISR fires for the current INFER.
-	// IOCTL_INFER zeros this at submission; ISR ORs the pending word in.  The
-	// "real inference complete" signal is bit 0x1000 (SC_HOST_INT); IQ-fetch
-	// completion alone (bit 0x1) fires too early (engines still kRun).
+	// IOCTL_INFER zeros this at submission; ISR ORs the pending word in.
+	// The "INFER complete" signal is APEX_WIRE_BIT_SC_HOST_0 (bit 4 = 0x10),
+	// fired when SCALAR executes the bitstream's host_interrupt 0 opcode at
+	// end-of-program (compiler-promised AFTER OUTFEED drain barrier).
+	// APEX_WIRE_BIT_IQ_INT (bit 0 = 0x1) alone means "descriptors fetched"
+	// — fires too early, SCALAR may still be running.
+	// APEX_WIRE_BIT_FATAL_ERR (bit 12 = 0x1000) is HIB fatal error.
 	volatile LONG IsrSeenPendingBits;
+
+	// Input image XOR-fold checksum computed at pre-submit time. Compared
+	// against post-DONE recomputation to detect chip stray writes into
+	// input region (chip should ONLY read from input, never write).
+	// Equality alone doesn't prove the chip read the bytes, but combined
+	// with INFEED kRun observation + PTE readback OK it's strong evidence
+	// that the data the chip saw is exactly what we placed in host RAM.
+	UINT64 InputChecksumPreSubmit;
+	UINT64 InputChecksumByteCount;
 
 	// MSI-X table snapshot taken at PrepareHardware entry (before GCB reset wipes
 	// chip's internal SRAM that backs BAR2+0x46800). Restored just before the

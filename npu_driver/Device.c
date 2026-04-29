@@ -413,8 +413,8 @@ npudriverEvtDevicePrepareHardware(
 	// too short to trigger auto-idle, but our two-IOCTL flow has a real gap.
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x80000001ULL);
-		DbgPrint("[%s] IdleRegister → 0x80000001 (disable_idle=1, counter=1)\n", __FUNCTION__);
+		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x00000001ULL);
+		DbgPrint("[%s] IdleRegister → 0x1 (enabled, counter=1)\n", __FUNCTION__);
 
 		// Re-write HIB MMU config after GCB reset — these registers may have been
 		// cleared by the reset even though they were written in ApexPageTableInit().
@@ -682,28 +682,6 @@ npudriverEvtDevicePrepareHardware(
 	{
 		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
 		DbgPrint("[%s] HIB_ERROR after CTRL=0x1 = 0x%llx\n", __FUNCTION__, hibChk);
-	}
-
-	// Clear any stale IQ interrupt pending from previous driver instance.
-	// On driver reload the chip retains IQ_INT_STATUS=1 from the last run; if
-	// we don't W1C-ack it before unmasking, the very first MSI-X delivery
-	// after EvtInterruptEnable triggers an immediate ISR storm (no real
-	// completion, just leftover state).
-	{
-		UINT64 staleIq = apex_read_register(deviceContext->Bar2BaseAddress,
-			APEX_REG_INSTR_QUEUE_INT_STATUS);
-		UINT64 stalePending = apex_read_register(deviceContext->Bar2BaseAddress,
-			APEX_REG_WIRE_INT_PENDING);
-		DbgPrint("[%s] stale IQ_INT_STATUS=0x%llx WIRE_INT_PENDING=0x%llx — clearing\n",
-			__FUNCTION__, staleIq, stalePending);
-		if (staleIq) {
-			apex_write_register(deviceContext->Bar2BaseAddress,
-				APEX_REG_INSTR_QUEUE_INT_STATUS, staleIq);  // W1C
-		}
-		if (stalePending) {
-			apex_write_register(deviceContext->Bar2BaseAddress,
-				APEX_REG_WIRE_INT_PENDING, stalePending);   // W1C
-		}
 	}
 
 	// Step B: add sb_wr_enable (bit2)
@@ -1234,8 +1212,10 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 	}
 
 	// Capture pending bits BEFORE we W1C-ack them — DPC needs to know what fired.
-	// Specifically: bit 0x1 (IQ_INT) alone == descriptors fetched but engines may
-	// still be running.  Real INFER completion includes bit 0x1000 (SC_HOST).
+	// APEX_WIRE_BIT_IQ_INT (0x1) alone == descriptors fetched but engines may
+	// still be running.  APEX_WIRE_BIT_SC_HOST_0 (0x10) == SCALAR reached the
+	// bitstream's host_interrupt 0 opcode = compiler-promised "INFER done".
+	// APEX_WIRE_BIT_FATAL_ERR (0x1000) == HIB fatal error, abort the IOCTL.
 	pDevContext->LastIsrWirePending = pending;
 	InterlockedOr(&pDevContext->IsrSeenPendingBits, (LONG)(pending & 0xFFFFFFFF));
 
@@ -1340,11 +1320,13 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 	// (b) verify PTE readback still points at the right host PFNs,
 	// (c) dump the first bytes OUTFEED actually wrote into host RAM.
 	//
-	// NB: IQ_INT (WIRE bit 0x1) alone fires when descriptors are
-	// fetched, NOT when SCALAR finishes executing them.  Real done
-	// signal is bit 0x1000 (SC_HOST).  If SCALAR is still running
-	// here we MUST NOT unlock — unlocking before OUTFEED writes back
-	// causes inbound page faults (we saw this in ISR#3, HIB_ERR=0x1).
+	// NB: APEX_WIRE_BIT_IQ_INT (0x1) alone fires when descriptors are
+	// fetched, NOT when SCALAR finishes executing them.  The real "done"
+	// signal is APEX_WIRE_BIT_SC_HOST_0 (0x10) — the SCALAR-issued
+	// host_interrupt opcode at end-of-program (compiler places this AFTER
+	// the OUTFEED drain barrier).  If SCALAR is still running AND we
+	// haven't seen SC_HOST_0 yet, MUST NOT unlock — unlocking before
+	// OUTFEED writes back causes inbound page faults.
 	// ============================================================
 	UINT32 scStat = 0, outStat = 0;
 	if (bar2 != NULL) {
@@ -1384,19 +1366,37 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 			sb[0], sb[1], sb[2], sb[3]);
 	}
 
+	// FATAL_ERR detection (bit 12 = 0x1000).  Logged but does NOT block
+	// completion — IOCTL path will surface the error via USER_HIB_ERROR.
+	if (pDevContext->IsrSeenPendingBits & APEX_WIRE_BIT_FATAL_ERR) {
+		DbgPrint("[DPC] FATAL_ERR observed in WIRE_INT_PENDING (bit 0x1000) — see USER_HIB_ERROR\n");
+	}
+
 	// PREMATURE-DPC GATE.
-	// If SCALAR is still running (status==1 kRun, 2 kSingleStep, 3 kHalting)
-	// AND no fault has been latched, the bitstream isn't done.  Don't unlock,
-	// don't signal — chip will fire another interrupt (likely WIRE bit 0x1000
-	// SC_HOST_INT) when SCALAR truly parks; that DPC will do the unlock.
+	// Two ways to recognize "INFER done":
+	//   (1) SCALAR_RUN_STATUS == kIdle(0) or kHalted(4) — the chip's view.
+	//   (2) APEX_WIRE_BIT_SC_HOST_0 (0x10) seen in any ISR for this INFER
+	//       — SCALAR has executed the bitstream's host_interrupt 0 opcode,
+	//         which the Edge TPU compiler places AFTER the OUTFEED drain
+	//         barrier.  Once SC_HOST_0 fires, we trust the compiler promise
+	//         that all OUTFEED writes are done, even if SCALAR_RUN_STATUS
+	//         shows a brief kRun snapshot due to HW pipeline latency.
 	//
-	// Treat status 0 (kIdle) and 4 (kHalted) as "terminal" — fine to unlock.
-	// kHalted may indicate fault; we still need to unlock and signal the
-	// IOCTL so the user sees STATUS_SUCCESS or the fault path runs.
-	if (bar2 != NULL && scStat != 0 && scStat != 4) {
-		DbgPrint("[DPC] PREMATURE: SCALAR=0x%x OUTFEED=0x%x — deferring unlock until next interrupt\n",
-			scStat, outStat);
+	// Without (2), if ISR fires once with pending=0x11 (IQ_INT + SC_HOST_0)
+	// while SCALAR still shows kRun for a few ms, DPC defers — but no fresh
+	// interrupt comes (level bits already W1C-acked) and we fall back to
+	// the 50ms polling timeout.  Adding (2) lets us complete via the
+	// interrupt path immediately, saving ~45ms per INFER.
+	BOOLEAN scHostSeen = (pDevContext->IsrSeenPendingBits & APEX_WIRE_BIT_SC_HOST_0) != 0;
+	BOOLEAN scalarTerminal = (scStat == 0 || scStat == 4);
+	if (bar2 != NULL && !scalarTerminal && !scHostSeen) {
+		DbgPrint("[DPC] PREMATURE: SCALAR=0x%x OUTFEED=0x%x SeenPending=0x%x — deferring unlock until next interrupt\n",
+			scStat, outStat, pDevContext->IsrSeenPendingBits);
 		return; // keep MDLs locked, keep event unsignaled
+	}
+	if (!scalarTerminal && scHostSeen) {
+		DbgPrint("[DPC] SC_HOST_0 seen (SeenPending=0x%x) — completing despite SCALAR=0x%x (compiler-promised done)\n",
+			pDevContext->IsrSeenPendingBits, scStat);
 	}
 
 	if (pDevContext->InferOutputMdl != NULL && bar2 != NULL) {
@@ -1660,6 +1660,57 @@ VOID npudriverDumpPciAer(WDFDEVICE Device, const char* tag)
 	}
 
 	bus.InterfaceDereference(bus.Context);
+}
+
+// Mini CSR sweep — read ONLY the named registers we already use safely
+// elsewhere in the driver.  A blind sweep over all of BAR2 hangs because some
+// offsets do not return PCIe completions, freezing the CPU on the MMIO read.
+// `tag` distinguishes pre/post snapshots in the log.  Caller dumps once before
+// inference and once after; user diffs the two by eye / grep.
+VOID npudriverDumpKnownCsrs(PDEVICE_CONTEXT ctx, const char* tag)
+{
+	PVOID b2 = ctx->Bar2BaseAddress;
+	if (b2 == NULL) return;
+
+	#define R32(name, off) DbgPrint("[CSR@%s] %-32s @0x%05x = 0x%08x\n", \
+		tag, name, (off), apex_read_register_32(b2, (off)))
+
+	// MMU / page-table
+	R32("PAGE_TABLE_SIZE",             0x46000);
+	R32("EXTENDED_TABLE",              0x46008);
+	R32("KERNEL_HIB_TRANSLATION_EN",   0x46010);
+
+	// HIB credits (input/param/instr/output)
+	R32("HIB_INSTRUCTION_CREDITS",     APEX_REG_HIB_INSTRUCTION_CREDITS);
+	R32("HIB_INPUT_ACTV_CREDITS",      APEX_REG_HIB_INPUT_ACTV_CREDITS);
+	R32("HIB_PARAM_CREDITS",           APEX_REG_HIB_PARAM_CREDITS);
+	R32("HIB_OUTPUT_ACTV_CREDITS",     APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+
+	// AXI shim counters (the ones that moved in the 0x1FFA000 redirect run)
+	R32("AXI_AW_CREDIT_INSERTION",     APEX_REG_AXI_AW_CREDIT_SHIM_INSERTION);
+	R32("AXI_W_CREDIT_INSERTION",      APEX_REG_AXI_W_CREDIT_SHIM_INSERTION);
+	R32("AXI_AW_CREDIT_OCCUPANCY",     APEX_REG_AXI_AW_CREDIT_SHIM_OCCUPANCY);
+	R32("AXI_W_CREDIT_OCCUPANCY",      APEX_REG_AXI_W_CREDIT_SHIM_OCCUPANCY);
+
+	// Engine run-status
+	R32("SCALAR_RUN_STATUS",           APEX_REG_SCALAR_RUN_STATUS);
+	R32("INFEED_RUN_STATUS",           APEX_REG_INFEED_RUN_STATUS);
+	R32("OUTFEED_RUN_STATUS",          APEX_REG_OUTFEED_RUN_STATUS);
+	R32("PARAMETER_POP_RUN_STATUS",    APEX_REG_PARAMETER_POP_RUN_STATUS);
+	R32("AVDATA_POP_RUN_STATUS",       APEX_REG_AVDATA_POP_RUN_STATUS);
+
+	// IQ status / int / wire
+	R32("INSTR_QUEUE_STATUS",          APEX_REG_INSTR_QUEUE_STATUS);
+	R32("INSTR_QUEUE_CONTROL",         APEX_REG_INSTR_QUEUE_CONTROL);
+	R32("INSTR_QUEUE_INT_STATUS",      APEX_REG_INSTR_QUEUE_INT_STATUS);
+	R32("WIRE_INT_PENDING",            APEX_REG_WIRE_INT_PENDING);
+	R32("WIRE_INT_MASK",               APEX_REG_WIRE_INT_MASK);
+
+	// Errors
+	R32("USER_HIB_ERROR_STATUS",       APEX_REG_USER_HIB_ERROR_STATUS);
+	R32("SCALAR_CORE_ERROR_STATUS",    APEX_REG_SCALAR_CORE_ERROR_STATUS);
+
+	#undef R32
 }
 
 NTSTATUS npudriverDumpMsixCapability(WDFDEVICE Device)

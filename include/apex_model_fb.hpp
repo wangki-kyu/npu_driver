@@ -239,6 +239,43 @@ inline ApexModelFb LoadModel(const std::string& path) {
     }
     std::cout << "[LoadModel] patches collected: " << model.patches.size() << std::endl;
 
+    // === DEBUG: dump every patch's desc/position/name/current-value ===
+    // Goal: verify which Description types are present in the bitstream and
+    // whether PatchVAs() handles them all.  Any patch with a non-zero
+    // current_value when our PatchVAs leaves it untouched (i.e. desc not in
+    // the switch statement of PatchVAs) means the chip is being told to use
+    // an address we never set up — likely silent silicon failure.
+    {
+        using namespace platforms::darwinn;
+        for (size_t pi = 0; pi < model.patches.size(); pi++) {
+            const auto& p = model.patches[pi];
+            uint32_t cur = 0;
+            if (p.offset_bit / 8 + 4 <= (int32_t)model.bitstream.size())
+                std::memcpy(&cur, model.bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+
+            const char* desc_name = "?";
+            switch (p.desc) {
+            case Description_BASE_ADDRESS_INPUT_ACTIVATION:  desc_name = "BASE_ADDRESS_INPUT_ACTIVATION";  break;
+            case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: desc_name = "BASE_ADDRESS_OUTPUT_ACTIVATION"; break;
+            case Description_BASE_ADDRESS_PARAMETER:         desc_name = "BASE_ADDRESS_PARAMETER";         break;
+            case Description_BASE_ADDRESS_SCRATCH:           desc_name = "BASE_ADDRESS_SCRATCH";           break;
+            default: break;
+            }
+
+            const char* pos_name =
+                (p.position == Position_LOWER_32BIT) ? "LO32" :
+                (p.position == Position_UPPER_32BIT) ? "HI32" : "?";
+
+            std::cout << "[LoadModel]   patch[" << pi << "]"
+                      << " desc=" << (int)p.desc << "(" << desc_name << ")"
+                      << " pos=" << (int)p.position << "(" << pos_name << ")"
+                      << " name='" << p.name << "'"
+                      << " offset_byte=0x" << std::hex << (p.offset_bit / 8)
+                      << " current_value=0x" << cur << std::dec
+                      << std::endl;
+        }
+    }
+
     // 12. Extract input layer metadata
     std::cout << "[LoadModel] Step 12: input_layers..." << std::endl;
     const auto* input_vec = exec->input_layers();
@@ -332,6 +369,37 @@ inline ApexModelFb LoadModel(const std::string& path) {
                 std::cout << "[LoadModel] exe1 bitstream: " << model.param_bitstream.size()
                           << " bytes, patches: " << model.param_patches.size()
                           << ", parameters: " << model.parameters.size() << " bytes" << std::endl;
+
+                // DEBUG: dump every exe1 patch (same intent as exe0 dump above)
+                {
+                    using namespace platforms::darwinn;
+                    for (size_t pi = 0; pi < model.param_patches.size(); pi++) {
+                        const auto& p = model.param_patches[pi];
+                        uint32_t cur = 0;
+                        if (p.offset_bit / 8 + 4 <= (int32_t)model.param_bitstream.size())
+                            std::memcpy(&cur, model.param_bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+
+                        const char* desc_name = "?";
+                        switch (p.desc) {
+                        case Description_BASE_ADDRESS_INPUT_ACTIVATION:  desc_name = "BASE_ADDRESS_INPUT_ACTIVATION";  break;
+                        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: desc_name = "BASE_ADDRESS_OUTPUT_ACTIVATION"; break;
+                        case Description_BASE_ADDRESS_PARAMETER:         desc_name = "BASE_ADDRESS_PARAMETER";         break;
+                        case Description_BASE_ADDRESS_SCRATCH:           desc_name = "BASE_ADDRESS_SCRATCH";           break;
+                        default: break;
+                        }
+                        const char* pos_name =
+                            (p.position == Position_LOWER_32BIT) ? "LO32" :
+                            (p.position == Position_UPPER_32BIT) ? "HI32" : "?";
+
+                        std::cout << "[LoadModel]   exe1.patch[" << pi << "]"
+                                  << " desc=" << (int)p.desc << "(" << desc_name << ")"
+                                  << " pos=" << (int)p.position << "(" << pos_name << ")"
+                                  << " name='" << p.name << "'"
+                                  << " offset_byte=0x" << std::hex << (p.offset_bit / 8)
+                                  << " current_value=0x" << cur << std::dec
+                                  << std::endl;
+                    }
+                }
             }
         }
     } else {

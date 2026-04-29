@@ -129,6 +129,43 @@
 #define APEX_REG_INSTR_QUEUE_INT_CONTROL     0x485c0  // interrupt control
 #define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (W1C: write 1 to clear)
 
+// ========== WIRE_INT_PENDING bit layout ==========
+// Authoritative source: libedgetpu/driver/config/common_csr_helper.h
+//   class WireIntBitArray (lines 395-446).  Same order as
+//   driver/interrupt/interrupt_handler.h enum DW_INTERRUPT_*.
+//
+//   bit 0  (0x0001)  instruction_queue   — IQ descriptor fetched
+//   bit 1  (0x0002)  input_actv_queue
+//   bit 2  (0x0004)  param_queue
+//   bit 3  (0x0008)  output_actv_queue
+//   bit 4  (0x0010)  sc_host_0           ★ "INFER complete" (SCALAR host_interrupt 0)
+//   bit 5  (0x0020)  sc_host_1
+//   bit 6  (0x0040)  sc_host_2
+//   bit 7  (0x0080)  sc_host_3
+//   bit 8  (0x0100)  top_level_0
+//   bit 9  (0x0200)  top_level_1
+//   bit 10 (0x0400)  top_level_2
+//   bit 11 (0x0800)  top_level_3
+//   bit 12 (0x1000)  fatal_err           ★ HIB fatal error
+//
+//   pending = 0x0011 → IQ_INT + SC_HOST_0 (canonical "INFER done" handshake).
+//   pending = 0x1000 → FATAL_ERR (NOT a completion signal, abort the IOCTL).
+#define APEX_WIRE_BIT_IQ_INT             (1u << 0)   // 0x0001
+#define APEX_WIRE_BIT_INPUT_ACTV_Q       (1u << 1)   // 0x0002
+#define APEX_WIRE_BIT_PARAM_Q            (1u << 2)   // 0x0004
+#define APEX_WIRE_BIT_OUTPUT_ACTV_Q      (1u << 3)   // 0x0008
+#define APEX_WIRE_BIT_SC_HOST_0          (1u << 4)   // 0x0010
+#define APEX_WIRE_BIT_SC_HOST_1          (1u << 5)   // 0x0020
+#define APEX_WIRE_BIT_SC_HOST_2          (1u << 6)   // 0x0040
+#define APEX_WIRE_BIT_SC_HOST_3          (1u << 7)   // 0x0080
+#define APEX_WIRE_BIT_TOP_LEVEL_0        (1u << 8)   // 0x0100
+#define APEX_WIRE_BIT_TOP_LEVEL_1        (1u << 9)   // 0x0200
+#define APEX_WIRE_BIT_TOP_LEVEL_2        (1u << 10)  // 0x0400
+#define APEX_WIRE_BIT_TOP_LEVEL_3        (1u << 11)  // 0x0800
+#define APEX_WIRE_BIT_FATAL_ERR          (1u << 12)  // 0x1000
+#define APEX_WIRE_BITS_SC_HOST_ANY       (0xFu << 4) // 0x00F0 — sc_host_0..3 mask
+#define APEX_WIRE_BITS_TOP_LEVEL_ANY     (0xFu << 8) // 0x0F00 — top_level_0..3 mask
+
 // ========== SC_HOST Interrupt Control ==========
 #define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 0xF = enable all 4 SC_HOST completion interrupts (kNumInterrupts=4)
 #define APEX_REG_TOP_LEVEL_INT_CONTROL      0x486b0  // write 0xF = enable top-level aggregator interrupts
