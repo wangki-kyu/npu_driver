@@ -15,9 +15,22 @@
 
 // register offset (BAR2)
 // ========== Memory Management ==========
+// AXI credit-shim status counters (R/O) — chip-internal AXI master channel stats.
+// Used to determine whether the chip ever attempted outbound AXI writes.  If
+// aw_insertion stays at 0 across an inference, the OUTFEED engine never even
+// reached the AXI master phase; if both increment but host RAM stays unchanged,
+// the writes went somewhere we can't see (PTE/IOMMU routing issue).
+#define APEX_REG_AXI_AW_CREDIT_SHIM_INSERTION 0x48220
+#define APEX_REG_AXI_W_CREDIT_SHIM_INSERTION  0x48260
+#define APEX_REG_AXI_AW_CREDIT_SHIM_OCCUPANCY 0x48210
+#define APEX_REG_AXI_W_CREDIT_SHIM_OCCUPANCY  0x48250
+
 #define APEX_REG_PAGE_TABLE_SIZE            0x46000
 #define APEX_REG_EXTENDED_TABLE             0x46008
-// 0x46010: no translation_enable register — MMU is activated by page_table_init=1
+// 0x46010 in gasket is APEX_BAR2_REG_KERNEL_HIB_TRANSLATION_ENABLE, but on this chip
+// it reads back 0x1 at POR — INFEED/IQ/StatusBlock all use MMU translation correctly
+// without us writing it, so we leave it alone.  (Tested: writing 1 made no difference
+// to the OUTFEED-not-writing-host-RAM symptom.)
 #define APEX_REG_PAGE_TABLE                 0x50000
 
 // ========== Interrupt Control ==========

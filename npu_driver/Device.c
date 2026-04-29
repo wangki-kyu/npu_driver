@@ -900,41 +900,10 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[BAR0] NOT MAPPED — Windows did not expose BAR0 as a memory resource\n");
 	}
 
-	// === HIB credit dump (END-OF-PREPARE-HARDWARE, BEFORE explicit fix) ===
+	// HIB credits at end-of-PrepareHardware — these registers are R/O status
+	// counters maintained by the chip; we keep the dump for diagnostics only.
 	{
 		PVOID b2 = deviceContext->Bar2BaseAddress;
-		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
-		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
-		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
-		UINT32 c3 = apex_read_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
-		DbgPrint("[CREDITS@PREPARE-END-PRE-FIX] instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
-			c0, c1, c2, c3);
-	}
-
-	// =========================================================
-	// FIX: Initialize output_actv_credits explicitly.
-	// On Apex/Beagle the POR default of output_actv_credits is 0,
-	// which gates ALL OUTFEED -> HIB outbound DMA writes.  libedgetpu/
-	// gasket never write this register because their host POR somehow
-	// has it set; ours doesn't.  Empirically observed (4 dump points,
-	// PRE-RESET through POST-INFER all read 0x0).
-	//
-	// Match the POR values of the other three credit registers so the
-	// outbound path has the same "permission" as inbound:
-	//   instr   = 0x800 (POR observed)
-	//   input   = 0x800 (POR observed)
-	//   param   = 0x1000 (POR observed)
-	//   output  = 0x800 (we pick — same as input/instr; if too few,
-	//                    OUTFEED stalls; if too many, no harm).
-	// =========================================================
-	{
-		PVOID b2 = deviceContext->Bar2BaseAddress;
-		apex_write_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS,  0x00000800);
-		apex_write_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS,   0x00000800);
-		apex_write_register_32(b2, APEX_REG_HIB_PARAM_CREDITS,        0x00001000);
-		apex_write_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS,  0x00000800);
-		DbgPrint("[CREDITS-FIX] wrote instr=0x800 input=0x800 param=0x1000 output=0x800\n");
-
 		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
 		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
 		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
@@ -942,6 +911,12 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[CREDITS@PREPARE-END] instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
 			c0, c1, c2, c3);
 	}
+
+	// AER baseline at end of PrepareHardware — establishes a known clean state.
+	// Any non-zero AER bits captured here are pre-existing chip/PCIe issues, not
+	// caused by inference.  We W1C inside the helper so subsequent snapshots
+	// only show NEW errors that occurred during inference.
+	npudriverDumpPciAer(Device, "prepare-end");
 
 	DbgPrint("[%s] Exit\n", __FUNCTION__);
 
@@ -1089,7 +1064,6 @@ npudriverEvtDeviceReleaseHardware(
 		ExFreePoolWithTag(deviceContext->StatusBlockBase, 'SBLK');
 		deviceContext->StatusBlockBase = NULL;
 	}
-
 	if (deviceContext->Bar2BaseAddress != NULL) {
 		MmUnmapIoSpace(deviceContext->Bar2BaseAddress, deviceContext->Bar2Length);
 		deviceContext->Bar2BaseAddress = NULL;
@@ -1519,6 +1493,175 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 // addr/data into the BAR/offset reported here. We can then either (a) mirror
 // those values into chip's BAR2+0x46800, or (b) point chip at the real table.
 // ============================================================================
+// Lightweight PCI Command/Status dump — callable from any IRQL <= DISPATCH_LEVEL.
+// We use this to prove (or disprove) the "chip can't issue outbound writes" hypothesis:
+//   Command bit2 (BME) must be 1 for the device to act as a PCIe bus master.
+//   Status bit13 (Received Master Abort) signals the root complex rejected a write —
+//     usually IOMMU/VT-d denying the PA the chip targeted.
+VOID npudriverDumpPciCommand(WDFDEVICE Device, const char* tag)
+{
+	BUS_INTERFACE_STANDARD bus = { 0 };
+	NTSTATUS status;
+	UINT16  cmd = 0;
+	UINT16  st  = 0;
+	ULONG   bytes;
+
+	status = WdfFdoQueryForInterface(
+		Device,
+		&GUID_BUS_INTERFACE_STANDARD,
+		(PINTERFACE)&bus,
+		sizeof(BUS_INTERFACE_STANDARD),
+		1, NULL);
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("[PCI-CMD@%s] QueryForInterface failed 0x%x\n", tag, status);
+		return;
+	}
+
+	bytes = bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &cmd, 0x04, 2);
+	if (bytes != 2) {
+		DbgPrint("[PCI-CMD@%s] read Command failed (got %lu)\n", tag, bytes);
+		bus.InterfaceDereference(bus.Context);
+		return;
+	}
+	bytes = bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &st, 0x06, 2);
+	if (bytes != 2) {
+		DbgPrint("[PCI-CMD@%s] read Status failed (got %lu)\n", tag, bytes);
+		bus.InterfaceDereference(bus.Context);
+		return;
+	}
+
+	DbgPrint("[PCI-CMD@%s] Command=0x%04x  BME=%u MEM=%u IO=%u  | Status=0x%04x  RcvMasterAbort=%u SigTargetAbort=%u SigSysErr=%u DataParityErr=%u\n",
+		tag,
+		cmd, (cmd >> 2) & 1, (cmd >> 1) & 1, cmd & 1,
+		st,  (st  >> 13) & 1, (st  >> 11) & 1, (st >> 14) & 1, (st >> 8) & 1);
+
+	// Best-effort: clear sticky error bits (W1C) so subsequent snapshots show only
+	// new errors that occurred since last clear.  Errors at startup are normal.
+	if (st & 0xF900) {
+		UINT16 w1c = (UINT16)(st & 0xF900);
+		bus.SetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &w1c, 0x06, 2);
+		DbgPrint("[PCI-CMD@%s] cleared sticky Status bits 0x%04x\n", tag, w1c);
+	}
+
+	bus.InterfaceDereference(bus.Context);
+}
+
+// PCIe Express Capability + AER dump.  Tells us whether chip's AXI activity
+// reaches the PCIe link by checking PCIe Device Status error bits and AER
+// Uncorrectable/Correctable error status registers.
+VOID npudriverDumpPciAer(WDFDEVICE Device, const char* tag)
+{
+	BUS_INTERFACE_STANDARD bus = { 0 };
+	NTSTATUS status;
+	UCHAR  pcieCap[24];
+	UCHAR  extCfg[256];
+	ULONG  bytes;
+	UINT32 aerOff = 0xFFFFFFFFu;
+
+	status = WdfFdoQueryForInterface(
+		Device, &GUID_BUS_INTERFACE_STANDARD,
+		(PINTERFACE)&bus, sizeof(BUS_INTERFACE_STANDARD), 1, NULL);
+	if (!NT_SUCCESS(status)) {
+		DbgPrint("[PCIE@%s] QueryForInterface failed 0x%x\n", tag, status);
+		return;
+	}
+
+	// PCIe Express Capability lives at PCI config 0x80 (id=0x10, seen in MSIX-CAP log).
+	// Layout: +0 cap header, +0x08 DevCtrl, +0x0a DevStatus, +0x10 LinkCtrl, +0x12 LinkStatus
+	bytes = bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, pcieCap, 0x80, 24);
+	if (bytes >= 24) {
+		UINT16 devCtrl    = *(UINT16*)(pcieCap + 0x08);
+		UINT16 devStatus  = *(UINT16*)(pcieCap + 0x0a);
+		UINT16 linkCtrl   = *(UINT16*)(pcieCap + 0x10);
+		UINT16 linkStatus = *(UINT16*)(pcieCap + 0x12);
+		DbgPrint("[PCIE@%s] DevCtrl=0x%04x DevStatus=0x%04x  CorrErr=%u NonFatalErr=%u FatalErr=%u UnsupReqDetected=%u  | LinkCtrl=0x%04x LinkStatus=0x%04x  speed=%u width=%u\n",
+			tag, devCtrl, devStatus,
+			devStatus & 1, (devStatus >> 1) & 1, (devStatus >> 2) & 1, (devStatus >> 3) & 1,
+			linkCtrl, linkStatus,
+			linkStatus & 0xF, (linkStatus >> 4) & 0x3F);
+
+		// Clear DevStatus error bits (W1C) so next snapshot only shows new errors.
+		if (devStatus & 0x000F) {
+			UINT16 w1c = devStatus & 0x000F;
+			bus.SetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &w1c, 0x80 + 0x0a, 2);
+			DbgPrint("[PCIE@%s] cleared sticky DevStatus error bits 0x%04x\n", tag, w1c);
+		}
+	} else {
+		DbgPrint("[PCIE@%s] PCIe cap read failed (got %lu bytes)\n", tag, bytes);
+	}
+
+	// PCIe extended config space (0x100..0x1FF) — AER is here.
+	// Walk extended capability chain looking for AER (cap ID = 0x0001).
+	bytes = bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, extCfg, 0x100, 256);
+	if (bytes >= 64) {
+		UINT32 nextOff = 0x100;
+		int    safety = 16;
+		while (nextOff != 0 && nextOff >= 0x100 && nextOff < 0x200 && safety-- > 0) {
+			UINT32 idx = nextOff - 0x100;
+			UINT32 hdr = *(UINT32*)(extCfg + idx);
+			UINT16 id  = (UINT16)(hdr & 0xFFFF);
+			UINT16 ver = (UINT16)((hdr >> 16) & 0xF);
+			UINT16 nxt = (UINT16)((hdr >> 20) & 0xFFF);
+			DbgPrint("[PCIE-EXT@%s] @0x%03x id=0x%04x ver=%u next=0x%03x\n",
+				tag, nextOff, id, ver, nxt);
+			if (id == 0x0001) {
+				aerOff = idx;
+				break;
+			}
+			if (nxt == 0 || nxt < 0x100) break;
+			nextOff = nxt;
+		}
+
+		if (aerOff != 0xFFFFFFFFu) {
+			UINT32 uncorStatus = *(UINT32*)(extCfg + aerOff + 0x04);
+			UINT32 uncorMask   = *(UINT32*)(extCfg + aerOff + 0x08);
+			UINT32 uncorSev    = *(UINT32*)(extCfg + aerOff + 0x0C);
+			UINT32 corStatus   = *(UINT32*)(extCfg + aerOff + 0x10);
+			UINT32 corMask     = *(UINT32*)(extCfg + aerOff + 0x14);
+			UINT32 ctrl        = *(UINT32*)(extCfg + aerOff + 0x18);
+			DbgPrint("[AER@%s] uncorStatus=0x%08x uncorMask=0x%08x uncorSev=0x%08x | corStatus=0x%08x corMask=0x%08x | ctrl=0x%08x\n",
+				tag, uncorStatus, uncorMask, uncorSev, corStatus, corMask, ctrl);
+			// Decoded uncor bits we care about for outbound writes:
+			//   bit12 = Poisoned TLP Received
+			//   bit13 = Flow Control Protocol Error
+			//   bit14 = Completion Timeout
+			//   bit15 = Completer Abort
+			//   bit16 = Unexpected Completion
+			//   bit18 = Malformed TLP
+			//   bit20 = Unsupported Request
+			DbgPrint("[AER@%s]   uncor: PoisonedTLP=%u FlowCtrl=%u CompletionTimeout=%u CompleterAbort=%u UnexpComp=%u MalformedTLP=%u UnsupReq=%u\n",
+				tag,
+				(uncorStatus >> 12) & 1, (uncorStatus >> 13) & 1, (uncorStatus >> 14) & 1,
+				(uncorStatus >> 15) & 1, (uncorStatus >> 16) & 1, (uncorStatus >> 18) & 1,
+				(uncorStatus >> 20) & 1);
+			DbgPrint("[AER@%s]   cor:   ReceiverErr=%u BadTLP=%u BadDLLP=%u Replay=%u\n",
+				tag,
+				corStatus & 1, (corStatus >> 6) & 1, (corStatus >> 7) & 1, (corStatus >> 8) & 1);
+
+			// Clear AER status (W1C)
+			if (uncorStatus) {
+				UINT32 w1c = uncorStatus;
+				bus.SetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &w1c, 0x100 + aerOff + 0x04, 4);
+			}
+			if (corStatus) {
+				UINT32 w1c = corStatus;
+				bus.SetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &w1c, 0x100 + aerOff + 0x10, 4);
+			}
+		} else {
+			DbgPrint("[AER@%s] AER capability not found in extended config\n", tag);
+			// Dump first 16 bytes so we know what's there
+			DbgPrint("[PCIE-EXT@%s] @0x100 raw: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				tag,
+				extCfg[0],extCfg[1],extCfg[2],extCfg[3], extCfg[4],extCfg[5],extCfg[6],extCfg[7],
+				extCfg[8],extCfg[9],extCfg[10],extCfg[11], extCfg[12],extCfg[13],extCfg[14],extCfg[15]);
+		}
+	} else {
+		DbgPrint("[PCIE-EXT@%s] extended config read returned %lu bytes (need 64+)\n", tag, bytes);
+	}
+
+	bus.InterfaceDereference(bus.Context);
+}
+
 NTSTATUS npudriverDumpMsixCapability(WDFDEVICE Device)
 {
 	BUS_INTERFACE_STANDARD bus = { 0 };
@@ -1527,7 +1670,7 @@ NTSTATUS npudriverDumpMsixCapability(WDFDEVICE Device)
 	UCHAR cap[16];
 	UCHAR capPtr;
 	int safety;
-	UINT16 vendorId, deviceId, statusReg;
+	UINT16 vendorId, deviceId, statusReg, cmdReg;
 	ULONG bytes;
 
 	status = WdfFdoQueryForInterface(
@@ -1549,12 +1692,27 @@ NTSTATUS npudriverDumpMsixCapability(WDFDEVICE Device)
 	}
 
 	vendorId  = *(UINT16*)(hdr + 0x00);
+	cmdReg    = *(UINT16*)(hdr + 0x04);
 	deviceId  = *(UINT16*)(hdr + 0x02);
 	statusReg = *(UINT16*)(hdr + 0x06);
 	capPtr    = hdr[0x34];
 
-	DbgPrint("[MSIX-CAP] PCI VID=0x%04x DID=0x%04x Status=0x%04x CapPtr=0x%02x\n",
-		vendorId, deviceId, statusReg, capPtr);
+	DbgPrint("[MSIX-CAP] PCI VID=0x%04x DID=0x%04x Cmd=0x%04x Status=0x%04x CapPtr=0x%02x\n",
+		vendorId, deviceId, cmdReg, statusReg, capPtr);
+	DbgPrint("[MSIX-CAP]   Cmd bits: BME=%u MEM=%u IO=%u  Status bits: RcvMasterAbort=%u SigTargetAbort=%u\n",
+		(cmdReg >> 2) & 1, (cmdReg >> 1) & 1, cmdReg & 1,
+		(statusReg >> 13) & 1, (statusReg >> 11) & 1);
+
+	// CRITICAL: if BME is 0 here, chip CANNOT emit outbound writes.  Force it on.
+	// Windows normally sets BME during PCI enumeration but if for any reason it
+	// got cleared (D3 transition, driver reload, etc.) we must restore it.
+	if (((cmdReg >> 2) & 1) == 0) {
+		UINT16 newCmd = cmdReg | 0x0006;  // set BME(2) | MEM(1)
+		DbgPrint("[MSIX-CAP] BME=0 detected — forcing Command 0x%04x -> 0x%04x\n", cmdReg, newCmd);
+		bus.SetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &newCmd, 0x04, 2);
+		bus.GetBusData(bus.Context, PCI_WHICHSPACE_CONFIG, &cmdReg, 0x04, 2);
+		DbgPrint("[MSIX-CAP] readback Cmd=0x%04x BME=%u\n", cmdReg, (cmdReg >> 2) & 1);
+	}
 
 	if (!(statusReg & 0x10)) {  // PCI_STATUS_CAPABILITIES_LIST = 0x10
 		DbgPrint("[MSIX-CAP] device reports no capabilities list\n");

@@ -499,6 +499,27 @@ VOID npudriverEvtIoDeviceControl(
 				c0, c1, c2, c3);
 		}
 
+		// PCI Command/Status snapshot — confirms BME=1 and no Master Abort right
+		// before we kick the descriptor.  If these flip during inference we'll
+		// see it in the post-DONE/post-TIMEOUT snapshots below.
+		npudriverDumpPciCommand(device, "pre-submit");
+		npudriverDumpPciAer(device, "pre-submit");
+
+		// AXI write credit shim counters — these are R/O statistics maintained by
+		// the chip's internal AXI master.  By dumping pre-submit and post-DONE we
+		// can determine if the chip even attempted outbound AXI writes during
+		// inference.  Pre-INFER baseline (probably 0); post-INFER non-zero if the
+		// chip emitted AW/W transactions (then we have a routing/PTE problem); if
+		// they stay at 0 the chip never reached the AXI master phase at all.
+		{
+			UINT32 awIns = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_INSERTION);
+			UINT32 wIns  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_INSERTION);
+			UINT32 awOcc = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_OCCUPANCY);
+			UINT32 wOcc  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_OCCUPANCY);
+			DbgPrint("[AXI@pre-submit] aw_insertion=0x%x w_insertion=0x%x aw_occupancy=0x%x w_occupancy=0x%x\n",
+				awIns, wIns, awOcc, wOcc);
+		}
+
 		// Pre-submit engine state — 데이터/타일 엔진이 실제 kRunning 인지 확인
 		DbgPrint("[INFER] pre-submit SCALAR=0x%x AVDATA=0x%x OUTFEED=0x%x INFEED=0x%x PARAM=0x%x IQ_INT=0x%llx WIRE=0x%llx\n",
 			apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS),
@@ -687,8 +708,26 @@ VOID npudriverEvtIoDeviceControl(
 				DbgPrint("[DONE] OUTFEED=0x%x INFEED=0x%x HIB_ERROR=0x%llx HIB_FIRST=0x%llx\n",
 					outfeedSt, infeedSt, hibErr, firstErr);
 				DbgPrint("[DONE] ISR call count AFTER INFER: %d\n", pDevContext->IsrCallCount);
+
+				// Post-completion PCI snapshot — Master Abort here means chip
+				// did issue an outbound write but root complex rejected it
+				// (typically VT-d/IOMMU denying the target PA).
+				npudriverDumpPciCommand(device, "post-DONE");
+				npudriverDumpPciAer(device, "post-DONE");
 				if (hibErr & 1ULL)
 					DbgPrint("[DONE]   inbound_page_fault at device VA 0x%llx\n", firstErr);
+
+				// AXI shim counters POST-INFER — compare with pre-submit snapshot.
+				// Non-zero increment = chip attempted outbound writes (PTE/IOMMU bug).
+				// Zero = chip's OUTFEED never reached AXI master (silicon-level gate).
+				{
+					UINT32 awIns = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_INSERTION);
+					UINT32 wIns  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_INSERTION);
+					UINT32 awOcc = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_OCCUPANCY);
+					UINT32 wOcc  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_OCCUPANCY);
+					DbgPrint("[AXI@post-DONE] aw_insertion=0x%x w_insertion=0x%x aw_occupancy=0x%x w_occupancy=0x%x\n",
+						awIns, wIns, awOcc, wOcc);
+				}
 
 				// HIB credit dump (POST-INFER) — did credits decrement during
 				// inference?  Compare with PRE-INFER snapshot.  output==0 here
@@ -707,6 +746,132 @@ VOID npudriverEvtIoDeviceControl(
 					UINT64 *sb = (UINT64 *)pDevContext->StatusBlockBase;
 					DbgPrint("[DONE-SB] StatusBlock: [0]=0x%llx [1]=0x%llx [2]=0x%llx [3]=0x%llx\n",
 						sb[0], sb[1], sb[2], sb[3]);
+				}
+
+				// =========================================================
+				// SCAN — chip 이 OUTFEED 로 발행한 ~2585 burst 가 host 의 어느
+				// PA 에 도착했는지 추적.  우리가 PTE 에 등록한 모든 영역의 head/tail
+				// 64 bytes 를 dump.  추론 결과처럼 보이는 byte 패턴이 어느 영역에서
+				// 나타나는지로 chip 의 진짜 destination PA 를 역추적한다.
+				//
+				// 참고 패턴:
+				//   0xCC repeated      → 우리가 Output 에 pre-fill 한 sentinel.  변화 없음.
+				//   0x80 0f 00 10 c3.. → bitstream header (PARAM/INFER bitstream 영역)
+				//   0x251B31...        → image pixels (Input 영역, 로그에서 본 첫 byte)
+				//   StatusBlock [0]=0x2 → IQ completed_head, chip 이 정상 write 한 케이스
+				//   기타 small float / quantized int8 → OUTFEED 결과 가능성
+				// =========================================================
+				DbgPrint("[SCAN] post-inference dump of all PTE-mapped regions\n");
+
+				// 1) DescRing — kernel allocated, 4 KB.  inference 전 첫 32 bytes 는
+				//    우리가 채운 descriptor (address+size) 였음.  chip 이 여기를
+				//    덮었는지 확인.
+				if (pDevContext->DescRingBase != NULL) {
+					PUCHAR p = (PUCHAR)pDevContext->DescRingBase;
+					DbgPrint("[SCAN-DescRing] kva=%p PA=0x%llx first32=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						p, pDevContext->DescRingDeviceVA,
+						p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+						p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
+						p[16],p[17],p[18],p[19], p[20],p[21],p[22],p[23],
+						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31]);
+				}
+
+				// 2) StatusBlock — kernel allocated, 4 KB.  처음 16 bytes 외에 나머지
+				//    영역도 dump (chip 이 잘못 변환된 VA 로 여기를 덮었을 가능성).
+				if (pDevContext->StatusBlockBase != NULL) {
+					PUCHAR p = (PUCHAR)pDevContext->StatusBlockBase;
+					DbgPrint("[SCAN-StatusBlock] kva=%p first32=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						p,
+						p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+						p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
+						p[16],p[17],p[18],p[19], p[20],p[21],p[22],p[23],
+						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31]);
+				}
+
+				// 3) PageTable host-side memory — 우리가 PTE 들을 작성한 host buffer.
+				//    chip 이 만약 device VA 의 high bits 를 잘못 해석해서 PTE
+				//    memory 영역으로 결과를 썼을 가능성.  64 KB 영역의 시작.
+				if (pDevContext->PageTableBase != NULL) {
+					PUCHAR p = (PUCHAR)pDevContext->PageTableBase;
+					DbgPrint("[SCAN-PageTable] kva=%p first32=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						p,
+						p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
+						p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
+						p[16],p[17],p[18],p[19], p[20],p[21],p[22],p[23],
+						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31]);
+				}
+
+				// 4) INFER bitstream MDL (LockedModelMdl) — 196 KB at PTE[1536..1584].
+				//    inference 전 bitstream header 는 80 0f 00 10 c3 00 00 00.
+				//    head 변하면 chip 이 bitstream 자체를 덮은 것.
+				if (pDevContext->LockedModelMdl != NULL) {
+					PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+						pDevContext->LockedModelMdl, NormalPagePriority);
+					if (kva != NULL) {
+						SIZE_T sz = MmGetMdlByteCount(pDevContext->LockedModelMdl);
+						DbgPrint("[SCAN-INFERBitstream] kva=%p sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | tail16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							kva, (UINT64)sz,
+							kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+							kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+							kva[sz-16],kva[sz-15],kva[sz-14],kva[sz-13], kva[sz-12],kva[sz-11],kva[sz-10],kva[sz-9],
+							kva[sz-8],kva[sz-7],kva[sz-6],kva[sz-5], kva[sz-4],kva[sz-3],kva[sz-2],kva[sz-1]);
+					}
+				}
+
+				// 5) Input image MDL — 300 KB at PTE[1585..1659].  inference 전
+				//    image pixels (head 0x25 0x1B...).  chip 이 OUTFEED 로 input
+				//    영역을 덮으면 head 가 무의미한 byte 로 변함.
+				if (pDevContext->InferInputMdl != NULL) {
+					PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+						pDevContext->InferInputMdl, NormalPagePriority);
+					if (kva != NULL) {
+						SIZE_T sz = MmGetMdlByteCount(pDevContext->InferInputMdl);
+						DbgPrint("[SCAN-InputImage] kva=%p sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | tail16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							kva, (UINT64)sz,
+							kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+							kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+							kva[sz-16],kva[sz-15],kva[sz-14],kva[sz-13], kva[sz-12],kva[sz-11],kva[sz-10],kva[sz-9],
+							kva[sz-8],kva[sz-7],kva[sz-6],kva[sz-5], kva[sz-4],kva[sz-3],kva[sz-2],kva[sz-1]);
+					}
+				}
+
+				// 6) Cached PARAM bitstream MDL — 12 KB at PTE[0..2], device VA 0x0.
+				if (pDevContext->CachedParamBitstreamMdl != NULL) {
+					PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+						pDevContext->CachedParamBitstreamMdl, NormalPagePriority);
+					if (kva != NULL) {
+						SIZE_T sz = MmGetMdlByteCount(pDevContext->CachedParamBitstreamMdl);
+						DbgPrint("[SCAN-PARAMBitstream] kva=%p sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | tail16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							kva, (UINT64)sz,
+							kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+							kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+							kva[sz-16],kva[sz-15],kva[sz-14],kva[sz-13], kva[sz-12],kva[sz-11],kva[sz-10],kva[sz-9],
+							kva[sz-8],kva[sz-7],kva[sz-6],kva[sz-5], kva[sz-4],kva[sz-3],kva[sz-2],kva[sz-1]);
+					}
+				}
+
+				// 7) Cached Param data MDL — 6 MB at PTE[3..1502], device VA 0x3000.
+				//    너무 크니까 head 만.
+				if (pDevContext->CachedParamMdl != NULL) {
+					PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+						pDevContext->CachedParamMdl, NormalPagePriority);
+					if (kva != NULL) {
+						SIZE_T sz = MmGetMdlByteCount(pDevContext->CachedParamMdl);
+						DbgPrint("[SCAN-ParamData] kva=%p sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | @+0x67c000 (=0x67c000-0x3000=0x679000): %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							kva, (UINT64)sz,
+							kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+							kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+							/* 만약 chip 이 0x67c000 device VA 를 PARAM 영역의 offset 으로 잘못
+							   해석했다면 여기 */
+							sz > 0x679000 ? kva[0x679000] : 0, sz > 0x679001 ? kva[0x679001] : 0,
+							sz > 0x679002 ? kva[0x679002] : 0, sz > 0x679003 ? kva[0x679003] : 0,
+							sz > 0x679004 ? kva[0x679004] : 0, sz > 0x679005 ? kva[0x679005] : 0,
+							sz > 0x679006 ? kva[0x679006] : 0, sz > 0x679007 ? kva[0x679007] : 0,
+							sz > 0x679008 ? kva[0x679008] : 0, sz > 0x679009 ? kva[0x679009] : 0,
+							sz > 0x67900a ? kva[0x67900a] : 0, sz > 0x67900b ? kva[0x67900b] : 0,
+							sz > 0x67900c ? kva[0x67900c] : 0, sz > 0x67900d ? kva[0x67900d] : 0,
+							sz > 0x67900e ? kva[0x67900e] : 0, sz > 0x67900f ? kva[0x67900f] : 0);
+					}
 				}
 
 				// Output buffer kernel-side dump BEFORE unlock — catches the case
@@ -792,6 +957,10 @@ VOID npudriverEvtIoDeviceControl(
 			DbgPrint("[%s] TIMEOUT waiting for inference\n", __FUNCTION__);
 			DbgPrint("[TIMEOUT] ISR call count: %d (0 means MSI-X never delivered)\n",
 				pDevContext->IsrCallCount);
+
+			// Post-timeout PCI snapshot — same intent as post-DONE.
+			npudriverDumpPciCommand(device, "post-TIMEOUT");
+			npudriverDumpPciAer(device, "post-TIMEOUT");
 
 			// Diagnostic: read hardware state to understand why
 			UINT64 wirePending   = apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING);
