@@ -59,6 +59,7 @@ VOID npudriverEvtIoDeviceControl(
 
 		if (NT_SUCCESS(status)) {
 			PDEVICE_CONTEXT pDC = DeviceGetContext(device);
+			pDC->LastMapBufferDeviceVA = deviceAddr;
 			DbgPrint("[MAP] HIB_ERROR after map = 0x%llx\n",
 				apex_read_register(pDC->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS));
 			DbgPrint("[%s] Mapped successfully, DeviceAddr=0x%llx\n", __FUNCTION__, deviceAddr);
@@ -202,15 +203,30 @@ VOID npudriverEvtIoDeviceControl(
 				// Scan whole bitstream for 32-bit LE patch values.  Apex
 				// patches are dword-aligned in the bitstream, so we step
 				// in 4-byte units.  Report up to 4 hits per pattern.
+				//
+				// For extended VAs (bit 63 set in OutputDeviceVA), the LOWER
+				// half is often 0 which would match thousands of zero dwords.
+				// Skip the LOWER scan in that case and instead scan for the
+				// UPPER half (0x80000000) which is unique enough to find.
 				{
-					UINT32 patterns[5] = {
-						(UINT32)pInput->InputDeviceVA,   // 0x631000
-						(UINT32)pInput->OutputDeviceVA,  // 0x67c000
-						(UINT32)(pInput->OutputDeviceVA + 0x2000), // 0x67e000 (OUTPUT[1])
-						0x3000u,                         // PARAM device VA
-						(UINT32)pInput->BitstreamDeviceVA // 0x600000 self-base
+					BOOLEAN outputIsExtended = (pInput->OutputDeviceVA & (1ULL << 63)) != 0;
+					UINT32 patterns[5];
+					patterns[0] = (UINT32)pInput->InputDeviceVA;
+					patterns[1] = outputIsExtended
+						? (UINT32)(pInput->OutputDeviceVA >> 32)               // UPPER (0x80000000)
+						: (UINT32)pInput->OutputDeviceVA;                       // LOWER (legacy 0x67c000)
+					patterns[2] = outputIsExtended
+						? (UINT32)((pInput->OutputDeviceVA + 0x2000) >> 32)
+						: (UINT32)(pInput->OutputDeviceVA + 0x2000);
+					patterns[3] = 0x3000u;
+					patterns[4] = (UINT32)pInput->BitstreamDeviceVA;
+					const char *names[5] = {
+						"INPUT",
+						outputIsExtended ? "OUTPUT[0]_UPPER" : "OUTPUT[0]",
+						outputIsExtended ? "OUTPUT[1]_UPPER" : "OUTPUT[1]",
+						"PARAM",
+						"BITSTREAM_SELF"
 					};
-					const char *names[5] = {"INPUT", "OUTPUT[0]", "OUTPUT[1]", "PARAM", "BITSTREAM_SELF"};
 					ULONG p, off, hits;
 					for (p = 0; p < 5; p++) {
 						hits = 0;
@@ -325,33 +341,47 @@ VOID npudriverEvtIoDeviceControl(
 			pageCount = (UINT32)((pInput->InputImageSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
 			pfnArray = MmGetMdlPfnArray(inputImageMdl);
 
-			DbgPrint("[%s] Registering input: PTE[%lu] size=%lu pages\n",
-				__FUNCTION__, pteIdx, pageCount);
+			if ((pInput->InputDeviceVA & (1ULL << 63)) != 0) {
+				// Extended VA: route via 2-level page table (subtable pool).
+				NTSTATUS extStatus = ApexExtMapBuffer(device, pInput->InputDeviceVA,
+					pfnArray, pageCount);
+				if (!NT_SUCCESS(extStatus)) {
+					DbgPrint("[%s] INPUT ApexExtMapBuffer failed VA=0x%llx pages=%u status=0x%x\n",
+						__FUNCTION__, pInput->InputDeviceVA, pageCount, extStatus);
+					status = extStatus;
+					MmUnlockPages(inputImageMdl);
+					IoFreeMdl(inputImageMdl);
+					MmUnlockPages(outputBufferMdl);
+					IoFreeMdl(outputBufferMdl);
+					break;
+				}
+				DbgPrint("[%s] EXT registered input: VA=0x%llx pages=%u\n",
+					__FUNCTION__, pInput->InputDeviceVA, pageCount);
+			} else {
+				DbgPrint("[%s] Registering input: PTE[%lu] size=%lu pages\n",
+					__FUNCTION__, pteIdx, pageCount);
+				WdfSpinLockAcquire(pDevContext->PageTableLock);
+				for (i = 0; i < pageCount; i++) {
+					UINT64 physAddr = ((UINT64)pfnArray[i] << PAGE_SHIFT);
+					apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr | 1);
+				}
+				WdfSpinLockRelease(pDevContext->PageTableLock);
 
-			WdfSpinLockAcquire(pDevContext->PageTableLock);
-			for (i = 0; i < pageCount; i++) {
-				UINT64 physAddr = ((UINT64)pfnArray[i] << PAGE_SHIFT);
-				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr | 1);
-			}
-			WdfSpinLockRelease(pDevContext->PageTableLock);
-
-			// == PTE write read back == 
-			{
-				PUCHAR kvAddr = (PUCHAR)MmGetSystemAddressForMdlSafe(inputImageMdl, NormalPagePriority);
-				UINT32 verifyCount = min(pageCount, 4);
-
-				for (i = 0; i < verifyCount; i++) {
-					UINT64 expectedPA = (UINT64)pfnArray[i] << PAGE_SHIFT;
-					UINT64 readbackPA = apex_read_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8));
-					UINT64 readbackPA_noFlag = readbackPA & ~1ULL;
-
-					UINT64 vaFirstQword = (kvAddr != NULL) ? *(UINT64*)(kvAddr + i * PAGE_SIZE) : 0xDEADDEAD;
-
-					DbgPrint("[%s] PTE[%lu+%u]: expected=0x%llX readback=0x%llX %s | VA[0]=0x%llX\n",
-						__FUNCTION__, pteIdx, i,
-						expectedPA, readbackPA_noFlag,
-						(readbackPA_noFlag == expectedPA) ? "OK" : "MISMATCH",
-						vaFirstQword);
+				// == PTE write read back == (simple-VA only)
+				{
+					PUCHAR kvAddr = (PUCHAR)MmGetSystemAddressForMdlSafe(inputImageMdl, NormalPagePriority);
+					UINT32 verifyCount = min(pageCount, 4);
+					for (i = 0; i < verifyCount; i++) {
+						UINT64 expectedPA = (UINT64)pfnArray[i] << PAGE_SHIFT;
+						UINT64 readbackPA = apex_read_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8));
+						UINT64 readbackPA_noFlag = readbackPA & ~1ULL;
+						UINT64 vaFirstQword = (kvAddr != NULL) ? *(UINT64*)(kvAddr + i * PAGE_SIZE) : 0xDEADDEAD;
+						DbgPrint("[%s] PTE[%lu+%u]: expected=0x%llX readback=0x%llX %s | VA[0]=0x%llX\n",
+							__FUNCTION__, pteIdx, i,
+							expectedPA, readbackPA_noFlag,
+							(readbackPA_noFlag == expectedPA) ? "OK" : "MISMATCH",
+							vaFirstQword);
+					}
 				}
 			}
 
@@ -431,25 +461,74 @@ VOID npudriverEvtIoDeviceControl(
 			}
 		}
 
-		// 5. Register output buffer pages in page table
+		// 5. Register output buffer pages in page table.
+		//
+		// Two paths depending on the OutputDeviceVA bit 63:
+		//   (a) bit 63 = 0 → simple region.  Each output page goes into a
+		//                    chip PTE register at index (VA >> 12) directly.
+		//   (b) bit 63 = 1 → extended region (libedgetpu default).  Build a
+		//                    2-level PT: chip PTE register at extended index
+		//                    points to a host-resident 4 KB sub-table whose
+		//                    entries point at the actual output pages.
+		//
+		// EXTENDED-PATH BOUNCE: user-mode OUTPUT pages are usually > 4 GB and
+		// chip outbound writes truncate to 32-bit, causing HIB_ERR=0x1 +
+		// FATAL_ERR.  Workaround: allocate a < 4 GB contiguous kernel bounce
+		// buffer, map THAT into the chip's 2-level PT, and memcpy bounce ->
+		// user buffer in DPC after OUTFEED drains.
 		{
-			pteIdx = (UINT32)(pInput->OutputDeviceVA >> PAGE_SHIFT);
 			pageCount = (UINT32)((pInput->OutputBufferSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
-			pfnArray = MmGetMdlPfnArray(outputBufferMdl);
 
-			DbgPrint("[%s] Registering output: PTE[%lu] size=%lu pages\n",
-				__FUNCTION__, pteIdx, pageCount);
+			if ((pInput->OutputDeviceVA & (1ULL << 63)) != 0) {
+				// Extended VA path with bounce.
+				PFN_NUMBER bouncePfns[64];  // 64 pages = 256 KB max bounce
+				UINT32 bouncePageCnt = 0;
+				NTSTATUS bnStatus = ApexAllocOutputBounce(
+					device, (SIZE_T)pInput->OutputBufferSize,
+					bouncePfns, ARRAYSIZE(bouncePfns), &bouncePageCnt);
+				if (!NT_SUCCESS(bnStatus)) {
+					DbgPrint("[%s] ApexAllocOutputBounce failed: 0x%x\n",
+						__FUNCTION__, bnStatus);
+					status = bnStatus;
+					MmUnlockPages(inputImageMdl);
+					IoFreeMdl(inputImageMdl);
+					MmUnlockPages(outputBufferMdl);
+					IoFreeMdl(outputBufferMdl);
+					break;
+				}
+				NTSTATUS extStatus = ApexExtMapBuffer(
+					device, pInput->OutputDeviceVA, bouncePfns, bouncePageCnt);
+				if (!NT_SUCCESS(extStatus)) {
+					DbgPrint("[%s] ApexExtMapBuffer failed: 0x%x — aborting INFER\n",
+						__FUNCTION__, extStatus);
+					ApexFreeOutputBounce(device);
+					status = extStatus;
+					MmUnlockPages(inputImageMdl);
+					IoFreeMdl(inputImageMdl);
+					MmUnlockPages(outputBufferMdl);
+					IoFreeMdl(outputBufferMdl);
+					break;
+				}
+				DbgPrint("[%s] Output mapped via EXTENDED+BOUNCE path (VA=0x%llx, %lu pages)\n",
+					__FUNCTION__, pInput->OutputDeviceVA, bouncePageCnt);
+			} else {
+				pfnArray = MmGetMdlPfnArray(outputBufferMdl);
+				pteIdx = (UINT32)(pInput->OutputDeviceVA >> PAGE_SHIFT);
+				DbgPrint("[%s] Registering output (SIMPLE): PTE[%lu] size=%lu pages\n",
+					__FUNCTION__, pteIdx, pageCount);
 
-			WdfSpinLockAcquire(pDevContext->PageTableLock);
-			for (i = 0; i < pageCount; i++) {
-				UINT64 physAddr = ((UINT64)pfnArray[i] << PAGE_SHIFT);
-				// EXPERIMENT: drop |1 valid-bit ONLY for OUTPUT PTEs.  Hypothesis:
-				// the LSB might be a "read-allowed" flag and chip refuses to write
-				// to a PTE marked read-only.  All other PTEs (DescRing, SB, Input,
-				// Param, etc.) keep |1 since they need to be readable.
-				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr);
+				WdfSpinLockAcquire(pDevContext->PageTableLock);
+				for (i = 0; i < pageCount; i++) {
+					UINT64 physAddr = ((UINT64)pfnArray[i] << PAGE_SHIFT);
+					// Restore the |0x1 valid bit.  Earlier experiment dropped it
+					// to test whether LSB is a read-allowed flag; result was no
+					// change, so we put the valid bit back per spec.
+					apex_write_register(bar2,
+						APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8),
+						physAddr | 0x1);
+				}
+				WdfSpinLockRelease(pDevContext->PageTableLock);
 			}
-			WdfSpinLockRelease(pDevContext->PageTableLock);
 
 			// SENTINEL FILL: pre-fill the locked output pages with 0xCC so we
 			// can tell after inference whether OUTFEED actually wrote anything.
@@ -589,6 +668,19 @@ VOID npudriverEvtIoDeviceControl(
 		// to find which registers chip touched during inference.
 		npudriverDumpKnownCsrs(pDevContext, "pre-submit");
 
+		// Snapshot SC_HOST_INT_COUNT (BAR2+0x486d0) BEFORE submit. The chip
+		// increments this register each time SCALAR executes its host_interrupt 0
+		// opcode (placed by the compiler AFTER the OUTFEED drain barrier), so
+		// any post-submit increment unambiguously means OUTFEED has finished.
+		// We cache the pre-submit value and compare against subsequent reads
+		// instead of relying on IQ_COMPLETED_HEAD (which only reflects ring
+		// fetch progress, not pipeline completion).
+		{
+			UINT64 preCount = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
+			pDevContext->LastScHostIntCount = preCount;
+			DbgPrint("[INFER] pre-submit SC_HOST_INT_COUNT snapshot = 0x%llx\n", preCount);
+		}
+
 		// AXI write credit shim counters — these are R/O statistics maintained by
 		// the chip's internal AXI master.  By dumping pre-submit and post-DONE we
 		// can determine if the chip even attempted outbound AXI writes during
@@ -635,6 +727,23 @@ VOID npudriverEvtIoDeviceControl(
 
 			HOST_QUEUE_DESC *ring = (HOST_QUEUE_DESC *)pDevContext->DescRingBase;
 
+			// SENTINEL FILL: pre-fill DescRing remainder + StatusBlock with
+			// 0xA5 so we can tell after inference if chip stray-wrote into
+			// these regions.  Our 2 descriptors will overwrite first 32 bytes.
+			RtlFillMemory(pDevContext->DescRingBase, PAGE_SIZE, 0xA5);
+			if (pDevContext->StatusBlockBase != NULL) {
+				RtlFillMemory(pDevContext->StatusBlockBase, PAGE_SIZE, 0xA5);
+			}
+
+			// HIB_OUTPUT_ACTV_CREDITS write removed — working libedgetpu trace
+			// never writes this register. Chip POR default of 0 is correct;
+			// writes were ignored (readback always 0) anyway. Just log for diag.
+			{
+				UINT32 outCreditPre = apex_read_register_32(bar2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
+				DbgPrint("[INFER] HIB_OUTPUT_ACTV_CREDITS = 0x%x (left at POR, working trace doesn't write)\n",
+					outCreditPre);
+			}
+
 			if (withParam) {
 				UINT32 slotP = pDevContext->DescRingTail % 256;
 				ring[slotP].address       = pDevContext->CachedParamBitstreamDeviceVA;
@@ -650,11 +759,11 @@ VOID npudriverEvtIoDeviceControl(
 				pDevContext->DescRingTail += 2;
 				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
 
-				UINT64 completed_head = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-				DbgPrint("[INFER_WITH_PARAM] PARAM slot=%u VA=0x%llx size=0x%x | INFER slot=%u VA=0x%llx size=0x%x | TAIL=%u Completed=%llu\n",
+				UINT64 iqFetched = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+				DbgPrint("[INFER_WITH_PARAM] PARAM slot=%u VA=0x%llx size=0x%x | INFER slot=%u VA=0x%llx size=0x%x | TAIL=%u IQ_FETCHED=%llu (fetch only)\n",
 					slotP, ring[slotP].address, ring[slotP].size_in_bytes,
 					slotI, ring[slotI].address, ring[slotI].size_in_bytes,
-					pDevContext->DescRingTail, completed_head);
+					pDevContext->DescRingTail, iqFetched);
 			} else {
 				UINT32 slot = pDevContext->DescRingTail % 256;
 				ring[slot].address       = pInput->BitstreamDeviceVA;
@@ -665,10 +774,10 @@ VOID npudriverEvtIoDeviceControl(
 				pDevContext->DescRingTail++;
 				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
 
-				UINT64 completed_head = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-				DbgPrint("[%s] Descriptor submitted: slot=%u VA=0x%llx size=0x%x TAIL=%u Completed Head=%llu\n",
+				UINT64 iqFetched = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+				DbgPrint("[%s] Descriptor submitted: slot=%u VA=0x%llx size=0x%x TAIL=%u IQ_FETCHED=%llu (fetch only — not inference done)\n",
 					__FUNCTION__, slot,
-					ring[slot].address, ring[slot].size_in_bytes, pDevContext->DescRingTail, completed_head);
+					ring[slot].address, ring[slot].size_in_bytes, pDevContext->DescRingTail, iqFetched);
 
 				UINT64 *rawRing = (UINT64 *)pDevContext->DescRingBase;
 				DbgPrint("[INFER] Ring slot raw: [0]=0x%llx [1]=0x%llx\n",
@@ -685,7 +794,7 @@ VOID npudriverEvtIoDeviceControl(
 			UINT64 qComplete  = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
 			UINT64 qCtrl      = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_CONTROL);
 			UINT64 qIntStatus = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_STATUS);
-			DbgPrint("[DIAG] QUEUE_BASE=0x%llx SIZE=0x%llx TAIL=0x%llx FETCHED=0x%llx COMPLETED=0x%llx CTRL=0x%llx INT_STATUS=0x%llx\n",
+			DbgPrint("[DIAG] QUEUE_BASE=0x%llx SIZE=0x%llx TAIL=0x%llx FETCHED=0x%llx IQ_FETCHED_HEAD=0x%llx CTRL=0x%llx INT_STATUS=0x%llx (IQ_FETCHED_HEAD is fetch progress, not done)\n",
 				qBase, qSize, qTail, qFetch, qComplete, qCtrl, qIntStatus);
 			UINT64 qStatusBlockBase = apex_read_register(bar2, 0x48598);
 			DbgPrint("[DIAG] STATUS_BLOCK_BASE=0x%llx\n", qStatusBlockBase);
@@ -737,39 +846,56 @@ VOID npudriverEvtIoDeviceControl(
 		}
 
 		if (status == STATUS_TIMEOUT) {
-			// Stage 1 expired — check inference completion.
+			// Stage 1 expired — check inference completion via SC_HOST_INT_COUNT.
 			//
-			// IMPORTANT: COMPLETED == TAIL alone is NOT sufficient.  IQ COMPLETED
-			// advances when the chip *fetches* a descriptor and dispatches it to
-			// the engines; SCALAR may still be executing the bitstream.  We saw
-			// this empirically: ISR fired at 6 ms with COMPLETED=2 == TAIL=2 but
-			// SCALAR/INFEED were still kRun(1).  Real "inference complete" is
-			// SCALAR==kIdle(0) (or kHalted(4) on fault).
-			UINT32 iqSize        = (UINT32)apex_read_register(bar2, APEX_REG_INSTR_QUEUE_SIZE);
-			UINT32 expectedDone  = pDevContext->DescRingTail & (iqSize - 1);
+			// PRIMARY signal: SC_HOST_INT_COUNT (0x486d0) increments above the
+			// pre-submit snapshot. This is the SCALAR host_interrupt 0 counter
+			// — fires AFTER the OUTFEED drain barrier, so an increment proves
+			// the inference pipeline (INFEED → compute → OUTFEED) is fully
+			// drained and host RAM has the results.
+			//
+			// SECONDARY corroboration: SCALAR && OUTFEED in terminal state
+			// (kIdle=0 or kHalted=4). Mirrors libedgetpu IsAllRunStatusKIdle.
+			//
+			// Note: IQ_COMPLETED_HEAD is logged for diagnostics ONLY — it
+			// reflects ring descriptor fetch, not pipeline completion.
+			UINT64 preCount      = pDevContext->LastScHostIntCount;
+			UINT64 scHost50ms    = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
 			UINT32 scStatus50ms  = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
-			UINT64 completed50ms = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+			UINT32 outStatus50ms = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+			UINT64 iqFetch50ms   = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
 			UINT64 hibErr50ms    = apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
-			DbgPrint("[50MS] SCALAR_RUN_STATUS=0x%x COMPLETED=0x%llx expected=%u TAIL=%u HIB_ERROR=0x%llx\n",
-				scStatus50ms, completed50ms, expectedDone, pDevContext->DescRingTail, hibErr50ms);
+			DbgPrint("[50MS] SC=0x%x OUT=0x%x SC_HOST_COUNT=0x%llx (pre=0x%llx) IQ_FETCH=0x%llx TAIL=%u HIB_ERROR=0x%llx\n",
+				scStatus50ms, outStatus50ms, scHost50ms, preCount, iqFetch50ms,
+				pDevContext->DescRingTail, hibErr50ms);
 
-			// Fast path: SCALAR already terminal (kIdle or kHalted) AND IQ done
-			if ((UINT32)completed50ms == expectedDone &&
-			    (scStatus50ms == 0 || scStatus50ms == 4)) {
-				DbgPrint("[50MS] inference truly done (COMPLETED=%llu SC=0x%x)\n",
-					completed50ms, scStatus50ms);
+			// Fast path: SC_HOST count incremented AND SCALAR/OUTFEED terminal
+			if (scHost50ms > preCount &&
+			    (scStatus50ms == 0 || scStatus50ms == 4) &&
+			    (outStatus50ms == 0 || outStatus50ms == 4)) {
+				DbgPrint("[50MS] inference truly done (SC_HOST_COUNT 0x%llx>0x%llx SC=0x%x OUT=0x%x)\n",
+					scHost50ms, preCount, scStatus50ms, outStatus50ms);
+				// Force the InferCompleteEvent so a deferred DPC doesn't
+				// leave us hanging — DPC may have observed SC_HOST_0 only
+				// and bailed out without unlocking, so we take over here.
+				KeSetEvent(&pDevContext->InferCompleteEvent, IO_NO_INCREMENT, FALSE);
 				status = STATUS_SUCCESS;
 			}
 
-			// Stage 2: poll until SCALAR is in {kIdle, kHalted} AND IQ done (max 5s)
+			// Stage 2: poll until SC_HOST count > pre AND SCALAR/OUTFEED terminal (max 5s)
 			if (status == STATUS_TIMEOUT) {
 				int pollIdx;
 				for (pollIdx = 0; pollIdx < 1000; pollIdx++) {
-					UINT64 done = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-					UINT32 sc   = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
-					if ((UINT32)done == expectedDone && (sc == 0 || sc == 4)) {
-						DbgPrint("[POLL] inference done after %d ms (COMPLETED=%llu SC=0x%x TAIL=%u)\n",
-							50 + pollIdx, done, sc, pDevContext->DescRingTail);
+					UINT64 scHost = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
+					UINT32 sc     = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+					UINT32 out    = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+					if (scHost > preCount &&
+					    (sc == 0 || sc == 4) &&
+					    (out == 0 || out == 4)) {
+						UINT64 iqFetchDone = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+						DbgPrint("[POLL] inference done after %d ms (SC_HOST_COUNT=0x%llx>0x%llx SC=0x%x OUT=0x%x IQ_FETCH=0x%llx TAIL=%u)\n",
+							50 + pollIdx, scHost, preCount, sc, out, iqFetchDone, pDevContext->DescRingTail);
+						KeSetEvent(&pDevContext->InferCompleteEvent, IO_NO_INCREMENT, FALSE);
 						status = STATUS_SUCCESS;
 						break;
 					}
@@ -780,8 +906,10 @@ VOID npudriverEvtIoDeviceControl(
 						UINT32 outfedSnap = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
 						UINT64 wirePend   = apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING);
 						UINT64 hibSnap    = apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
-						DbgPrint("[SNAP@%dms] SC=0x%x INFEED=0x%x OUTFEED=0x%x WIRE=0x%llx IQ_DONE=%llu HIB=0x%llx\n",
-							50 + pollIdx, scSnap, infeedSnap, outfedSnap, wirePend, done, hibSnap);
+						UINT64 iqFetchSnap= apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+						DbgPrint("[SNAP@%dms] SC=0x%x INFEED=0x%x OUTFEED=0x%x WIRE=0x%llx SC_HOST=0x%llx(pre=0x%llx) IQ_FETCH=0x%llx HIB=0x%llx\n",
+							50 + pollIdx, scSnap, infeedSnap, outfedSnap, wirePend,
+							scHost, preCount, iqFetchSnap, hibSnap);
 					}
 					{
 						LARGE_INTEGER delay;
@@ -837,6 +965,45 @@ VOID npudriverEvtIoDeviceControl(
 						c0, c1, c2, c3);
 				}
 
+				// ARBITER counters — pinpoints WHERE chip lost OUTFEED data.
+				//
+				// write_request_arbiter: AXI write channel selection.  Compare
+				// output_actv (OUTFEED) vs status_block (known-working) to see
+				// whether OUTFEED ever requested the AXI write channel.
+				//
+				// address_translation_arbiter: MMU walker.  request==0 means
+				// the OUTFEED request never even reached MMU (chip-internal
+				// path stopped earlier — likely SCALAR/OUTFEED engine never
+				// emitted the write).  request>0 + blocked dominant means
+				// MMU lookup failed (PTE walk problem).
+				{
+					UINT32 wraOutReq    = apex_read_register_32(bar2, APEX_REG_WRA_OUT_ACTV_REQ);
+					UINT32 wraOutBlk    = apex_read_register_32(bar2, APEX_REG_WRA_OUT_ACTV_BLOCKED);
+					UINT32 wraSbReq     = apex_read_register_32(bar2, APEX_REG_WRA_STATUS_BLK_REQ);
+					UINT32 wraSbBlk     = apex_read_register_32(bar2, APEX_REG_WRA_STATUS_BLK_BLOCKED);
+					DbgPrint("[ARB-W@post-DONE]  out_actv:    req=0x%x blocked=0x%x | status_blk: req=0x%x blocked=0x%x\n",
+						wraOutReq, wraOutBlk, wraSbReq, wraSbBlk);
+
+					UINT32 ataOutReq    = apex_read_register_32(bar2, APEX_REG_ATA_OUT_ACTV_REQ);
+					UINT32 ataOutBlk    = apex_read_register_32(bar2, APEX_REG_ATA_OUT_ACTV_BLOCKED);
+					UINT32 ataInstrReq  = apex_read_register_32(bar2, APEX_REG_ATA_INSTRUCTION_REQ);
+					UINT32 ataInstrBlk  = apex_read_register_32(bar2, APEX_REG_ATA_INSTRUCTION_BLOCKED);
+					UINT32 ataInActvReq = apex_read_register_32(bar2, APEX_REG_ATA_INPUT_ACTV_REQ);
+					UINT32 ataInActvBlk = apex_read_register_32(bar2, APEX_REG_ATA_INPUT_ACTV_BLOCKED);
+					DbgPrint("[ARB-AT@post-DONE] out_actv:    req=0x%x blocked=0x%x\n",
+						ataOutReq, ataOutBlk);
+					DbgPrint("[ARB-AT@post-DONE] instruction: req=0x%x blocked=0x%x\n",
+						ataInstrReq, ataInstrBlk);
+					DbgPrint("[ARB-AT@post-DONE] input_actv:  req=0x%x blocked=0x%x  (baseline — INFEED works)\n",
+						ataInActvReq, ataInActvBlk);
+
+					UINT32 rArb  = apex_read_register_32(bar2, APEX_REG_READ_REQUEST_ARBITER);
+					UINT32 wArb  = apex_read_register_32(bar2, APEX_REG_WRITE_REQUEST_ARBITER);
+					UINT32 atArb = apex_read_register_32(bar2, APEX_REG_ADDR_TRANSLATION_ARBITER);
+					DbgPrint("[ARB-CFG@post-DONE] read_req=0x%x write_req=0x%x addr_trans=0x%x\n",
+						rArb, wArb, atArb);
+				}
+
 				// Status block dump at completion time
 				if (pDevContext->StatusBlockBase != NULL) {
 					UINT64 *sb = (UINT64 *)pDevContext->StatusBlockBase;
@@ -859,29 +1026,64 @@ VOID npudriverEvtIoDeviceControl(
 				// =========================================================
 				DbgPrint("[SCAN] post-inference dump of all PTE-mapped regions\n");
 
-				// 1) DescRing — kernel allocated, 4 KB.  inference 전 첫 32 bytes 는
-				//    우리가 채운 descriptor (address+size) 였음.  chip 이 여기를
-				//    덮었는지 확인.
+				// 1) DescRing — 4 KB pre-filled with 0xA5 before INFER.  Our 2
+				//    descriptors occupied first 32 bytes.  Anything past that
+				//    still 0xA5 == chip didn't touch.  Non-A5 bytes past 32
+				//    == chip stray-wrote here (unexpected target).
 				if (pDevContext->DescRingBase != NULL) {
 					PUCHAR p = (PUCHAR)pDevContext->DescRingBase;
-					DbgPrint("[SCAN-DescRing] kva=%p PA=0x%llx first32=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
-						p, pDevContext->DescRingDeviceVA,
+					ULONG nonA5 = 0;
+					ULONG firstNonA5 = 0xFFFFFFFF;
+					ULONG ii;
+					for (ii = 32; ii < PAGE_SIZE; ii++) {
+						if (p[ii] != 0xA5) {
+							nonA5++;
+							if (firstNonA5 == 0xFFFFFFFF) firstNonA5 = ii;
+						}
+					}
+					DbgPrint("[SCAN-DescRing] PA=0x%llx descs[0..31]=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | post-32 non-A5 bytes=%lu firstAt=0x%lx\n",
+						pDevContext->DescRingDeviceVA,
 						p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
 						p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
 						p[16],p[17],p[18],p[19], p[20],p[21],p[22],p[23],
-						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31]);
+						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31],
+						nonA5, firstNonA5);
+					if (nonA5 > 0 && firstNonA5 != 0xFFFFFFFF) {
+						ULONG d = firstNonA5;
+						DbgPrint("[SCAN-DescRing] firstNonA5@0x%lx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							d,
+							p[d+0],p[d+1],p[d+2],p[d+3], p[d+4],p[d+5],p[d+6],p[d+7],
+							p[d+8],p[d+9],p[d+10],p[d+11], p[d+12],p[d+13],p[d+14],p[d+15]);
+					}
 				}
 
-				// 2) StatusBlock — kernel allocated, 4 KB.  처음 16 bytes 외에 나머지
-				//    영역도 dump (chip 이 잘못 변환된 VA 로 여기를 덮었을 가능성).
+				// 2) StatusBlock — 4 KB pre-filled with 0xA5 before INFER.
+				//    chip writes completed_head at byte [0..3] (we already
+				//    see 0x02 there).  Anything else == stray writes.
 				if (pDevContext->StatusBlockBase != NULL) {
 					PUCHAR p = (PUCHAR)pDevContext->StatusBlockBase;
-					DbgPrint("[SCAN-StatusBlock] kva=%p first32=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
-						p,
+					ULONG nonA5 = 0;
+					ULONG firstNonA5 = 0xFFFFFFFF;
+					ULONG ii;
+					for (ii = 16; ii < PAGE_SIZE; ii++) {
+						if (p[ii] != 0xA5) {
+							nonA5++;
+							if (firstNonA5 == 0xFFFFFFFF) firstNonA5 = ii;
+						}
+					}
+					DbgPrint("[SCAN-StatusBlock] head[0..31]=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | post-16 non-A5 bytes=%lu firstAt=0x%lx\n",
 						p[0],p[1],p[2],p[3], p[4],p[5],p[6],p[7],
 						p[8],p[9],p[10],p[11], p[12],p[13],p[14],p[15],
 						p[16],p[17],p[18],p[19], p[20],p[21],p[22],p[23],
-						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31]);
+						p[24],p[25],p[26],p[27], p[28],p[29],p[30],p[31],
+						nonA5, firstNonA5);
+					if (nonA5 > 0 && firstNonA5 != 0xFFFFFFFF) {
+						ULONG d = firstNonA5;
+						DbgPrint("[SCAN-StatusBlock] firstNonA5@0x%lx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+							d,
+							p[d+0],p[d+1],p[d+2],p[d+3], p[d+4],p[d+5],p[d+6],p[d+7],
+							p[d+8],p[d+9],p[d+10],p[d+11], p[d+12],p[d+13],p[d+14],p[d+15]);
+					}
 				}
 
 				// 3) PageTable host-side memory — 우리가 PTE 들을 작성한 host buffer.
@@ -1025,12 +1227,15 @@ VOID npudriverEvtIoDeviceControl(
 					PMDL outMdl    = pDevContext->InferOutputMdl;
 					UINT64 outVA   = pDevContext->InferOutputDeviceVA;
 					UINT64 outSize = pDevContext->InferOutputSize;
-					UINT32 outPteIdx = (UINT32)(outVA >> PAGE_SHIFT);
 					UINT32 outPageCnt = (UINT32)((outSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
 					PPFN_NUMBER outPfn = MmGetMdlPfnArray(outMdl);
+					BOOLEAN outIsExtended = (outVA & (1ULL << 63)) != 0;
 
-					// Verify PTE readback for first up-to-4 output pages.
-					{
+					// Verify PTE readback. Simple = chip PTE[VA>>12] holds data PA.
+					// Extended = chip PTE[6144+...] holds 2-level PT PA; sub-entries
+					// hold data PAs and live in host RAM.
+					if (!outIsExtended) {
+						UINT32 outPteIdx = (UINT32)(outVA >> PAGE_SHIFT);
 						UINT32 vc = (outPageCnt < 4) ? outPageCnt : 4;
 						UINT32 ii;
 						for (ii = 0; ii < vc; ii++) {
@@ -1041,6 +1246,28 @@ VOID npudriverEvtIoDeviceControl(
 							DbgPrint("[DONE-PTE] OUTPUT PTE[%u+%u] expect=0x%llx read=0x%llx %s\n",
 								outPteIdx, ii, expectPA, readPaNoF,
 								(readPaNoF == expectPA) ? "OK" : "MISMATCH");
+						}
+					} else {
+						UINT32 chipPteIdx     = 6144u + (UINT32)((outVA >> 21) & 0x1FFF);
+						UINT32 hostTableStart = (UINT32)((outVA >> 12) & 0x1FF);
+						UINT64 chipReg = apex_read_register(bar2,
+							APEX_REG_PAGE_TABLE + (chipPteIdx * 8));
+						UINT64 expectPa = pDevContext->ExtSecondLevelPa;
+						DbgPrint("[DONE-PTE] EXT chip PTE[%u] = 0x%llx (expected 2-level PT PA = 0x%llx | 0x1) %s\n",
+							chipPteIdx, chipReg, expectPa,
+							((chipReg & ~1ULL) == expectPa) ? "OK" : "MISMATCH");
+						if (pDevContext->ExtSecondLevelKva != NULL) {
+							UINT64* slot = (UINT64*)pDevContext->ExtSecondLevelKva;
+							UINT32 vc = (outPageCnt < 4) ? outPageCnt : 4;
+							UINT32 ii;
+							for (ii = 0; ii < vc; ii++) {
+								UINT64 expectPA = (UINT64)outPfn[ii] << PAGE_SHIFT;
+								UINT64 entry = slot[hostTableStart + ii];
+								UINT64 entryPa = entry & ~1ULL;
+								DbgPrint("[DONE-PTE] EXT 2L[%u+%u] expect=0x%llx entry=0x%llx %s\n",
+									hostTableStart, ii, expectPA, entry,
+									(entryPa == expectPA) ? "OK" : "MISMATCH");
+							}
 						}
 					}
 
@@ -1120,6 +1347,9 @@ VOID npudriverEvtIoDeviceControl(
 			UINT64 qCompleted    = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
 			UINT64 qIntStatus    = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_STATUS);
 			UINT64 qCtrl         = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_CONTROL);
+			UINT64 scHostCount   = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
+			UINT64 scHostStatus  = apex_read_register(bar2, APEX_REG_SC_HOST_INT_STATUS);
+			UINT64 scHostPre     = pDevContext->LastScHostIntCount;
 
 			UINT32 avdataStatus = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
 			UINT32 paramStatus  = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
@@ -1164,9 +1394,13 @@ VOID npudriverEvtIoDeviceControl(
 			DbgPrint("[TIMEOUT] SCALAR_CORE_ERROR  = 0x%08x\n", scError);
 			DbgPrint("[TIMEOUT] SC_HOST_INTVECCTL  = 0x%llx\n", scHostIntvec);
 			DbgPrint("[TIMEOUT] WIRE_INT_MASK      = 0x%llx\n", wireIntMask);
-			DbgPrint("[TIMEOUT] IQ_COMPLETED_HEAD  = 0x%llx\n", qCompleted);
+			DbgPrint("[TIMEOUT] IQ_FETCHED_HEAD     = 0x%llx (descriptor fetch progress, NOT INFER done)\n", qCompleted);
 			DbgPrint("[TIMEOUT] IQ_INT_STATUS      = 0x%llx\n", qIntStatus);
 			DbgPrint("[TIMEOUT] IQ_CONTROL         = 0x%llx\n", qCtrl);
+			DbgPrint("[TIMEOUT] SC_HOST_INT_COUNT  = 0x%llx (pre-submit=0x%llx) %s\n",
+				scHostCount, scHostPre,
+				(scHostCount > scHostPre) ? "*** INCREMENTED — INFER actually finished but DPC missed it" : "no increment — INFER never completed");
+			DbgPrint("[TIMEOUT] SC_HOST_INT_STATUS = 0x%llx\n", scHostStatus);
 
 			// IQ 가 INFER 처리를 시작이라도 했는지: status block + ring slot 0 메모리 덤프
 			if (pDevContext->StatusBlockBase != NULL) {
@@ -1207,6 +1441,36 @@ VOID npudriverEvtIoDeviceControl(
 			DbgPrint("[%s] Inference completed successfully\n", __FUNCTION__);
 		}
 
+		// Tear down the extended-VA mapping (chip PTE register clear +
+		// 2-level PT page free).  Idempotent: no-op if extended path
+		// wasn't taken.  Must happen here regardless of success/timeout.
+		ApexExtUnmapBuffer(device);
+
+		// Free the < 4 GB output bounce buffer.  DPC already memcpy'd
+		// bounce -> user buffer before unlocking the output MDL, so no
+		// data is lost here.  Idempotent.
+		ApexFreeOutputBounce(device);
+
+		// POST-INFER PCIe snapshot — at PASSIVE_LEVEL (IOCTL caller thread)
+		// so config-space reads are safe.  Critical comparison vs the
+		// [PCIE@pre-submit] / [PCI-CMD@pre-submit] / [AXI@pre-submit] lines
+		// captured before submit:
+		//   - aw_ins/w_ins delta = 0  → chip never issued outbound write TLPs
+		//                                (chip-internal ATU / credit gate)
+		//   - aw_ins/w_ins delta > 0  → chip issued TLPs but they got blocked
+		//                                outside the chip; check Status RcvMA
+		//                                and DevStatus UnsupReq for evidence.
+		if (bar2 != NULL) {
+			UINT32 awIns = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_INSERTION);
+			UINT32 wIns  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_INSERTION);
+			UINT32 awOcc = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_OCCUPANCY);
+			UINT32 wOcc  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_OCCUPANCY);
+			DbgPrint("[AXI@post-infer] aw_ins=0x%x w_ins=0x%x aw_occ=0x%x w_occ=0x%x\n",
+				awIns, wIns, awOcc, wOcc);
+		}
+		npudriverDumpPciCommand(device, "post-infer");
+		npudriverDumpPciAer(device, "post-infer");
+
 		break;
 	}
 
@@ -1235,17 +1499,16 @@ VOID npudriverEvtIoDeviceControl(
 		DbgPrint("[PARAM_CACHE] ParamAddr=0x%llx Size=0x%llx DeviceVA=0x%llx BitstreamSize=0x%llx\n",
 			pInput->ParamAddr, pInput->ParamSize, pInput->ParamDeviceVA, pInput->BitstreamSize);
 
-		// 0. 이전에 caching 된 파라미터가 있으면 먼저 해제 (re-cache 케이스)
+		// 0. Release previously cached PARAM data (re-cache).  In extended VA mode
+		// the entire ExtSubtables pool gets nuked at the same time as a release;
+		// in simple VA mode we walk PTE entries.  We can't easily distinguish
+		// here so just unlock the MDL — extended chip PTE/subtable cleanup
+		// happens in ApexExtUnmapBuffer at file cleanup time, and simple PTE
+		// reuse will overwrite stale entries on the new MAP.
 		if (pDevContext->CachedParamMdl != NULL) {
 			DbgPrint("[PARAM_CACHE] Releasing previously cached params: PTE[%u..%u]\n",
 				pDevContext->CachedParamPteIdx,
 				pDevContext->CachedParamPteIdx + pDevContext->CachedParamPageCount - 1);
-			WdfSpinLockAcquire(pDevContext->PageTableLock);
-			for (i = 0; i < pDevContext->CachedParamPageCount; i++) {
-				apex_write_register(bar2,
-					APEX_REG_PAGE_TABLE + ((pDevContext->CachedParamPteIdx + i) * 8), 0);
-			}
-			WdfSpinLockRelease(pDevContext->PageTableLock);
 			MmUnlockPages(pDevContext->CachedParamMdl);
 			IoFreeMdl(pDevContext->CachedParamMdl);
 			pDevContext->CachedParamMdl = NULL;
@@ -1253,17 +1516,9 @@ VOID npudriverEvtIoDeviceControl(
 			pDevContext->CachedParamPageCount = 0;
 		}
 
-		// 0b. Release previously cached PARAM bitstream too (re-cache case)
+		// 0b. Release previously cached PARAM bitstream too.
 		if (pDevContext->CachedParamBitstreamMdl != NULL) {
-			DbgPrint("[PARAM_CACHE] Releasing previously cached bitstream: PTE[%u..%u]\n",
-				pDevContext->CachedParamBitstreamPteIdx,
-				pDevContext->CachedParamBitstreamPteIdx + pDevContext->CachedParamBitstreamPageCount - 1);
-			WdfSpinLockAcquire(pDevContext->PageTableLock);
-			for (i = 0; i < pDevContext->CachedParamBitstreamPageCount; i++) {
-				apex_write_register(bar2,
-					APEX_REG_PAGE_TABLE + ((pDevContext->CachedParamBitstreamPteIdx + i) * 8), 0);
-			}
-			WdfSpinLockRelease(pDevContext->PageTableLock);
+			DbgPrint("[PARAM_CACHE] Releasing previously cached bitstream\n");
 			MmUnlockPages(pDevContext->CachedParamBitstreamMdl);
 			IoFreeMdl(pDevContext->CachedParamBitstreamMdl);
 			pDevContext->CachedParamBitstreamMdl = NULL;
@@ -1271,6 +1526,13 @@ VOID npudriverEvtIoDeviceControl(
 			pDevContext->CachedParamBitstreamPteIdx = 0;
 			pDevContext->CachedParamBitstreamPageCount = 0;
 		}
+
+		// NOTE: do NOT call ApexExtUnmapBuffer here.  PARAM bitstream was just
+		// extended-mapped by the IOCTL_MAP_BUFFER preceding this call (e.g. at
+		// chipPTE[6148] hostIdx 64..66 for VA 0x8000000000840000) and nuking it
+		// here would leave that VA unbacked when INFER later submits the
+		// bitstream descriptor → chip MMU extended_page_fault on the bitstream
+		// fetch.  The subtable pool is freed at file cleanup time instead.
 
 		// 1. Lock parameter pages (hardware DMA reads them for PARAMETER_POP)
 		paramMdl = IoAllocateMdl((PVOID)pInput->ParamAddr, (ULONG)pInput->ParamSize, FALSE, FALSE, NULL);
@@ -1287,18 +1549,34 @@ VOID npudriverEvtIoDeviceControl(
 			break;
 		}
 
-		// 2. Register parameter pages in page table at ParamDeviceVA
+		// 2. Register parameter pages in page table at ParamDeviceVA.
+		// Extended VA path: route through ApexExtMapBuffer (multi-subtable pool).
 		pteIdx    = (UINT32)(pInput->ParamDeviceVA >> PAGE_SHIFT);
 		pageCount = (UINT32)((pInput->ParamSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
 		pfnArray  = MmGetMdlPfnArray(paramMdl);
 
-		DbgPrint("[PARAM_CACHE] Registering param PTEs: PTE[%u..%u] (%u pages)\n",
-			pteIdx, pteIdx + pageCount - 1, pageCount);
-		WdfSpinLockAcquire(pDevContext->PageTableLock);
-		for (i = 0; i < pageCount; i++)
-			apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8),
-				((UINT64)pfnArray[i] << PAGE_SHIFT) | 1);
-		WdfSpinLockRelease(pDevContext->PageTableLock);
+		if ((pInput->ParamDeviceVA & (1ULL << 63)) != 0) {
+			NTSTATUS extStatus = ApexExtMapBuffer(device, pInput->ParamDeviceVA,
+				pfnArray, pageCount);
+			if (!NT_SUCCESS(extStatus)) {
+				DbgPrint("[PARAM_CACHE] ApexExtMapBuffer failed VA=0x%llx pages=%u status=0x%x\n",
+					pInput->ParamDeviceVA, pageCount, extStatus);
+				MmUnlockPages(paramMdl);
+				IoFreeMdl(paramMdl);
+				status = extStatus;
+				break;
+			}
+			DbgPrint("[PARAM_CACHE] EXT registered param: VA=0x%llx pages=%u\n",
+				pInput->ParamDeviceVA, pageCount);
+		} else {
+			DbgPrint("[PARAM_CACHE] Registering param PTEs: PTE[%u..%u] (%u pages)\n",
+				pteIdx, pteIdx + pageCount - 1, pageCount);
+			WdfSpinLockAcquire(pDevContext->PageTableLock);
+			for (i = 0; i < pageCount; i++)
+				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8),
+					((UINT64)pfnArray[i] << PAGE_SHIFT) | 1);
+			WdfSpinLockRelease(pDevContext->PageTableLock);
+		}
 
 		// === MAPPING-ONLY MODE (always) ===
 		//
@@ -1332,18 +1610,21 @@ VOID npudriverEvtIoDeviceControl(
 				pteIdx, pteIdx + pageCount - 1, pageCount, paramMdl);
 
 			// Transfer PARAM bitstream MDL ownership from LockedModelMdl to
-			// CachedParamBitstreamMdl. Bitstream is at deviceVA=0 (PTE[0..N]).
+			// CachedParamBitstreamMdl. The PARAM bitstream's device VA was
+			// stored in the most recent IOCTL_MAP_BUFFER call — preserve it
+			// (extended VA in current build) instead of hard-coding 0.
 			if (pDevContext->LockedModelMdl != NULL && pInput->BitstreamSize > 0) {
 				UINT32 bsPageCount = (UINT32)((pInput->BitstreamSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
 				pDevContext->CachedParamBitstreamMdl       = pDevContext->LockedModelMdl;
-				pDevContext->CachedParamBitstreamDeviceVA  = 0;
+				pDevContext->CachedParamBitstreamDeviceVA  = pDevContext->LastMapBufferDeviceVA;
 				pDevContext->CachedParamBitstreamSize      = (UINT32)pInput->BitstreamSize;
-				pDevContext->CachedParamBitstreamPteIdx    = 0;
+				pDevContext->CachedParamBitstreamPteIdx    = (UINT32)(pDevContext->LastMapBufferDeviceVA >> PAGE_SHIFT);
 				pDevContext->CachedParamBitstreamPageCount = bsPageCount;
 				pDevContext->LockedModelMdl  = NULL;
 				pDevContext->LockedModelSize = 0;
-				DbgPrint("[PARAM_CACHE] Cached bitstream retained: PTE[0..%u] DeviceVA=0x0 size=0x%x MDL=%p\n",
-					bsPageCount - 1, (UINT32)pInput->BitstreamSize,
+				DbgPrint("[PARAM_CACHE] Cached bitstream retained: DeviceVA=0x%llx size=0x%x MDL=%p\n",
+					pDevContext->CachedParamBitstreamDeviceVA,
+					(UINT32)pInput->BitstreamSize,
 					pDevContext->CachedParamBitstreamMdl);
 			}
 		} else {

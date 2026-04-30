@@ -54,6 +54,18 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 		deviceContext->InferInputMdl = NULL;
 		deviceContext->InferOutputMdl = NULL;
 
+		// Extended-VA second-level page table state — inactive on boot.
+		deviceContext->ExtSecondLevelKva = NULL;
+		deviceContext->ExtSecondLevelPa  = 0;
+		deviceContext->ExtChipPteIdx     = 0;
+		deviceContext->ExtMappingActive  = FALSE;
+
+		// Output bounce buffer state — inactive on boot.
+		deviceContext->OutputBounceKva    = NULL;
+		deviceContext->OutputBouncePa     = 0;
+		deviceContext->OutputBounceSize   = 0;
+		deviceContext->OutputBounceActive = FALSE;
+
 		// Cached parameter MDL (IOCTL_PARAM_CACHE 가 채움)
 		deviceContext->CachedParamMdl = NULL;
 		deviceContext->CachedParamPteIdx = 0;
@@ -245,26 +257,17 @@ npudriverEvtDevicePrepareHardware(
 
 	// Reset and quit-reset sequence to enable GCB (Global Clock Block)
 	// This is required for the scalar core to be operational
-	DbgPrint("[%s] Starting GCB reset sequence\n", __FUNCTION__);
+	DbgPrint("[%s] Starting GCB reset sequence (libedgetpu-style: no RAM shutdown force)\n", __FUNCTION__);
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x1, 2, 2);  // Enable GCB reset
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x1, 2, 18); // Enable clock gate
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x3, 2, 14); // Force RAM shutdown
-
-	// Wait for RAM shutdown to complete (bit 6 of SCU_3 should be set)
+	// EXPERIMENT: do NOT force SCU_3 bit14 (RAM shutdown). libedgetpu's EnableReset
+	// only writes rg_force_sleep=0x3 (SCU_3 bits[22:23]) and polls cur_pwr_state==0x2.
+	// Forcing RAM shutdown wipes chip-internal SRAM state (suspected to wipe OUTFEED
+	// engine's internal buffers/state, killing outbound DMA after RunControl=1).
 	{
-		UINT32 scu3_val = 0;
-		int retry;
-		for (retry = 0; retry < 100; retry++) {
-			scu3_val = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
-			if ((scu3_val & (1 << 6)) != 0) {
-				DbgPrint("[%s] RAM shutdown confirmed (SCU_3=0x%08x)\n", __FUNCTION__, scu3_val);
-				break;
-			}
-			KeStallExecutionProcessor(100); // 100 microseconds
-		}
-		if (retry >= 100) {
-			DbgPrint("[%s] WARNING: RAM shutdown timeout after 10ms (SCU_3=0x%08x)\n", __FUNCTION__, scu3_val);
-		}
+		UINT32 scu3Before = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+		DbgPrint("[%s] SCU_3 before sleep-mode entry: 0x%08x (skipping force RAM shutdown)\n",
+			__FUNCTION__, scu3Before);
 	}
 
 	// EnableReset step 5 (libedgetpu beagle_top_level_handler.cc:221-223):
@@ -277,30 +280,19 @@ npudriverEvtDevicePrepareHardware(
 	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_GCBB_CREDIT0, 0xF);
 	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_GCBB_CREDIT0, 0x0);
 
-	DbgPrint("[%s] Starting GCB quit-reset sequence\n", __FUNCTION__);
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x0, 2, 14); // Disable RAM shutdown
+	DbgPrint("[%s] Starting GCB quit-reset sequence (no RAM enable polling)\n", __FUNCTION__);
 	// rg_gated_gcb (SCU_2 bits[19:18]) — libedgetpu values:
 	//   0x0 = deprecated, 0x1 = hardware clock gated, 0x2 = no clock gating (force on)
 	// 0x0 (deprecated) puts GCB in undefined gating state — large bitstreams (INFER)
 	// stall mid-execution. 0x2 (force on) matches DisableHardwareClockGate().
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 18); // rg_gated_gcb = no clock gating
 	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 2);  // Exit reset
-
-	// Wait for RAM enable to complete (bit 6 of SCU_3 should clear)
+	// EXPERIMENT: skip RAM enable polling (bit6) — we never forced RAM shutdown,
+	// so there's nothing to wait for here. libedgetpu's QuitReset polls cur_pwr_state==0x0
+	// instead, which is checked separately in the SCALAR_RUN_CONTROL polling below.
 	{
-		UINT32 scu3_val = 0;
-		int retry;
-		for (retry = 0; retry < 100; retry++) {
-			scu3_val = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
-			if ((scu3_val & (1 << 6)) == 0) {
-				DbgPrint("[%s] RAM enable confirmed (SCU_3=0x%08x)\n", __FUNCTION__, scu3_val);
-				break;
-			}
-			KeStallExecutionProcessor(100); // 100 microseconds
-		}
-		if (retry >= 100) {
-			DbgPrint("[%s] WARNING: RAM enable timeout after 10ms (SCU_3=0x%08x)\n", __FUNCTION__, scu3_val);
-		}
+		UINT32 scu3After = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+		DbgPrint("[%s] SCU_3 after quit-reset: 0x%08x\n", __FUNCTION__, scu3After);
 	}
 
 	// Critical: Confirm reset is completely released by polling SCALAR_RUN_CONTROL
@@ -403,94 +395,44 @@ npudriverEvtDevicePrepareHardware(
 			c0, c1, c2, c3);
 	}
 
-	// ExitReset step 4 (libedgetpu beagle_top_level_handler.cc::QuitReset):
-	// IdleRegister: bit[31]=disable_idle (0=on, 1=off), bits[30:0]=counter.
-	// We DISABLE auto-idle (set bit31=1) so the chip does NOT power-gate INFEED/
-	// PARAM_POP after PARAM_CACHE bitstream completes. With idle enabled (0x1),
-	// engines drop to kHalted=4 during the IOCTL gap and refuse RUN_CONTROL
-	// writes — INFER then deadlocks because SCALAR can't dispatch to halted
-	// INFEED. libedgetpu submits PARAM_CACHE+INFER back-to-back so the gap is
-	// too short to trigger auto-idle, but our two-IOCTL flow has a real gap.
+	// Re-write HIB MMU config after GCB reset — these registers may have been
+	// cleared by the reset even though they were written in ApexPageTableInit().
+	// (Working user-mode log doesn't write these — gasket kernel does it. We keep
+	//  it because we ARE the kernel side and our GCB reset wipes them.)
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x00000001ULL);
-		DbgPrint("[%s] IdleRegister → 0x1 (enabled, counter=1)\n", __FUNCTION__);
-
-		// Re-write HIB MMU config after GCB reset — these registers may have been
-		// cleared by the reset even though they were written in ApexPageTableInit().
 		apex_write_register(bar2, APEX_REG_PAGE_TABLE_SIZE, (UINT64)APEX_PAGE_TABLE_ENTRIES);
 		apex_write_register(bar2, APEX_REG_EXTENDED_TABLE, 6144);
 		DbgPrint("[%s] PAGE_TABLE_SIZE=%u EXTENDED_TABLE=6144 re-written after GCB reset\n",
 			__FUNCTION__, APEX_PAGE_TABLE_ENTRIES);
-
-		// TILE_CONFIG0 and TILE_DEEP_SLEEP are written in IOCTL_INFER after bitstream
-		// is mapped, so tiles don't access unmapped VAs during device open.
 	}
 
-	// Initialize interrupt routing
-	// Route SC_HOST_0 completion interrupt to MSI-X vector 0 (our WdfInterrupt)
+	// =====================================================================
+	// CHIP INIT — match working libedgetpu user-mode register sequence verbatim.
+	// All register writes/order taken directly from a working coral.sys+libedgetpu
+	// trace. Anything libedgetpu does NOT write is left at chip POR default.
+	//
+	// Removed (was in our previous code, but NOT in working trace):
+	//   - IDLEGENERATOR (0x48508) write
+	//   - all *_INTVECCTL writes (0x46018, 0x46020, 0x46028, 0x46030, 0x46038,
+	//     0x46040, 0x46048) — POR default routing left intact
+	//   - TOP_LEVEL_INT_CONTROL (0x486b0) write
+	//   - WIRE_INT_MASK (0x48780) write
+	//   - TILE_DEEP_SLEEP (manipulated only inside IOCTL_INFER, if at all)
+	//
+	// Kept (working trace omits because gasket kernel handles them; we ARE the
+	// kernel, so we keep them):
+	//   - GCB reset, MSI-X table SAVE/RESTORE/MASK clear
+	//   - PAGE_TABLE_SIZE / EXTENDED_TABLE rewrite after GCB reset
+	//   - PAGE_TABLE_INIT signal + MSIX_TABLE_INIT polling
+	//   - DescRing/StatusBlock allocation + PTE[4096/4097] write (working trace: 0x1000000/0x1001000)
+	// =====================================================================
 	if (deviceContext->Bar2BaseAddress != NULL) {
-		// SC_HOST_INTVECCTL: bits[3:0] = vector number (0 = MSI-X message 0)
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_SC_HOST_INTVECCTL, 0);
-		DbgPrint("[%s] SC_HOST_INTVECCTL set to route to MSI-X vector 0\n", __FUNCTION__);
+		PVOID bar2 = deviceContext->Bar2BaseAddress;
 
-		// SC_HOST_INT_CONTROL: enable ALL 4 SC_HOST completion interrupts (kNumInterrupts=4
-		// per scalar_core_controller.cc:32; libedgetpu writes (1<<4)-1=0xF, NOT 1).
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_SC_HOST_INT_CONTROL, 0xF);
-		DbgPrint("[%s] SC_HOST_INT_CONTROL → 0xF (4 SC_HOST interrupts enabled)\n", __FUNCTION__);
-
-		// TOP_LEVEL_INT_CONTROL: enable top-level aggregator (libedgetpu writes 0xF).
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_TOP_LEVEL_INT_CONTROL, 0xF);
-		DbgPrint("[%s] TOP_LEVEL_INT_CONTROL → 0xF\n", __FUNCTION__);
-
-		// FATAL_ERR_INT_CONTROL: enable fatal-error interrupt so HIB errors notify host.
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_FATAL_ERR_INT_CONTROL, 1);
-		DbgPrint("[%s] FATAL_ERR_INT_CONTROL → 1\n", __FUNCTION__);
-
-		// DMA_BURST_LIMITER: libedgetpu explicitly writes 0 here at chip open
-		// (mmio_driver.cc:288-295). Default is unspecified; chip may stall on long bursts.
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_DMA_BURST_LIMITER, 0);
-		DbgPrint("[%s] DMA_BURST_LIMITER → 0 (explicit)\n", __FUNCTION__);
-
-		// INSTR_QUEUE_INTVECCTL: route instruction queue interrupt to MSI-X vector 0
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_INSTR_QUEUE_INTVECCTL, 0);
-		DbgPrint("[%s] INSTR_QUEUE_INTVECCTL → MSI-X vector 0\n", __FUNCTION__);
-
-		// Other queue/error INTVECCTL — gasket routes each to a unique vector but
-		// since we register only 4 vectors and all collapse to same handler, route to 0.
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_INPUT_ACTV_QUEUE_INTVECCTL, 0);
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_PARAM_QUEUE_INTVECCTL, 0);
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_OUTPUT_ACTV_QUEUE_INTVECCTL, 0);
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_FATAL_ERR_INTVECCTL, 0);
-		DbgPrint("[%s] INPUT/PARAM/OUTPUT_ACTV/FATAL_ERR INTVECCTL → vector 0\n", __FUNCTION__);
-
-		// INSTR_QUEUE_INT_CONTROL: enable IQ completion interrupt (host_queue.h:84-85).
-		// Without this, IQ_INT_STATUS stays 0 and WIRE_INT_PENDING never fires for IQ.
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_INSTR_QUEUE_INT_CONTROL, 1);
-		DbgPrint("[%s] INSTR_QUEUE_INT_CONTROL → 1 (IQ interrupt enabled)\n", __FUNCTION__);
-
-		// TOP_LEVEL_INTVECCTL: routes the aggregated WIRE_INT_PENDING signal to
-		// MSI-X vector 0. Without this, WIRE_INT_PENDING is set but no MSI-X
-		// write transaction is generated → ISR never called.
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_TOP_LEVEL_INTVECCTL, 0);
-		DbgPrint("[%s] TOP_LEVEL_INTVECCTL → MSI-X vector 0\n", __FUNCTION__);
-
-		// WIRE_INT_MASK: unmask all wire interrupts (value 0 = all unmasked)
-		apex_write_register(deviceContext->Bar2BaseAddress,
-						   APEX_REG_WIRE_INT_MASK, 0);
-		DbgPrint("[%s] WIRE_INT_MASK cleared (interrupts unmasked)\n", __FUNCTION__);
+		// Step 1: DMA_BURST_LIMITER = 0 (working trace step 2)
+		apex_write_register(bar2, APEX_REG_DMA_BURST_LIMITER, 0);
+		DbgPrint("[%s] DMA_BURST_LIMITER → 0\n", __FUNCTION__);
 
 		// =====================================================================
 		// MSI-X TABLE UNMASK — chip-private MSI-X table at BAR2+0x46800.
@@ -592,7 +534,7 @@ npudriverEvtDevicePrepareHardware(
 	}
 
 	// Allocate descriptor ring (4KB = 256 slots * 16 bytes each)
-	// Maps to PTE slot 6142 (last-2 simple entry), device VA = 6142 * 4KB = 0x17FE000
+	// Maps to PTE slot 4096 (working trace), device VA = 4096 * 4KB = 0x1000000 (simple slot)
 	#pragma warning(push)
 	#pragma warning(disable:4996)
 	deviceContext->DescRingBase = ExAllocatePoolWithTag(NonPagedPoolNx, PAGE_SIZE, 'DRNG');
@@ -604,14 +546,14 @@ npudriverEvtDevicePrepareHardware(
 	RtlZeroMemory(deviceContext->DescRingBase, PAGE_SIZE);
 	{
 		PHYSICAL_ADDRESS descPhys = MmGetPhysicalAddress(deviceContext->DescRingBase);
-		deviceContext->DescRingDeviceVA = (UINT64)6142 * PAGE_SIZE;  // 0x17FE000
+		deviceContext->DescRingDeviceVA = (UINT64)4096 * PAGE_SIZE;  // 0x1000000
 		deviceContext->DescRingTail = 0;
 		apex_write_register(deviceContext->Bar2BaseAddress,
-			APEX_REG_PAGE_TABLE + (6142 * 8), descPhys.QuadPart | 1);
+			APEX_REG_PAGE_TABLE + (4096 * 8), descPhys.QuadPart | 1);
 		{
 			UINT64 rb = apex_read_register(deviceContext->Bar2BaseAddress,
-				APEX_REG_PAGE_TABLE + (6142 * 8));
-			DbgPrint("[%s] DescRing: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[6142] write=0x%llx readback=0x%llx %s\n",
+				APEX_REG_PAGE_TABLE + (4096 * 8));
+			DbgPrint("[%s] DescRing: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[4096] write=0x%llx readback=0x%llx %s\n",
 				__FUNCTION__, deviceContext->DescRingBase, descPhys.QuadPart,
 				deviceContext->DescRingDeviceVA, descPhys.QuadPart | 1, rb,
 				(rb == (UINT64)(descPhys.QuadPart | 1)) ? "OK" : "MISMATCH");
@@ -619,7 +561,7 @@ npudriverEvtDevicePrepareHardware(
 	}
 
 	// Allocate status block (4KB) — hardware DMA-writes completion info here
-	// Maps to PTE slot 6143 (last simple entry), device VA = 6143 * 4KB = 0x17FF000
+	// Maps to PTE slot 4097 (working trace), device VA = 4097 * 4KB = 0x1001000 (simple slot)
 	#pragma warning(push)
 	#pragma warning(disable:4996)
 	deviceContext->StatusBlockBase = ExAllocatePoolWithTag(NonPagedPoolNx, PAGE_SIZE, 'SBLK');
@@ -633,13 +575,13 @@ npudriverEvtDevicePrepareHardware(
 	RtlZeroMemory(deviceContext->StatusBlockBase, PAGE_SIZE);
 	{
 		PHYSICAL_ADDRESS sblkPhys = MmGetPhysicalAddress(deviceContext->StatusBlockBase);
-		deviceContext->StatusBlockDeviceVA = (UINT64)6143 * PAGE_SIZE;  // 0x17FF000
+		deviceContext->StatusBlockDeviceVA = (UINT64)4097 * PAGE_SIZE;  // 0x1001000
 		apex_write_register(deviceContext->Bar2BaseAddress,
-			APEX_REG_PAGE_TABLE + (6143 * 8), sblkPhys.QuadPart | 1);
+			APEX_REG_PAGE_TABLE + (4097 * 8), sblkPhys.QuadPart | 1);
 		{
 			UINT64 rb = apex_read_register(deviceContext->Bar2BaseAddress,
-				APEX_REG_PAGE_TABLE + (6143 * 8));
-			DbgPrint("[%s] StatusBlock: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[6143] write=0x%llx readback=0x%llx %s\n",
+				APEX_REG_PAGE_TABLE + (4097 * 8));
+			DbgPrint("[%s] StatusBlock: VA=%p PA=0x%llx DeviceVA=0x%llx PTE[4097] write=0x%llx readback=0x%llx %s\n",
 				__FUNCTION__, deviceContext->StatusBlockBase, sblkPhys.QuadPart,
 				deviceContext->StatusBlockDeviceVA, sblkPhys.QuadPart | 1, rb,
 				(rb == (UINT64)(sblkPhys.QuadPart | 1)) ? "OK" : "MISMATCH");
@@ -668,32 +610,18 @@ npudriverEvtDevicePrepareHardware(
 
 	// Verify both ring PTEs are valid before enabling queue
 	{
-		UINT64 rb6142 = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_PAGE_TABLE + (6142 * 8));
-		UINT64 rb6143 = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_PAGE_TABLE + (6143 * 8));
-		DbgPrint("[%s] PTE[6142](DescRing)=0x%llx PTE[6143](StatusBlock)=0x%llx\n",
-			__FUNCTION__, rb6142, rb6143);
-		if ((rb6142 & 1) == 0) DbgPrint("[%s] WARNING: PTE[6142] not valid!\n", __FUNCTION__);
-		if ((rb6143 & 1) == 0) DbgPrint("[%s] WARNING: PTE[6143] not valid!\n", __FUNCTION__);
+		UINT64 rb4096 = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_PAGE_TABLE + (4096 * 8));
+		UINT64 rb4097 = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_PAGE_TABLE + (4097 * 8));
+		DbgPrint("[%s] PTE[4096](DescRing)=0x%llx PTE[4097](StatusBlock)=0x%llx\n",
+			__FUNCTION__, rb4096, rb4097);
+		if ((rb4096 & 1) == 0) DbgPrint("[%s] WARNING: PTE[4096] not valid!\n", __FUNCTION__);
+		if ((rb4097 & 1) == 0) DbgPrint("[%s] WARNING: PTE[4097] not valid!\n", __FUNCTION__);
 	}
 
-	// Step A: enable only (bit0), no sb_wr_enable yet — isolate which bit causes fault
-	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_CONTROL, 0x1);
-	DbgPrint("[%s] INSTR_QUEUE_CONTROL → 0x1 (enable only)\n", __FUNCTION__);
-	{
-		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
-		DbgPrint("[%s] HIB_ERROR after CTRL=0x1 = 0x%llx\n", __FUNCTION__, hibChk);
-	}
-
-	// Step B: add sb_wr_enable (bit2)
+	// INSTR_QUEUE_CONTROL = 0x5 (enable + sb_wr_enable). Working trace writes
+	// this once with the final value (no two-step). Then poll STATUS until bit0=1.
 	apex_write_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_CONTROL, 0x5);
 	DbgPrint("[%s] INSTR_QUEUE_CONTROL → 0x5 (enable + sb_wr_enable)\n", __FUNCTION__);
-	{
-		UINT64 hibChk = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_USER_HIB_ERROR_STATUS);
-		DbgPrint("[%s] HIB_ERROR after CTRL=0x5 = 0x%llx\n", __FUNCTION__, hibChk);
-	}
-
-	// Poll queue_status (0x48570) until bit0==1 (libedgetpu step 7).
-	// Hardware must confirm enable before any TAIL writes are meaningful.
 	{
 		int retry;
 		for (retry = 0; retry < 200; retry++) {
@@ -709,6 +637,14 @@ npudriverEvtDevicePrepareHardware(
 			UINT64 qs = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_INSTR_QUEUE_STATUS);
 			DbgPrint("[%s] WARNING: queue_status poll timeout STATUS=0x%llx\n", __FUNCTION__, qs);
 		}
+	}
+
+	// Read SC_HOST_INT_COUNT baseline (working trace step 11) — also stored in
+	// LastScHostIntCount at IOCTL_INFER pre-submit time, but we read it once here
+	// for diagnostic logging.
+	{
+		UINT64 baseline = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_SC_HOST_INT_COUNT);
+		DbgPrint("[%s] SC_HOST_INT_COUNT baseline = 0x%llx\n", __FUNCTION__, baseline);
 	}
 
 	// Initialize all cores (breakpoints, tile config, run controls).
@@ -740,8 +676,26 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[%s] BREAKPOINT registers left at chip default (libedgetpu-style)\n",
 			__FUNCTION__);
 
-		// TILE_CONFIG0 broadcast to all 7 tile groups, poll for acknowledgment.
-		// Must happen before tile run controls (run_controller.cc:118-128).
+		// Working trace order (verbatim):
+		//   Scalar-side RUN_CONTROL writes → TILE_CONFIG0 + readback → Tile-side
+		//   RUN_CONTROL writes → STATUS_BLOCK_UPDATE=0 → SC_HOST_INT_CONTROL=0xF
+		//   → INSTR_QUEUE_INT_CONTROL=1 → FATAL_ERR_INT_CONTROL=1
+		//
+		// TILE_DEEP_SLEEP write removed — working trace never touches it (left at POR).
+
+		// Phase 1: scalar-side run controls (working trace order, NOT alphabetical).
+		//   0x44018 = SCALAR
+		//   0x44158 = AVDATA_POP
+		//   0x44198 = PARAMETER_POP
+		//   0x441d8 = INFEED
+		//   0x44218 = OUTFEED
+		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,        1);
+		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    1);
+		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);
+		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,        1);
+		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       1);
+
+		// Phase 2: TILE_CONFIG0 broadcast + readback confirm.
 		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
 		{
 			int tci;
@@ -752,18 +706,17 @@ npudriverEvtDevicePrepareHardware(
 			DbgPrint("[%s] TILE_CONFIG0=0x7F confirmed after %d polls\n", __FUNCTION__, tci);
 		}
 
-		// TILE_DEEP_SLEEP: to_sleep_delay=2, to_wake_delay=30 (libedgetpu value).
-		// Prevents SRAM access before wake stabilization (default 0x501 is too short).
-		apex_write_register(bar2, APEX_REG_TILE_DEEP_SLEEP, 0x1E02ULL);
-
-		// Run control sequence per libedgetpu run_controller.cc DoRunControl().
-		// Phase 1: scalar-side units (SCALAR first).
-		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,        1);
-		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    1);
-		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);
-		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,        1);
-		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       1);
-		// Phase 2: tile-side units.
+		// Phase 3: tile-side run controls (working trace order):
+		//   0x400c0 = TILE_OP
+		//   0x40150 = NARROW_TO_WIDE
+		//   0x40110 = WIDE_TO_NARROW
+		//   0x40250 = MESH_BUS0
+		//   0x40298 = MESH_BUS1
+		//   0x402e0 = MESH_BUS2
+		//   0x40328 = MESH_BUS3
+		//   0x40190 = RING_BUS_CONSUMER0
+		//   0x401d0 = RING_BUS_CONSUMER1
+		//   0x40210 = RING_BUS_PRODUCER
 		apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
 		apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
 		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
@@ -775,6 +728,20 @@ npudriverEvtDevicePrepareHardware(
 		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
 		apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
 		DbgPrint("[%s] Run controls set (all units kRunning)\n", __FUNCTION__);
+
+		// Phase 4: STATUS_BLOCK_UPDATE = 0 (must come AFTER all run controls per
+		// working trace).  Disables periodic status block auto-write.
+		apex_write_register(bar2, APEX_REG_STATUS_BLOCK_UPDATE, 0);
+		DbgPrint("[%s] STATUS_BLOCK_UPDATE → 0\n", __FUNCTION__);
+
+		// Phase 5: interrupt enables (working trace LAST step).
+		//   0x486a0 = SC_HOST_INT_CONTROL  = 0xF (enable SC_HOST 0..3)
+		//   0x485c0 = INSTR_QUEUE_INT_CTRL = 1
+		//   0x486c0 = FATAL_ERR_INT_CTRL   = 1
+		apex_write_register(bar2, APEX_REG_SC_HOST_INT_CONTROL,    0xF);
+		apex_write_register(bar2, APEX_REG_INSTR_QUEUE_INT_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_FATAL_ERR_INT_CONTROL,   1);
+		DbgPrint("[%s] Interrupts enabled: SC_HOST=0xF IQ=1 FATAL=1\n", __FUNCTION__);
 	}
 
 	// =====================================================================
@@ -888,6 +855,66 @@ npudriverEvtDevicePrepareHardware(
 		UINT32 c3 = apex_read_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS);
 		DbgPrint("[CREDITS@PREPARE-END] instr=0x%08x input=0x%08x param=0x%08x output=0x%08x\n",
 			c0, c1, c2, c3);
+	}
+
+	// EXPERIMENT: enable OUTPUT_ACTV queue.  Per-queue dump showed:
+	//   [Q@out_actv] control=0x0  ← only OUTPUT queue is disabled
+	//   [Q@in_actv]  control=0x3  (enable + sb_wr_enable, auto)
+	//   [Q@param]    control=0x3  (enable + sb_wr_enable, auto)
+	// Hypothesis: chip emits outbound writes for OUTFEED but they need an enabled
+	// OUTPUT_ACTV queue to reach host RAM.  Match input_actv/param queues' default
+	// 0x3 (enable bit0 + sb_wr_enable bit1).
+	{
+		PVOID b2 = deviceContext->Bar2BaseAddress;
+		UINT32 outqBefore = apex_read_register_32(b2, APEX_REG_OUTQ_CONTROL);
+		apex_write_register_32(b2, APEX_REG_OUTQ_CONTROL, 0x3);
+		UINT32 outqAfter = apex_read_register_32(b2, APEX_REG_OUTQ_CONTROL);
+		UINT32 outqStat  = apex_read_register_32(b2, APEX_REG_OUTQ_STATUS);
+		DbgPrint("[Q@out_actv] enabled: control before=0x%x wrote=0x3 after=0x%x status=0x%x\n",
+			outqBefore, outqAfter, outqStat);
+	}
+
+	// === PER-QUEUE CSR DUMP — diagnose chip-expected descriptor sizes & queue states ===
+	// libedgetpu HostQueue::Open reads queue_descriptor_size to verify sizeof(Element).
+	// Beagle has 4 queues (instruction / output_actv / input_actv / param); we only use
+	// the instruction queue. If chip's expected descriptor_size != 16, our descriptors
+	// are misaligned. If output_actv queue has non-default state (control/status),
+	// that's a hidden mechanism we missed.
+	{
+		PVOID b2 = deviceContext->Bar2BaseAddress;
+		UINT32 iqDesc = apex_read_register_32(b2, APEX_REG_IQ_DESCRIPTOR_SIZE);
+		UINT32 iqMin  = apex_read_register_32(b2, APEX_REG_IQ_MINIMUM_SIZE);
+		UINT32 iqMax  = apex_read_register_32(b2, APEX_REG_IQ_MAXIMUM_SIZE);
+		DbgPrint("[Q@instr]    descriptor_size=%u minimum=%u maximum=%u\n",
+			iqDesc, iqMin, iqMax);
+
+		UINT32 outqCtrl = apex_read_register_32(b2, APEX_REG_OUTQ_CONTROL);
+		UINT32 outqStat = apex_read_register_32(b2, APEX_REG_OUTQ_STATUS);
+		UINT32 outqDesc = apex_read_register_32(b2, APEX_REG_OUTQ_DESCRIPTOR_SIZE);
+		UINT32 outqMin  = apex_read_register_32(b2, APEX_REG_OUTQ_MINIMUM_SIZE);
+		DbgPrint("[Q@out_actv] control=0x%x status=0x%x descriptor_size=%u minimum=%u\n",
+			outqCtrl, outqStat, outqDesc, outqMin);
+
+		UINT32 inqCtrl = apex_read_register_32(b2, APEX_REG_INQ_CONTROL);
+		UINT32 inqStat = apex_read_register_32(b2, APEX_REG_INQ_STATUS);
+		UINT32 inqDesc = apex_read_register_32(b2, APEX_REG_INQ_DESCRIPTOR_SIZE);
+		UINT32 inqMin  = apex_read_register_32(b2, APEX_REG_INQ_MINIMUM_SIZE);
+		DbgPrint("[Q@in_actv]  control=0x%x status=0x%x descriptor_size=%u minimum=%u\n",
+			inqCtrl, inqStat, inqDesc, inqMin);
+
+		UINT32 prqCtrl = apex_read_register_32(b2, APEX_REG_PARAMQ_CONTROL);
+		UINT32 prqStat = apex_read_register_32(b2, APEX_REG_PARAMQ_STATUS);
+		UINT32 prqDesc = apex_read_register_32(b2, APEX_REG_PARAMQ_DESCRIPTOR_SIZE);
+		UINT32 prqMin  = apex_read_register_32(b2, APEX_REG_PARAMQ_MINIMUM_SIZE);
+		DbgPrint("[Q@param]    control=0x%x status=0x%x descriptor_size=%u minimum=%u\n",
+			prqCtrl, prqStat, prqDesc, prqMin);
+
+		// Top-level arbiter registers — POR / pre-INFER state.
+		UINT32 rArb = apex_read_register_32(b2, APEX_REG_READ_REQUEST_ARBITER);
+		UINT32 wArb = apex_read_register_32(b2, APEX_REG_WRITE_REQUEST_ARBITER);
+		UINT32 atArb = apex_read_register_32(b2, APEX_REG_ADDR_TRANSLATION_ARBITER);
+		DbgPrint("[ARB-CFG@prepare-end] read_req=0x%x write_req=0x%x addr_trans=0x%x\n",
+			rArb, wArb, atArb);
 	}
 
 	// AER baseline at end of PrepareHardware — establishes a known clean state.
@@ -1071,6 +1098,25 @@ npudriverEvtFileCleanup(
 
 	DbgPrint("[%s] File cleanup called\n", __FUNCTION__);
 
+	// Drain ExtraLockedMdls FIRST — these are MDLs that were piled up by
+	// repeated IOCTL_MAP_BUFFER calls (e.g. exe0 0x800000 + INFER bs 0x900000
+	// in the same open) before any UNMAP / PARAM_CACHE handover.  If we don't
+	// release them here, the process termination path will hit
+	// PROCESS_HAS_LOCKED_PAGES BSOD.
+	{
+		UINT32 i;
+		for (i = 0; i < deviceContext->ExtraLockedMdlCount; i++) {
+			DbgPrint("[%s] Releasing extras[%u] MDL=%p\n",
+				__FUNCTION__, i, deviceContext->ExtraLockedMdls[i]);
+			if (deviceContext->ExtraLockedMdls[i] != NULL) {
+				MmUnlockPages(deviceContext->ExtraLockedMdls[i]);
+				IoFreeMdl(deviceContext->ExtraLockedMdls[i]);
+				deviceContext->ExtraLockedMdls[i] = NULL;
+			}
+		}
+		deviceContext->ExtraLockedMdlCount = 0;
+	}
+
 	// Safety check: unlock pages if they weren't properly unlocked
 	if (deviceContext->LockedModelMdl != NULL) {
 		DbgPrint("[%s] WARNING: Locked MDL detected during file cleanup\n", __FUNCTION__);
@@ -1201,10 +1247,12 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 									   APEX_REG_WIRE_INT_PENDING);
 	UINT64 iqIntStatus = apex_read_register(pDevContext->Bar2BaseAddress,
 											APEX_REG_INSTR_QUEUE_INT_STATUS);
+	UINT64 scHostCount = apex_read_register(pDevContext->Bar2BaseAddress,
+											APEX_REG_SC_HOST_INT_COUNT);
 
 	// Always log entry — pending==0 case included
-	DbgPrint("[ISR#%d] MessageID=%lu pending=0x%llx iq_int=0x%llx\n",
-		callNum, MessageID, pending, iqIntStatus);
+	DbgPrint("[ISR#%d] MessageID=%lu pending=0x%llx iq_int=0x%llx sc_host_count=0x%llx\n",
+		callNum, MessageID, pending, iqIntStatus, scHostCount);
 
 	if (pending == 0) {
 		// Not our interrupt (or already cleared). Tell KMDF to try other handlers.
@@ -1219,18 +1267,26 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 	pDevContext->LastIsrWirePending = pending;
 	InterlockedOr(&pDevContext->IsrSeenPendingBits, (LONG)(pending & 0xFFFFFFFF));
 
-	// Ack BOTH the source (IQ_INT_STATUS) and the aggregator (WIRE_INT_PENDING)
-	// inside the ISR — must happen before we leave DIRQL or the chip re-asserts
-	// MSI-X immediately and we get an interrupt storm.
+	// Ack the SOURCE registers first (level-driven), then the aggregator
+	// (WIRE_INT_PENDING). Without this the chip re-asserts MSI-X immediately
+	// and we storm.
 	//
-	// Order matters: clear the source first (IQ_INT_STATUS) so the level-driven
-	// aggregator drops; then clear the aggregator latch (WIRE_INT_PENDING).
-	// IQ_INT_STATUS turns out to be W1C on this chip — writing 0 leaves the bit
-	// set and chip re-fires forever.
+	// SC_HOST_INT_STATUS (0x486a8) — REAL INFER completion source. libedgetpu
+	// writes 0xE here on every SC_HOST fire (W1C bits 1..3, leaving bit 0 for
+	// the count register to latch). Without this ack the next INFER's SC_HOST_0
+	// edge is lost and OUTFEED appears to never complete. This was missing.
+	if (pending & APEX_WIRE_BITS_SC_HOST_ANY) {
+		apex_write_register(pDevContext->Bar2BaseAddress,
+			APEX_REG_SC_HOST_INT_STATUS, 0xE);
+	}
+
+	// IQ_INT_STATUS — libedgetpu writes 0 to clear (NOT W1C as our prior
+	// comment claimed). Observed in the working runtime trace.
 	if (iqIntStatus != 0) {
 		apex_write_register(pDevContext->Bar2BaseAddress,
-			APEX_REG_INSTR_QUEUE_INT_STATUS, iqIntStatus);
+			APEX_REG_INSTR_QUEUE_INT_STATUS, 0);
 	}
+
 	apex_write_register(pDevContext->Bar2BaseAddress,
 					   APEX_REG_WIRE_INT_PENDING, pending);
 
@@ -1346,12 +1402,49 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 		wirePend = apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING);
 		hibErr   = apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
 		hibFirst = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
-		DbgPrint("[DPC-DIAG] SC=0x%x IN=0x%x OUT=0x%x AV=0x%x | IQ_DONE=%llu IQ_INT=0x%llx WIRE_NOW=0x%llx WIRE_ISR=0x%llx SEEN=0x%x | HIB_ERR=0x%llx HIB_FIRST=0x%llx\n",
+		// page_fault_address (0x48738) is the unified fault-VA register —
+		// captures the device VA the chip was walking when MMU rejected it,
+		// regardless of direction (INFEED inbound vs OUTFEED outbound write).
+		UINT64 faultVA = apex_read_register(bar2, APEX_REG_INFEED_PAGE_FAULT_ADDR);
+		UINT64 firstTs = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR_TS);
+		DbgPrint("[DPC-DIAG] SC=0x%x IN=0x%x OUT=0x%x AV=0x%x | IQ_DONE=%llu IQ_INT=0x%llx WIRE_NOW=0x%llx WIRE_ISR=0x%llx SEEN=0x%x | HIB_ERR=0x%llx HIB_FIRST=0x%llx FAULT_VA=0x%llx FIRST_TS=0x%llx\n",
 			scStat, inStat, outStat, avStat,
 			iqDone, iqIntSt, wirePend,
 			pDevContext->LastIsrWirePending,
 			(UINT32)pDevContext->IsrSeenPendingBits,
-			hibErr, hibFirst);
+			hibErr, hibFirst, faultVA, firstTs);
+
+		// AXI write-channel counters at DPC time.  Compare against the
+		// pre-submit snapshot in [AXI@pre-submit]:
+		//   - awIns/wIns increased  → chip issued outbound write TLPs
+		//                              (root complex / IOMMU likely the wall)
+		//   - awIns/wIns unchanged  → chip never even tried to write outbound
+		//                              (chip-internal ATU / credit gate is the wall)
+		// awOcc/wOcc reflect in-flight (un-acked) write requests.
+		{
+			UINT32 awIns = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_INSERTION);
+			UINT32 wIns  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_INSERTION);
+			UINT32 awOcc = apex_read_register_32(bar2, APEX_REG_AXI_AW_CREDIT_SHIM_OCCUPANCY);
+			UINT32 wOcc  = apex_read_register_32(bar2, APEX_REG_AXI_W_CREDIT_SHIM_OCCUPANCY);
+			DbgPrint("[DPC-AXI] aw_ins=0x%x w_ins=0x%x aw_occ=0x%x w_occ=0x%x\n",
+				awIns, wIns, awOcc, wOcc);
+		}
+
+		// HIB credits at DPC time — does any non-OUTPUT credit drop on fault?
+		// If yes → credits are dynamic; OUTPUT=0 means chip thinks our OUTPUT
+		// VA is invalid.  If unchanged → credits are POR static and irrelevant.
+		{
+			UINT64 cInstr  = apex_read_register(bar2, 0x48740);
+			UINT64 cInput  = apex_read_register(bar2, 0x48748);
+			UINT64 cParam  = apex_read_register(bar2, 0x48750);
+			UINT64 cOutput = apex_read_register(bar2, 0x48758);
+			DbgPrint("[DPC-CREDITS] instr=0x%llx input=0x%llx param=0x%llx output=0x%llx\n",
+				cInstr, cInput, cParam, cOutput);
+		}
+
+		// NOTE: PCI config-space read requires PASSIVE_LEVEL (WdfFdoQueryForInterface).
+		// DPC runs at DISPATCH_LEVEL.  PCI snapshot is collected by IOCTL post-INFER
+		// instead — see [PCIE@post-infer] / [PCI-CMD@post-infer] in Queue.c.
 		// hint: SC=0 OUT=0 -> all engines parked normally (real done)
 		//       SC=1 -> still running, this DPC is premature, defer
 		//       SC=4 (kHalted) -> halted, error completion
@@ -1373,42 +1466,56 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 	}
 
 	// PREMATURE-DPC GATE.
-	// Two ways to recognize "INFER done":
-	//   (1) SCALAR_RUN_STATUS == kIdle(0) or kHalted(4) — the chip's view.
-	//   (2) APEX_WIRE_BIT_SC_HOST_0 (0x10) seen in any ISR for this INFER
-	//       — SCALAR has executed the bitstream's host_interrupt 0 opcode,
-	//         which the Edge TPU compiler places AFTER the OUTFEED drain
-	//         barrier.  Once SC_HOST_0 fires, we trust the compiler promise
-	//         that all OUTFEED writes are done, even if SCALAR_RUN_STATUS
-	//         shows a brief kRun snapshot due to HW pipeline latency.
 	//
-	// Without (2), if ISR fires once with pending=0x11 (IQ_INT + SC_HOST_0)
-	// while SCALAR still shows kRun for a few ms, DPC defers — but no fresh
-	// interrupt comes (level bits already W1C-acked) and we fall back to
-	// the 50ms polling timeout.  Adding (2) lets us complete via the
-	// interrupt path immediately, saving ~45ms per INFER.
+	// Earlier version trusted SC_HOST_0 (bit 4) alone as "INFER done".  Bug:
+	// SC_HOST_0 fires when the SCALAR core executes host_interrupt 0 — but on
+	// observed traces this can fire BEFORE OUTFEED actually drains its writes
+	// (we saw OUT_RUN_STATUS=0 at first ISR, OUTFEED=0x1 only 1ms later).
+	// Releasing the OUTPUT mapping at that point caused the chip's later
+	// outbound write to walk a freed/zeroed PTE → HIB_ERR=0x1 + FATAL_ERR
+	// (the second ISR with pending=0x1011).
+	//
+	// New rule: complete only when ALL run-status engines are in a terminal
+	// state.  Terminal = kIdle(0) (normal done) or kHalted(4) (error done).
+	// This matches libedgetpu's IsAllRunStatusKIdle pattern and ensures
+	// the OUTFEED engine has fully drained before we tear down the OUTPUT
+	// extended mapping.
+	//
+	// FATAL_ERR seen in pending also forces completion (so we don't deadlock
+	// on a dead chip).
 	BOOLEAN scHostSeen = (pDevContext->IsrSeenPendingBits & APEX_WIRE_BIT_SC_HOST_0) != 0;
-	BOOLEAN scalarTerminal = (scStat == 0 || scStat == 4);
-	if (bar2 != NULL && !scalarTerminal && !scHostSeen) {
-		DbgPrint("[DPC] PREMATURE: SCALAR=0x%x OUTFEED=0x%x SeenPending=0x%x — deferring unlock until next interrupt\n",
-			scStat, outStat, pDevContext->IsrSeenPendingBits);
+	BOOLEAN fatalSeen  = (pDevContext->IsrSeenPendingBits & APEX_WIRE_BIT_FATAL_ERR) != 0;
+	UINT32  gateSc     = (bar2 != NULL) ? apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS)     : 0xFFFFFFFFu;
+	UINT32  gateIn     = (bar2 != NULL) ? apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS)     : 0xFFFFFFFFu;
+	UINT32  gateOut    = (bar2 != NULL) ? apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS)    : 0xFFFFFFFFu;
+	UINT32  gateAv     = (bar2 != NULL) ? apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS) : 0xFFFFFFFFu;
+	BOOLEAN allIdle    = (gateSc == 0) && (gateOut == 0) && (gateIn == 0) && (gateAv == 0);
+	BOOLEAN anyHalted  = (gateSc == 4) || (gateOut == 4);
+	BOOLEAN terminal   = allIdle || anyHalted || fatalSeen;
+	if (bar2 != NULL && !terminal) {
+		DbgPrint("[DPC] PREMATURE: SC=0x%x IN=0x%x OUT=0x%x AV=0x%x scHost=%d fatal=%d — deferring (waiting for all-idle)\n",
+			gateSc, gateIn, gateOut, gateAv, scHostSeen, fatalSeen);
 		return; // keep MDLs locked, keep event unsignaled
 	}
-	if (!scalarTerminal && scHostSeen) {
-		DbgPrint("[DPC] SC_HOST_0 seen (SeenPending=0x%x) — completing despite SCALAR=0x%x (compiler-promised done)\n",
-			pDevContext->IsrSeenPendingBits, scStat);
+	if (terminal && !allIdle) {
+		DbgPrint("[DPC] terminal-but-not-allIdle: SC=0x%x IN=0x%x OUT=0x%x AV=0x%x halted=%d fatal=%d scHost=%d\n",
+			gateSc, gateIn, gateOut, gateAv, anyHalted, fatalSeen, scHostSeen);
 	}
 
 	if (pDevContext->InferOutputMdl != NULL && bar2 != NULL) {
 		PMDL outMdl   = pDevContext->InferOutputMdl;
 		UINT64 outVA   = pDevContext->InferOutputDeviceVA;
 		UINT64 outSize = pDevContext->InferOutputSize;
-		UINT32 pteIdx  = (UINT32)(outVA >> PAGE_SHIFT);
 		UINT32 pageCnt = (UINT32)((outSize + PAGE_SIZE - 1) >> PAGE_SHIFT);
 		PPFN_NUMBER pfn = MmGetMdlPfnArray(outMdl);
+		BOOLEAN isExtended = (outVA & (1ULL << 63)) != 0;
 
-		// (a) PTE readback for first up-to-4 output pages
-		{
+		// (a) PTE readback for first up-to-4 output pages.
+		// Simple VA: read chip PTE[outVA>>12] directly, expect data PA.
+		// Extended VA: read chip PTE[6144+((outVA>>21)&0x1FFF)], expect 2-level PT PA;
+		//              also dump the host-resident sub-entries we wrote.
+		if (!isExtended) {
+			UINT32 pteIdx  = (UINT32)(outVA >> PAGE_SHIFT);
 			UINT32 vc = (pageCnt < 4) ? pageCnt : 4;
 			UINT32 ii;
 			for (ii = 0; ii < vc; ii++) {
@@ -1419,22 +1526,83 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 					pteIdx, ii, expectPA, readPaNoF,
 					(readPaNoF == expectPA) ? "OK" : "MISMATCH");
 			}
+		} else {
+			UINT32 chipPteIdx     = 6144u + (UINT32)((outVA >> 21) & 0x1FFF);
+			UINT32 hostTableStart = (UINT32)((outVA >> 12) & 0x1FF);
+			UINT64 chipReg = apex_read_register(bar2, APEX_REG_PAGE_TABLE + (chipPteIdx * 8));
+			UINT64 expectPa = pDevContext->ExtSecondLevelPa;
+			DbgPrint("[DPC-PTE] EXT chip PTE[%u] = 0x%llx (expected 2-level PT PA = 0x%llx | 0x1) %s\n",
+				chipPteIdx, chipReg, expectPa,
+				((chipReg & ~1ULL) == expectPa) ? "OK" : "MISMATCH");
+
+			// Dump the host-resident 2-level PT entries we wrote.
+			if (pDevContext->ExtSecondLevelKva != NULL) {
+				UINT64* slot = (UINT64*)pDevContext->ExtSecondLevelKva;
+				UINT32 vc = (pageCnt < 4) ? pageCnt : 4;
+				UINT32 ii;
+				for (ii = 0; ii < vc; ii++) {
+					UINT64 expectPA = (UINT64)pfn[ii] << PAGE_SHIFT;
+					UINT64 entry = slot[hostTableStart + ii];
+					UINT64 entryPa = entry & ~1ULL;
+					DbgPrint("[DPC-PTE] EXT 2L[%u+%u] expect=0x%llx entry=0x%llx %s\n",
+						hostTableStart, ii, expectPA, entry,
+						(entryPa == expectPA) ? "OK" : "MISMATCH");
+				}
+			}
 		}
 
-		// (b) Map locked output pages into kernel VA, scan first 16 KB for
-		//     non-zero, dump first 64 bytes.
+		// (b) Map locked output pages into kernel VA, scan ENTIRE buffer for
+		//     non-0xCC bytes (was 16 KB only — too small to catch chip writes
+		//     that may land deeper into the buffer), dump first 64 bytes,
+		//     and locate the first non-0xCC byte if any.
 		{
-			PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(outMdl, NormalPagePriority);
+			// In EXTENDED+BOUNCE mode the chip wrote into our < 4 GB bounce
+			// buffer, not the user MDL.  Dump bounce in that case so we can
+			// see whether OUTFEED actually wrote.  In SIMPLE mode chip wrote
+			// directly into user buffer pages — dump the MDL kernel VA.
+			PUCHAR kva = NULL;
+			const char* tag = "USER";
+			if (pDevContext->OutputBounceActive && pDevContext->OutputBounceKva != NULL) {
+				kva = (PUCHAR)pDevContext->OutputBounceKva;
+				tag = "BOUNCE";
+			} else {
+				kva = (PUCHAR)MmGetSystemAddressForMdlSafe(outMdl, NormalPagePriority);
+			}
 			if (kva != NULL) {
 				ULONG dumpLen = (outSize < 64) ? (ULONG)outSize : 64;
-				ULONG scanLen = (outSize < 0x4000) ? (ULONG)outSize : 0x4000;
+				ULONG scanLen = (ULONG)outSize;   // full buffer scan
 				ULONG j;
 				ULONG nz = 0;
+				ULONG ncc = 0;
+				ULONG firstNonCc = 0xFFFFFFFF;
 				for (j = 0; j < scanLen; j++) {
 					if (kva[j] != 0) nz++;
+					if (kva[j] != 0xCC) {
+						ncc++;
+						if (firstNonCc == 0xFFFFFFFF) firstNonCc = j;
+					}
 				}
-				DbgPrint("[DPC-OUT] kernel VA=%p outVA=0x%llx size=%llu nonzero(first %lu B)=%lu\n",
-					kva, outVA, outSize, scanLen, nz);
+				DbgPrint("[DPC-OUT/%s] kernel VA=%p outVA=0x%llx size=%llu nonzero=%lu non-0xCC=%lu (FULL scan) firstNon0xCC@0x%lx\n",
+					tag, kva, outVA, outSize, nz, ncc, firstNonCc);
+				if (firstNonCc != 0xFFFFFFFF && firstNonCc + 16 <= scanLen) {
+					ULONG f = firstNonCc;
+					DbgPrint("[DPC-OUT/%s] firstNon0xCC@0x%lx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						tag, f,
+						kva[f+0], kva[f+1], kva[f+2],  kva[f+3],
+						kva[f+4], kva[f+5], kva[f+6],  kva[f+7],
+						kva[f+8], kva[f+9], kva[f+10], kva[f+11],
+						kva[f+12],kva[f+13],kva[f+14], kva[f+15]);
+				}
+				// Also dump tail 64 B — chip may write near end of buffer.
+				if (scanLen >= 64) {
+					ULONG t = scanLen - 64;
+					DbgPrint("[DPC-OUT/%s] tail64@0x%lx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+						tag, t,
+						kva[t+0], kva[t+1], kva[t+2],  kva[t+3],
+						kva[t+4], kva[t+5], kva[t+6],  kva[t+7],
+						kva[t+8], kva[t+9], kva[t+10], kva[t+11],
+						kva[t+12],kva[t+13],kva[t+14], kva[t+15]);
+				}
 				DbgPrint("[DPC-OUT] [00] %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
 					kva[0],  kva[1],  kva[2],  kva[3],  kva[4],  kva[5],  kva[6],  kva[7],
 					kva[8],  kva[9],  kva[10], kva[11], kva[12], kva[13], kva[14], kva[15]);
@@ -1459,6 +1627,106 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 		}
 	}
 
+	// =========================================================
+	// DPC-SCAN — chip 이 OUTFEED 로 발행한 W beat 가 host 의 어느 영역에 도달했는지 추적.
+	// MDL 을 unlock 하기 직전이라 모든 host VA 가 살아있음.  OUTPUT 이 0xCC 그대로 남아도
+	// 여기서 다른 영역에 stray write 흔적이 있다면 chip 의 진짜 destination 을 역추적할 수 있음.
+	// =========================================================
+	{
+		// 1) DescRing — pre-INFER 에 0xA5 fill, descriptor 32 byte 만 우리가 씀.
+		if (pDevContext->DescRingBase != NULL) {
+			PUCHAR p = (PUCHAR)pDevContext->DescRingBase;
+			ULONG nonA5 = 0;
+			ULONG firstNonA5 = 0xFFFFFFFF;
+			ULONG ii;
+			for (ii = 32; ii < PAGE_SIZE; ii++) {
+				if (p[ii] != 0xA5) {
+					nonA5++;
+					if (firstNonA5 == 0xFFFFFFFF) firstNonA5 = ii;
+				}
+			}
+			DbgPrint("[DPC-SCAN-DescRing] post-32 non-0xA5=%lu firstAt=0x%lx\n",
+				nonA5, firstNonA5);
+			if (nonA5 > 0 && firstNonA5 != 0xFFFFFFFF) {
+				ULONG d = firstNonA5;
+				DbgPrint("[DPC-SCAN-DescRing] @0x%lx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					d,
+					p[d+0],p[d+1],p[d+2],p[d+3], p[d+4],p[d+5],p[d+6],p[d+7],
+					p[d+8],p[d+9],p[d+10],p[d+11], p[d+12],p[d+13],p[d+14],p[d+15]);
+			}
+		}
+
+		// 2) StatusBlock — pre-INFER 에 0xA5 fill, chip 이 head 16 byte 에 IQ_completed_head 만 씀.
+		if (pDevContext->StatusBlockBase != NULL) {
+			PUCHAR p = (PUCHAR)pDevContext->StatusBlockBase;
+			ULONG nonA5 = 0;
+			ULONG firstNonA5 = 0xFFFFFFFF;
+			ULONG ii;
+			for (ii = 16; ii < PAGE_SIZE; ii++) {
+				if (p[ii] != 0xA5) {
+					nonA5++;
+					if (firstNonA5 == 0xFFFFFFFF) firstNonA5 = ii;
+				}
+			}
+			DbgPrint("[DPC-SCAN-StatusBlock] post-16 non-0xA5=%lu firstAt=0x%lx\n",
+				nonA5, firstNonA5);
+			if (nonA5 > 0 && firstNonA5 != 0xFFFFFFFF) {
+				ULONG d = firstNonA5;
+				DbgPrint("[DPC-SCAN-StatusBlock] @0x%lx: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					d,
+					p[d+0],p[d+1],p[d+2],p[d+3], p[d+4],p[d+5],p[d+6],p[d+7],
+					p[d+8],p[d+9],p[d+10],p[d+11], p[d+12],p[d+13],p[d+14],p[d+15]);
+			}
+		}
+
+		// 3) INFER bitstream MDL — chip 이 자기 instruction 영역을 덮어쓰면 head 가 변함.
+		//    pre-INFER 의 head bytes 는 80 0f 00 28 c7 00 00 00 ...
+		if (pDevContext->LockedModelMdl != NULL) {
+			PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+				pDevContext->LockedModelMdl, NormalPagePriority);
+			if (kva != NULL) {
+				SIZE_T sz = MmGetMdlByteCount(pDevContext->LockedModelMdl);
+				DbgPrint("[DPC-SCAN-INFERBitstream] sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | tail16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					(UINT64)sz,
+					kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+					kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+					kva[sz-16],kva[sz-15],kva[sz-14],kva[sz-13], kva[sz-12],kva[sz-11],kva[sz-10],kva[sz-9],
+					kva[sz-8],kva[sz-7],kva[sz-6],kva[sz-5], kva[sz-4],kva[sz-3],kva[sz-2],kva[sz-1]);
+			}
+		}
+
+		// 4) Input image — chip 이 OUTPUT 의 VA 를 잘못 디코드해서 INPUT 영역에
+		//    write back 했을 가능성.  pre-INFER 의 head 는 image pixel pattern.
+		if (pDevContext->InferInputMdl != NULL) {
+			PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+				pDevContext->InferInputMdl, NormalPagePriority);
+			if (kva != NULL) {
+				SIZE_T sz = MmGetMdlByteCount(pDevContext->InferInputMdl);
+				DbgPrint("[DPC-SCAN-InputImage] sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | tail16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					(UINT64)sz,
+					kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+					kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+					kva[sz-16],kva[sz-15],kva[sz-14],kva[sz-13], kva[sz-12],kva[sz-11],kva[sz-10],kva[sz-9],
+					kva[sz-8],kva[sz-7],kva[sz-6],kva[sz-5], kva[sz-4],kva[sz-3],kva[sz-2],kva[sz-1]);
+			}
+		}
+
+		// 5) Cached PARAM bitstream — chip 이 instruction 영역을 자기 결과로 덮을 수 있음.
+		if (pDevContext->CachedParamBitstreamMdl != NULL) {
+			PUCHAR kva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+				pDevContext->CachedParamBitstreamMdl, NormalPagePriority);
+			if (kva != NULL) {
+				SIZE_T sz = MmGetMdlByteCount(pDevContext->CachedParamBitstreamMdl);
+				DbgPrint("[DPC-SCAN-PARAMBitstream] sz=%llu first16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x | tail16=%02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					(UINT64)sz,
+					kva[0],kva[1],kva[2],kva[3], kva[4],kva[5],kva[6],kva[7],
+					kva[8],kva[9],kva[10],kva[11], kva[12],kva[13],kva[14],kva[15],
+					kva[sz-16],kva[sz-15],kva[sz-14],kva[sz-13], kva[sz-12],kva[sz-11],kva[sz-10],kva[sz-9],
+					kva[sz-8],kva[sz-7],kva[sz-6],kva[sz-5], kva[sz-4],kva[sz-3],kva[sz-2],kva[sz-1]);
+			}
+		}
+	}
+
 	if (pDevContext->InferInputMdl != NULL) {
 		MmUnlockPages(pDevContext->InferInputMdl);
 		IoFreeMdl(pDevContext->InferInputMdl);
@@ -1467,6 +1735,43 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 	}
 
 	if (pDevContext->InferOutputMdl != NULL) {
+		// EXTENDED+BOUNCE path: chip wrote into our < 4 GB bounce buffer.
+		// Copy bounce -> user buffer (via MDL kernel VA, MDL still locked
+		// here) BEFORE unlocking, while user pages are guaranteed resident.
+		if (pDevContext->OutputBounceActive && pDevContext->OutputBounceKva != NULL) {
+			PUCHAR userKva = (PUCHAR)MmGetSystemAddressForMdlSafe(
+				pDevContext->InferOutputMdl, NormalPagePriority);
+			if (userKva != NULL) {
+				SIZE_T copySize = pDevContext->InferOutputSize;
+				if (copySize > pDevContext->OutputBounceSize) {
+					copySize = pDevContext->OutputBounceSize;
+				}
+				RtlCopyMemory(userKva, pDevContext->OutputBounceKva, copySize);
+				DbgPrint("[%s] Bounce copied to user buffer (size=%llu)\n",
+					__FUNCTION__, (UINT64)copySize);
+				DbgPrint("[%s] BOUNCE first 16B: %02x %02x %02x %02x %02x %02x %02x %02x  %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					__FUNCTION__,
+					((PUCHAR)pDevContext->OutputBounceKva)[0],
+					((PUCHAR)pDevContext->OutputBounceKva)[1],
+					((PUCHAR)pDevContext->OutputBounceKva)[2],
+					((PUCHAR)pDevContext->OutputBounceKva)[3],
+					((PUCHAR)pDevContext->OutputBounceKva)[4],
+					((PUCHAR)pDevContext->OutputBounceKva)[5],
+					((PUCHAR)pDevContext->OutputBounceKva)[6],
+					((PUCHAR)pDevContext->OutputBounceKva)[7],
+					((PUCHAR)pDevContext->OutputBounceKva)[8],
+					((PUCHAR)pDevContext->OutputBounceKva)[9],
+					((PUCHAR)pDevContext->OutputBounceKva)[10],
+					((PUCHAR)pDevContext->OutputBounceKva)[11],
+					((PUCHAR)pDevContext->OutputBounceKva)[12],
+					((PUCHAR)pDevContext->OutputBounceKva)[13],
+					((PUCHAR)pDevContext->OutputBounceKva)[14],
+					((PUCHAR)pDevContext->OutputBounceKva)[15]);
+			} else {
+				DbgPrint("[%s] WARNING: cannot map output MDL — bounce data lost\n",
+					__FUNCTION__);
+			}
+		}
 		MmUnlockPages(pDevContext->InferOutputMdl);
 		IoFreeMdl(pDevContext->InferOutputMdl);
 		pDevContext->InferOutputMdl = NULL;

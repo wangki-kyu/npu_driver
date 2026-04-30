@@ -125,9 +125,15 @@
 #define APEX_REG_INSTR_QUEUE_SIZE            0x485a0  // ring capacity (# descriptors)
 #define APEX_REG_INSTR_QUEUE_TAIL            0x485a8  // cumulative descriptor count
 #define APEX_REG_INSTR_QUEUE_FETCHED_HEAD    0x485b0  // hw fetch progress
-#define APEX_REG_INSTR_QUEUE_COMPLETED_HEAD  0x485b8  // hw completion progress
+// IQ_COMPLETED_HEAD (0x485b8) tracks IQ descriptor *fetch* progress only — it
+// increments as soon as a descriptor is consumed from the ring, NOT when the
+// inference pipeline (INFEED → compute → OUTFEED) finishes. The real "INFER
+// done" signal is sc_host_int_count (0x486d0), incremented by SCALAR's
+// host_interrupt 0 opcode placed AFTER the OUTFEED drain barrier. Use this
+// register for diagnostics only — never for completion polling.
+#define APEX_REG_INSTR_QUEUE_COMPLETED_HEAD  0x485b8  // IQ fetch progress (NOT inference completion)
 #define APEX_REG_INSTR_QUEUE_INT_CONTROL     0x485c0  // interrupt control
-#define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (W1C: write 1 to clear)
+#define APEX_REG_INSTR_QUEUE_INT_STATUS      0x485c8  // interrupt status (libedgetpu writes 0 to clear)
 
 // ========== WIRE_INT_PENDING bit layout ==========
 // Authoritative source: libedgetpu/driver/config/common_csr_helper.h
@@ -168,6 +174,20 @@
 
 // ========== SC_HOST Interrupt Control ==========
 #define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 0xF = enable all 4 SC_HOST completion interrupts (kNumInterrupts=4)
+// SC_HOST_INT_STATUS / SC_HOST_INT_COUNT — REAL INFER completion signal.
+// libedgetpu's canonical post-inference handshake (per host_queue.h + working
+// runtime trace):
+//   1) SCALAR reaches host_interrupt 0 opcode (after OUTFEED drain) → fires
+//      SC_HOST_0 wire interrupt (WIRE_INT_PENDING bit 4 = 0x10).
+//   2) ISR writes 0xE to SC_HOST_INT_STATUS to W1C-clear bits 1..3 (leaves
+//      bit 0 alone — chip latches that one for the count register).
+//   3) ISR reads SC_HOST_INT_COUNT — monotonic counter of SCALAR-issued
+//      host_interrupt 0 events. Compare to last cached value to detect new
+//      completion. Polling this register (not IQ_COMPLETED_HEAD) is what
+//      guarantees OUTFEED has actually written results back to host RAM.
+#define APEX_REG_SC_HOST_INT_STATUS         0x486a8  // W1C: write 0xE to ack SC_HOST 1..3
+#define APEX_REG_SC_HOST_INT_COUNT          0x486d0  // monotonic SC_HOST_0 fire count (REAL INFER done)
+#define APEX_REG_STATUS_BLOCK_UPDATE        0x486e8  // 0 = disable periodic status block auto-write
 #define APEX_REG_TOP_LEVEL_INT_CONTROL      0x486b0  // write 0xF = enable top-level aggregator interrupts
 #define APEX_REG_FATAL_ERR_INT_CONTROL      0x486c0  // write 1 = enable fatal-error interrupt
 #define APEX_REG_DMA_BURST_LIMITER          0x487a8  // axi DMA burst limiter (write 0 explicitly)
@@ -192,14 +212,76 @@
 #define APEX_REG_HIB_PARAM_CREDITS          0x48750
 #define APEX_REG_HIB_OUTPUT_ACTV_CREDITS    0x48758  // suspected outbound credit gate
 
+// ========== Per-queue CSR (libedgetpu beagle_csr_offsets.h) ==========
+// Beagle has 4 separate queues at the chip level: output_actv / instruction /
+// input_actv / param. We use only the instruction queue, but reading the others'
+// status/descriptor_size tells us what the chip expects.
+//
+// instruction_queue (libedgetpu uses this one):
+#define APEX_REG_IQ_DESCRIPTOR_SIZE         0x48578  // RO: chip-expected element size
+#define APEX_REG_IQ_MINIMUM_SIZE            0x48580
+#define APEX_REG_IQ_MAXIMUM_SIZE            0x48588
+// output_actv queue (chip-side OUTFEED queue we never touch):
+#define APEX_REG_OUTQ_CONTROL               0x484f8
+#define APEX_REG_OUTQ_STATUS                0x48508
+#define APEX_REG_OUTQ_DESCRIPTOR_SIZE       0x48510
+#define APEX_REG_OUTQ_MINIMUM_SIZE          0x48518
+// input_actv queue:
+#define APEX_REG_INQ_CONTROL                0x485d0
+#define APEX_REG_INQ_STATUS                 0x485d8
+#define APEX_REG_INQ_DESCRIPTOR_SIZE        0x485e0
+#define APEX_REG_INQ_MINIMUM_SIZE           0x485e8
+// param queue:
+#define APEX_REG_PARAMQ_CONTROL             0x48638
+#define APEX_REG_PARAMQ_STATUS              0x48640
+#define APEX_REG_PARAMQ_DESCRIPTOR_SIZE     0x48648
+#define APEX_REG_PARAMQ_MINIMUM_SIZE        0x48650
+
+// ========== Internal arbiter performance counters (DebugHibUserCsrOffsets) ==========
+// These counters reveal where outbound writes lose data inside the chip.
+//
+// write_request_arbiter — selects which outbound write source (OUTFEED data vs
+// status block) gets the AXI write channel. If output_actv requests cycle but
+// blocked dominates, AXI write channel can't drain OUTFEED.
+#define APEX_REG_WRA_OUT_ACTV_REQ           0x48390
+#define APEX_REG_WRA_OUT_ACTV_BLOCKED       0x48398
+#define APEX_REG_WRA_STATUS_BLK_REQ         0x483b0  // status block (known-working path)
+#define APEX_REG_WRA_STATUS_BLK_BLOCKED     0x483b8
+//
+// address_translation_arbiter — MMU walker arbitration. If output_actv request
+// is non-zero but its translation cycles never advance, MMU never resolves
+// OUTPUT VA → host PA.
+#define APEX_REG_ATA_OUT_ACTV_REQ           0x48450
+#define APEX_REG_ATA_OUT_ACTV_BLOCKED       0x48458
+#define APEX_REG_ATA_INSTRUCTION_REQ        0x483d0  // baseline: instruction-fetch path
+#define APEX_REG_ATA_INSTRUCTION_BLOCKED    0x483d8
+#define APEX_REG_ATA_INPUT_ACTV_REQ         0x483f0  // baseline: INFEED works
+#define APEX_REG_ATA_INPUT_ACTV_BLOCKED     0x483f8
+
+// Top-level arbiter registers — single uint64 each (likely an enable mask
+// or status word).  beagle_csr_offsets.h:868-870.
+//
+// Hypothesis: address_translation_arbiter (0x48728) has per-channel enable
+// bits, and OUTFEED's bit is cleared so its requests bypass MMU translation
+// (skipping it produces ata.out_actv.req=0 while wra.out_actv.req still
+// counts the AXI write attempts).  Reading the value tells us whether
+// OUTFEED has its translation enabled.
+#define APEX_REG_READ_REQUEST_ARBITER       0x48718
+#define APEX_REG_WRITE_REQUEST_ARBITER      0x48720
+#define APEX_REG_ADDR_TRANSLATION_ARBITER   0x48728
+
 // ========== Status & Debug ==========
 #define APEX_REG_OMC0_D0                    0x01a0d0  // Temperature sensor
 #define APEX_REG_USER_HIB_ERROR_STATUS      0x486f0  // HIB error status (beagle_csr_offsets.h)
 #define APEX_REG_USER_HIB_ERROR_MASK        0x486f8  // HIB error mask
 #define APEX_REG_USER_HIB_FIRST_ERROR       0x48700  // HIB first error status
+#define APEX_REG_USER_HIB_FIRST_ERROR_TS    0x48708  // HIB first error timestamp
 #define APEX_REG_SCALAR_CORE_ERROR_STATUS   0x41a0   // Scalar Core error status
 #define APEX_REG_IDLEGENERATOR              0x4A000  // Idle state: 0xFFFFFFFF = all blocks idle
-#define APEX_REG_INFEED_PAGE_FAULT_ADDR     0x48738  // VA that triggered last INFEED MMU page fault
+// 0x48738 = unified page_fault_address (libedgetpu beagle_csr_offsets.h:872).
+// Captures faulting device VA for any direction (inbound INFEED read /
+// outbound OUTFEED write / param walk). Name kept as INFEED_* for legacy.
+#define APEX_REG_INFEED_PAGE_FAULT_ADDR     0x48738  // unified MMU fault VA
 
 // ========== User HIB DMA Pause (GCB 리셋 전후 DMA 일시정지 제어) ==========
 #define APEX_REG_USER_HIB_DMA_PAUSE     0x486D8  // write 1=pause, 0=unpause

@@ -4,8 +4,10 @@
 #include <fstream>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
 #include <iostream>
 #include <iomanip>
+#include <Windows.h>
 
 // FlatBuffers generated parser — official libedgetpu schema-based implementation
 // Uses executable_generated.h (v24.3.25) with flatbuffers library
@@ -456,6 +458,38 @@ inline void DumpPatchedVAs(const ApexModelFb& model) {
     std::cout << "  scratch_size_bytes: " << model.scratch_size_bytes << std::endl;
     if (model.scratch_size_bytes > 0 && va64(scratch_hi, scratch_lo) == 0)
         std::cout << "  WARNING: scratch_size > 0 but SCRATCH VA = 0" << std::endl;
+}
+
+// Dump every patch's offset and POST-patch raw value to both std::cout and
+// OutputDebugStringA so it appears in DbgView alongside kernel logs.  Useful
+// for confirming that LOWER_32BIT and UPPER_32BIT of every BASE_ADDRESS_*
+// patch were actually written and contain the expected device VA.
+inline void DumpPatchRawValues(const ApexModelFb& model, const char* tag) {
+    using namespace platforms::darwinn;
+    for (size_t pi = 0; pi < model.patches.size(); pi++) {
+        const auto& p = model.patches[pi];
+        uint32_t cur = 0;
+        if (p.offset_bit / 8 + 4 <= (int32_t)model.bitstream.size())
+            std::memcpy(&cur, model.bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+        const char* desc_name = "?";
+        switch (p.desc) {
+        case Description_BASE_ADDRESS_INPUT_ACTIVATION:  desc_name = "INPUT";   break;
+        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: desc_name = "OUTPUT";  break;
+        case Description_BASE_ADDRESS_PARAMETER:         desc_name = "PARAM";   break;
+        case Description_BASE_ADDRESS_SCRATCH:           desc_name = "SCRATCH"; break;
+        default: break;
+        }
+        const char* pos_name =
+            (p.position == Position_LOWER_32BIT) ? "LO32" :
+            (p.position == Position_UPPER_32BIT) ? "HI32" : "?";
+        char buf[256];
+        sprintf_s(buf, sizeof(buf),
+            "[%s] patch[%zu] %s.%s name='%s' off=0x%x value=0x%08x\n",
+            tag, pi, desc_name, pos_name, p.name.c_str(),
+            (unsigned)(p.offset_bit / 8), cur);
+        std::cout << buf;
+        OutputDebugStringA(buf);
+    }
 }
 
 inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,

@@ -183,6 +183,7 @@ int main()
 
     // 1. Load model using apex_model_fb.hpp
     std::cout << "Loading model..." << std::endl;
+    //apex_fb::ApexModelFb model = apex_fb::LoadModel(".\\models\\ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite");
     apex_fb::ApexModelFb model = apex_fb::LoadModel(".\\models\\ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite");
 
     if (model.bitstream.empty()) {
@@ -205,6 +206,20 @@ int main()
 
     DWORD bytesReturned = 0;
 
+    // EXTENDED VA mode — match working libedgetpu trace exactly.  All buffers
+    // (PARAM data/bitstream, INFER bitstream, INPUT, OUTPUT, SCRATCH) live in
+    // the chip's extended address space (bit 63 = 1).  The driver's
+    // ApexPageTableMap detects bit 63 and routes through the 2-level page
+    // table path (chip PTE[6144 + (VA>>21)&0x1FFF] -> 4 KB host PT page ->
+    // host PA).  Working trace VAs:
+    //   PARAM data       : 0x8000000000000000  (extended idx 0..2, 6 MB)
+    //   PARAM bitstream  : 0x8000000000840000  (idx 4, host idx 0x40)
+    //   INFER bitstream  : 0x8000000000900000  (idx 4, host idx 0x100)
+    //   INPUT            : 0x8000000000880000  (idx 4, host idx 0x80)
+    //   OUTPUT base      : 0x8000000000844000  (idx 4, host idx 0x44)
+    //   SCRATCH          : 0x8000000000848000  (idx 4, host idx 0x48)
+    static const uint64_t EXT_VA_BIT = 0x8000000000000000ULL;
+
     // PARAM device VA — INFER bitstream 도 같은 값으로 패치되어야 한다 (libedgetpu
     // MapParameters 패턴: PARAMETER_CACHING / main 양쪽 executable 이 같은 device VA 의
     // parameter buffer 를 참조함). Phase 1 가 없는 STAND_ALONE 모델에서는 0.
@@ -217,8 +232,11 @@ int main()
         useInferWithParam = true;
         std::cout << "\n--- Phase 1: Parameter Caching ---" << std::endl;
 
-        // param_va: device VA for parameters data, immediately after exe1 bitstream
-        param_va = apex_fb::PageAlignUp(model.param_bitstream.size());
+        // param_va: device VA for parameters data — extended VA base (idx 0..N).
+        // Working trace places PARAM data at 0x8000000000000000.  The PARAM
+        // bitstream goes at idx 4 (0x840000 offset within extended range) so
+        // it doesn't collide with the larger PARAM data region.
+        param_va = EXT_VA_BIT;  // 0x8000000000000000
         apex_fb::PatchParamBitstreamVAs(model, param_va);
         std::cout << "exe1 bitstream patched:" << std::endl;
         apex_fb::DumpParamPatchedVAs(model);
@@ -240,11 +258,11 @@ int main()
         std::cout << "Phase 1 buffers: bitstream=" << model.param_bitstream.size()
                   << "B  parameters=" << model.parameters.size() << "B" << std::endl;
 
-        // Map exe1 bitstream at device VA 0x0 (PTE[0..N1])
+        // Map exe1 bitstream at extended VA 0x8000000000840000 (working trace value)
         MAP_BUFFER_INPUT mapP1 = {};
         mapP1.UserAddress = (UINT64)pParamBitstreamBuf;
         mapP1.Size = model.param_bitstream.size();
-        mapP1.DeviceAddress = 0;
+        mapP1.DeviceAddress = EXT_VA_BIT | 0x840000ULL;
         bool p1Ok = DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapP1, sizeof(MAP_BUFFER_INPUT),
                                     nullptr, 0, &bytesReturned, nullptr) != 0;
         if (!p1Ok) {
@@ -255,7 +273,7 @@ int main()
             CoUninitialize();
             return 1;
         }
-        std::cout << "Phase 1: exe1 bitstream mapped at device VA 0x0" << std::endl;
+        std::cout << "Phase 1: exe1 bitstream mapped at device VA 0x" << std::hex << mapP1.DeviceAddress << std::dec << std::endl;
 
         // ===== FULL PARAMETER_CACHING MODE =====
         // PARAMETER_CACHING bitstream 을 IQ 에 제출 → 하드웨어가 weights 를 on-chip
@@ -272,6 +290,36 @@ int main()
         std::cout << (p1Ok ? "IOCTL_PARAM_CACHE succeeded! Weights cached on-chip."
                            : "IOCTL_PARAM_CACHE FAILED!") << std::endl;
         if (!p1Ok) std::cout << "  error: " << GetLastError() << std::endl;
+
+        // Map exe0 (INFER) bitstream at 0x8000000000800000 (working trace step 2: "Mapped params" 49 pages).
+        // MUST be AFTER PARAM_CACHE so that the PARAM bitstream MDL ownership transfer
+        // already happened (LockedModelMdl=NULL when this runs). exe0 stays mapped through
+        // INFER so PARAMETER_POP / parameter linking can dereference it.
+        if (p1Ok) {
+            void* pExe0BitstreamPhase1 = AllocateAlignedMemory(model.bitstream.size(), 4096);
+            if (pExe0BitstreamPhase1 != nullptr) {
+                memcpy(pExe0BitstreamPhase1, model.bitstream.data(), model.bitstream.size());
+                MAP_BUFFER_INPUT mapExe0P1 = {};
+                mapExe0P1.UserAddress = (UINT64)pExe0BitstreamPhase1;
+                mapExe0P1.Size = model.bitstream.size();
+                mapExe0P1.DeviceAddress = EXT_VA_BIT | 0x800000ULL;  // working trace value
+                bool exe0P1Ok = DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapExe0P1, sizeof(MAP_BUFFER_INPUT),
+                                                nullptr, 0, &bytesReturned, nullptr) != 0;
+                if (!exe0P1Ok) {
+                    std::cout << "Phase 1 exe0 bitstream IOCTL_MAP_BUFFER failed: " << GetLastError() << std::endl;
+                    FreeAlignedMemory(pExe0BitstreamPhase1);
+                    FreeAlignedMemory(pParametersBuf);
+                    FreeAlignedMemory(pParamBitstreamBuf);
+                    CloseHandle(handle);
+                    CoUninitialize();
+                    return 1;
+                }
+                std::cout << "Phase 1: exe0 bitstream mapped at device VA 0x" << std::hex << mapExe0P1.DeviceAddress << std::dec
+                          << " (" << model.bitstream.size() << " bytes)" << std::endl;
+            } else {
+                std::cout << "WARNING: failed to allocate exe0 Phase 1 buffer (continuing without)" << std::endl;
+            }
+        }
 
         // NOTE: Driver retains the PARAM bitstream (PTE[0..N1]) and its MDL after
         // IOCTL_PARAM_CACHE — IOCTL_INFER_WITH_PARAM re-enqueues that descriptor
@@ -290,18 +338,18 @@ int main()
         std::cout << "No parameter caching needed (STAND_ALONE model)" << std::endl;
     }
 
-    // 2. Calculate device VAs — params 영역 (PTE[3..1502], 0x3000~0x5DF000) 과 충돌 금지.
-    //    INFER bitstream 을 params 뒤로 이동: [params@0x3000] ... [bitstream@bitstream_va] [input] [output] [scratch]
+    // 2. Device VAs — extended VA mode, matching working libedgetpu trace.
+    //    All buffers live in chip extended idx 4 (2 MB region @ 0x800000) which
+    //    is well outside the PARAM data region (idx 0..2 @ 0x000000..0x600000).
     const size_t INPUT_SIZE   = model.input_layers[0].size_bytes;
-    const size_t OUTPUT_SIZE  = model.total_output_size_bytes;  // all output layers, page-aligned
+    const size_t OUTPUT_SIZE  = model.total_output_size_bytes;
     const size_t SCRATCH_SIZE = model.scratch_size_bytes;
-    // 0x600000 = 6MB, params (0x3000~0x5DEB00, ~6MB) 끝나고 충분한 여유
-    uint64_t bitstream_va = 0x600000ULL;
-    uint64_t input_va   = bitstream_va + apex_fb::PageAlignUp(model.bitstream.size());
-    uint64_t output_va  = input_va     + apex_fb::PageAlignUp(INPUT_SIZE);
-    uint64_t scratch_va = (SCRATCH_SIZE > 0)
-                          ? output_va + apex_fb::PageAlignUp(OUTPUT_SIZE)
-                          : 0;
+    uint64_t bitstream_va = EXT_VA_BIT | 0x900000ULL;   // working: 0x8000000000900000
+    uint64_t input_va     = EXT_VA_BIT | 0x880000ULL;   // working: 0x8000000000880000 (page-aligned)
+    uint64_t output_va    = EXT_VA_BIT | 0x844000ULL;   // working: 0x8000000000844000 (Squeeze1)
+    uint64_t scratch_va   = (SCRATCH_SIZE > 0)
+                            ? (EXT_VA_BIT | 0x848000ULL)
+                            : 0;
     std::cout << "Bitstream device VA: 0x" << std::hex << bitstream_va << std::dec << std::endl;
 
     std::cout << "Input device VA:   0x" << std::hex << input_va   << std::dec << std::endl;
@@ -320,6 +368,7 @@ int main()
 
     std::cout << "--- VA map (after patch) ---" << std::endl;
     apex_fb::DumpPatchedVAs(model);
+    apex_fb::DumpPatchRawValues(model, "POST-PATCH");
     std::cout << "Bitstream patched successfully" << std::endl;
 
     // 4. Allocate page-aligned buffer and copy patched bitstream
