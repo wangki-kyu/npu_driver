@@ -1441,10 +1441,25 @@ VOID npudriverEvtIoDeviceControl(
 			DbgPrint("[%s] Inference completed successfully\n", __FUNCTION__);
 		}
 
-		// Tear down the extended-VA mapping (chip PTE register clear +
-		// 2-level PT page free).  Idempotent: no-op if extended path
-		// wasn't taken.  Must happen here regardless of success/timeout.
-		ApexExtUnmapBuffer(device);
+		// Tear down ONLY the INFER-scoped mappings (INPUT + OUTPUT).
+		// We must NOT call ApexExtUnmapBuffer here — that frees ALL extended
+		// subtables, including the one shared with cached PARAM data and the
+		// PARAM bitstream.  Wiping those leaves the chip PTE pointing at a
+		// freed host PT page on the next INFER → MMU walk fault or, worse,
+		// stale-PFN walk into reclaimed kernel memory.
+		// ApexPageTableUnmap zeroes only the requested VA range's entries
+		// (extended: 2-level PT entries; simple: chip PTE registers) so cached
+		// PARAM mappings stay intact.
+		if (pDevContext->InferInputDeviceVA != 0 && pDevContext->InferInputSize != 0) {
+			ApexPageTableUnmap(device,
+				pDevContext->InferInputDeviceVA,
+				(SIZE_T)pDevContext->InferInputSize);
+		}
+		if (pDevContext->InferOutputDeviceVA != 0 && pDevContext->InferOutputSize != 0) {
+			ApexPageTableUnmap(device,
+				pDevContext->InferOutputDeviceVA,
+				(SIZE_T)pDevContext->InferOutputSize);
+		}
 
 		// Free the < 4 GB output bounce buffer.  DPC already memcpy'd
 		// bounce -> user buffer before unlocking the output MDL, so no
@@ -1499,40 +1514,39 @@ VOID npudriverEvtIoDeviceControl(
 		DbgPrint("[PARAM_CACHE] ParamAddr=0x%llx Size=0x%llx DeviceVA=0x%llx BitstreamSize=0x%llx\n",
 			pInput->ParamAddr, pInput->ParamSize, pInput->ParamDeviceVA, pInput->BitstreamSize);
 
-		// 0. Release previously cached PARAM data (re-cache).  In extended VA mode
-		// the entire ExtSubtables pool gets nuked at the same time as a release;
-		// in simple VA mode we walk PTE entries.  We can't easily distinguish
-		// here so just unlock the MDL — extended chip PTE/subtable cleanup
-		// happens in ApexExtUnmapBuffer at file cleanup time, and simple PTE
-		// reuse will overwrite stale entries on the new MAP.
+		// 0. Release previously cached PARAM data (re-cache).
+		// MUST clear chip PTE / 2-level PT entries before unlocking the MDL —
+		// otherwise the chip walks stale PFNs into pages the OS has already
+		// reclaimed, corrupting kernel memory on the next inference (BSOD).
+		// ApexPageTableUnmap dispatches on bit63 to handle extended/simple.
 		if (pDevContext->CachedParamMdl != NULL) {
-			DbgPrint("[PARAM_CACHE] Releasing previously cached params: PTE[%u..%u]\n",
-				pDevContext->CachedParamPteIdx,
-				pDevContext->CachedParamPteIdx + pDevContext->CachedParamPageCount - 1);
+			SIZE_T sz = (SIZE_T)pDevContext->CachedParamPageCount << PAGE_SHIFT;
+			DbgPrint("[PARAM_CACHE] Releasing previously cached params: VA=0x%llx (%u pages)\n",
+				pDevContext->CachedParamDeviceVA, pDevContext->CachedParamPageCount);
+			ApexPageTableUnmap(device, pDevContext->CachedParamDeviceVA, sz);
 			MmUnlockPages(pDevContext->CachedParamMdl);
 			IoFreeMdl(pDevContext->CachedParamMdl);
 			pDevContext->CachedParamMdl = NULL;
+			pDevContext->CachedParamDeviceVA = 0;
 			pDevContext->CachedParamPteIdx = 0;
 			pDevContext->CachedParamPageCount = 0;
 		}
 
-		// 0b. Release previously cached PARAM bitstream too.
+		// 0b. Release previously cached PARAM bitstream too — same reason.
 		if (pDevContext->CachedParamBitstreamMdl != NULL) {
-			DbgPrint("[PARAM_CACHE] Releasing previously cached bitstream\n");
+			SIZE_T sz = (SIZE_T)pDevContext->CachedParamBitstreamPageCount << PAGE_SHIFT;
+			DbgPrint("[PARAM_CACHE] Releasing previously cached bitstream: VA=0x%llx (%u pages)\n",
+				pDevContext->CachedParamBitstreamDeviceVA,
+				pDevContext->CachedParamBitstreamPageCount);
+			ApexPageTableUnmap(device, pDevContext->CachedParamBitstreamDeviceVA, sz);
 			MmUnlockPages(pDevContext->CachedParamBitstreamMdl);
 			IoFreeMdl(pDevContext->CachedParamBitstreamMdl);
 			pDevContext->CachedParamBitstreamMdl = NULL;
+			pDevContext->CachedParamBitstreamDeviceVA = 0;
 			pDevContext->CachedParamBitstreamSize = 0;
 			pDevContext->CachedParamBitstreamPteIdx = 0;
 			pDevContext->CachedParamBitstreamPageCount = 0;
 		}
-
-		// NOTE: do NOT call ApexExtUnmapBuffer here.  PARAM bitstream was just
-		// extended-mapped by the IOCTL_MAP_BUFFER preceding this call (e.g. at
-		// chipPTE[6148] hostIdx 64..66 for VA 0x8000000000840000) and nuking it
-		// here would leave that VA unbacked when INFER later submits the
-		// bitstream descriptor → chip MMU extended_page_fault on the bitstream
-		// fetch.  The subtable pool is freed at file cleanup time instead.
 
 		// 1. Lock parameter pages (hardware DMA reads them for PARAMETER_POP)
 		paramMdl = IoAllocateMdl((PVOID)pInput->ParamAddr, (ULONG)pInput->ParamSize, FALSE, FALSE, NULL);
@@ -1603,11 +1617,12 @@ VOID npudriverEvtIoDeviceControl(
 		//    않아야 하며 (driver 가 cleanup 까지 유지), driver 가 LockedModelMdl=NULL
 		//    로 만들어 다음 IOCTL_UNMAP_BUFFER 가 잘못 unlock 하는 것도 방지.
 		if (NT_SUCCESS(status)) {
-			pDevContext->CachedParamMdl       = paramMdl;
-			pDevContext->CachedParamPteIdx    = pteIdx;
-			pDevContext->CachedParamPageCount = pageCount;
-			DbgPrint("[PARAM_CACHE] Cached params retained: PTE[%u..%u] (%u pages, MDL=%p)\n",
-				pteIdx, pteIdx + pageCount - 1, pageCount, paramMdl);
+			pDevContext->CachedParamMdl        = paramMdl;
+			pDevContext->CachedParamDeviceVA   = pInput->ParamDeviceVA;
+			pDevContext->CachedParamPteIdx     = pteIdx;
+			pDevContext->CachedParamPageCount  = pageCount;
+			DbgPrint("[PARAM_CACHE] Cached params retained: VA=0x%llx PTE[%u..%u] (%u pages, MDL=%p)\n",
+				pInput->ParamDeviceVA, pteIdx, pteIdx + pageCount - 1, pageCount, paramMdl);
 
 			// Transfer PARAM bitstream MDL ownership from LockedModelMdl to
 			// CachedParamBitstreamMdl. The PARAM bitstream's device VA was

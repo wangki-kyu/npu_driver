@@ -68,6 +68,7 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 
 		// Cached parameter MDL (IOCTL_PARAM_CACHE 가 채움)
 		deviceContext->CachedParamMdl = NULL;
+		deviceContext->CachedParamDeviceVA = 0;
 		deviceContext->CachedParamPteIdx = 0;
 		deviceContext->CachedParamPageCount = 0;
 
@@ -1152,51 +1153,38 @@ npudriverEvtFileCleanup(
 		deviceContext->InferScratchMdl = NULL;
 	}
 
-	// Cleanup cached parameters (kept mapped throughout file handle lifetime)
+	// Cleanup cached parameters (kept mapped throughout file handle lifetime).
+	// ApexPageTableUnmap dispatches on the VA's bit63: extended → zero the
+	// host-side 2-level PT entries; simple → zero chip PTE registers directly.
+	// Without this the chip retains stale PFNs that point into pages we are
+	// about to unlock, which corrupts kernel memory on the next chip access.
 	if (deviceContext->CachedParamMdl != NULL) {
-		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		UINT32 i;
-		DbgPrint("[%s] Releasing cached parameters: PTE[%u..%u] (%u pages)\n",
+		SIZE_T sz = (SIZE_T)deviceContext->CachedParamPageCount << PAGE_SHIFT;
+		DbgPrint("[%s] Releasing cached parameters: VA=0x%llx (%u pages)\n",
 			__FUNCTION__,
-			deviceContext->CachedParamPteIdx,
-			deviceContext->CachedParamPteIdx + deviceContext->CachedParamPageCount - 1,
+			deviceContext->CachedParamDeviceVA,
 			deviceContext->CachedParamPageCount);
 
-		if (bar2 != NULL) {
-			WdfSpinLockAcquire(deviceContext->PageTableLock);
-			for (i = 0; i < deviceContext->CachedParamPageCount; i++) {
-				apex_write_register(bar2,
-					APEX_REG_PAGE_TABLE + ((deviceContext->CachedParamPteIdx + i) * 8), 0);
-			}
-			WdfSpinLockRelease(deviceContext->PageTableLock);
-		}
+		ApexPageTableUnmap(device, deviceContext->CachedParamDeviceVA, sz);
 
 		MmUnlockPages(deviceContext->CachedParamMdl);
 		IoFreeMdl(deviceContext->CachedParamMdl);
 		deviceContext->CachedParamMdl = NULL;
+		deviceContext->CachedParamDeviceVA = 0;
 		deviceContext->CachedParamPteIdx = 0;
 		deviceContext->CachedParamPageCount = 0;
 	}
 
-	// Cleanup cached PARAM bitstream (kept mapped for IOCTL_INFER_WITH_PARAM)
+	// Cleanup cached PARAM bitstream (kept mapped for IOCTL_INFER_WITH_PARAM).
 	if (deviceContext->CachedParamBitstreamMdl != NULL) {
-		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		UINT32 i;
-		DbgPrint("[%s] Releasing cached PARAM bitstream: PTE[%u..%u] (%u pages, MDL=%p)\n",
+		SIZE_T sz = (SIZE_T)deviceContext->CachedParamBitstreamPageCount << PAGE_SHIFT;
+		DbgPrint("[%s] Releasing cached PARAM bitstream: VA=0x%llx (%u pages, MDL=%p)\n",
 			__FUNCTION__,
-			deviceContext->CachedParamBitstreamPteIdx,
-			deviceContext->CachedParamBitstreamPteIdx + deviceContext->CachedParamBitstreamPageCount - 1,
+			deviceContext->CachedParamBitstreamDeviceVA,
 			deviceContext->CachedParamBitstreamPageCount,
 			deviceContext->CachedParamBitstreamMdl);
 
-		if (bar2 != NULL) {
-			WdfSpinLockAcquire(deviceContext->PageTableLock);
-			for (i = 0; i < deviceContext->CachedParamBitstreamPageCount; i++) {
-				apex_write_register(bar2,
-					APEX_REG_PAGE_TABLE + ((deviceContext->CachedParamBitstreamPteIdx + i) * 8), 0);
-			}
-			WdfSpinLockRelease(deviceContext->PageTableLock);
-		}
+		ApexPageTableUnmap(device, deviceContext->CachedParamBitstreamDeviceVA, sz);
 
 		MmUnlockPages(deviceContext->CachedParamBitstreamMdl);
 		IoFreeMdl(deviceContext->CachedParamBitstreamMdl);

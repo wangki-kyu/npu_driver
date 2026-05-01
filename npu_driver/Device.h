@@ -70,7 +70,8 @@ typedef struct _DEVICE_CONTEXT
 	// libedgetpu MapParameters() 패턴: 모든 executable 의 파라미터는 driver lifetime 동안
 	// 매핑 유지. INFER bitstream 의 BASE_ADDRESS_PARAMETER 패치가 같은 VA 를 참조함.
 	PMDL    CachedParamMdl;              // MDL for locked param pages (NULL = none)
-	UINT32  CachedParamPteIdx;           // First PTE index for params
+	UINT64  CachedParamDeviceVA;         // device VA the params were mapped at (extended or simple)
+	UINT32  CachedParamPteIdx;           // First PTE index for params (simple-VA mode only)
 	UINT32  CachedParamPageCount;        // Number of param pages
 
 	// Cached PARAM_CACHE bitstream — kept mapped so IOCTL_INFER_WITH_PARAM can
