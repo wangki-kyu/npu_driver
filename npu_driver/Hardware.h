@@ -168,6 +168,11 @@
 
 // ========== SC_HOST Interrupt Control ==========
 #define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 0xF = enable all 4 SC_HOST completion interrupts (kNumInterrupts=4)
+// SC_HOST_INT_STATUS — libedgetpu writes 0xE here every SC_HOST IRQ (bits 1..3 W1C,
+// bit 0 left for SC_HOST_INT_COUNT to latch). Without this ack the next SC_HOST_0
+// edge does NOT fire, so request[1] (INFER) never delivers its SC_HOST IRQ.
+#define APEX_REG_SC_HOST_INT_STATUS         0x486a8
+#define APEX_REG_SC_HOST_INT_COUNT          0x486d0  // monotonic count of SC_HOST IRQs
 #define APEX_REG_TOP_LEVEL_INT_CONTROL      0x486b0  // write 0xF = enable top-level aggregator interrupts
 #define APEX_REG_FATAL_ERR_INT_CONTROL      0x486c0  // write 1 = enable fatal-error interrupt
 #define APEX_REG_DMA_BURST_LIMITER          0x487a8  // axi DMA burst limiter (write 0 explicitly)

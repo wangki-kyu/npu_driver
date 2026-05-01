@@ -103,6 +103,18 @@ typedef struct _DEVICE_CONTEXT
 	// APEX_WIRE_BIT_FATAL_ERR (bit 12 = 0x1000) is HIB fatal error.
 	volatile LONG IsrSeenPendingBits;
 
+	// libedgetpu-style INFER 완료 판정.
+	// 0x486d0 (SC_HOST_INT_COUNT) 는 chip 이 SCALAR host_interrupt 0 opcode 를
+	// 실행할 때마다 누적 증가. INFER bitstream 끝의 host_interrupt 0 = OUTFEED
+	// drain barrier 뒤. 따라서 `count delta == expected` 가 진짜 INFER 완료.
+	//   IOCTL_INFER          → expected = 1 (INFER bitstream 1 개)
+	//   IOCTL_INFER_WITH_PARAM → expected = 2 (PARAM bitstream + INFER bitstream)
+	// IQ_COMPLETED_HEAD / SC_HOST_0 비트만 보면 PARAM fetch/완료가 INFER 완료로
+	// 오해됨 (OUTFEED 가 아직 시작도 안 했는데 unlock 하는 버그).
+	UINT64 PreInferScHostIntCount;       // submit 직전에 저장한 count baseline
+	UINT32 ExpectedScHostIncrement;      // 1 (INFER) / 2 (INFER_WITH_PARAM)
+	volatile UINT64 LatestScHostIntCount;// ISR 가 매 SC_HOST IRQ 에서 read 해서 갱신
+
 	// Input image XOR-fold checksum computed at pre-submit time. Compared
 	// against post-DONE recomputation to detect chip stray writes into
 	// input region (chip should ONLY read from input, never write).

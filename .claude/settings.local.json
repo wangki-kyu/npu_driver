@@ -8,7 +8,9 @@
       "Bash(cygpath -w /tmp/beagle_top_level_interrupt_manager.cc)",
       "Bash(gh api *)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(grep -inE \"mov\\\\s+.*,\\\\s*[0-9a-f]{4,5}h\" E:/work/project/coral.sys.lst)",
+      "Bash(grep -inE \"mov\\\\s+.*,\\\\s*[0-9a-f]{5,6}h\" E:/work/project/coral.sys.lst)"
     ]
   }
 }

@@ -317,6 +317,18 @@ VOID npudriverEvtIoDeviceControl(
 		// Reset cumulative ISR pending-bit log for this inference.
 		pDevContext->IsrSeenPendingBits = 0;
 		pDevContext->LastIsrWirePending = 0;
+
+		// libedgetpu-style 완료 판정 baseline (mmio_driver.cc:171-189 패턴).
+		// submit 직전에 sc_host_int_count read → DPC 가 delta == expected 일 때만
+		// 진짜 완료로 판정. PARAM SC_HOST_0 와 INFER SC_HOST_0 를 구분하기 위함.
+		pDevContext->PreInferScHostIntCount = apex_read_register(bar2,
+			APEX_REG_SC_HOST_INT_COUNT);
+		pDevContext->LatestScHostIntCount   = pDevContext->PreInferScHostIntCount;
+		pDevContext->ExpectedScHostIncrement = withParam ? 2u : 1u;
+		DbgPrint("[INFER] sc_host_int_count baseline=%llu expected_delta=%u\n",
+			pDevContext->PreInferScHostIntCount,
+			pDevContext->ExpectedScHostIncrement);
+
 		KeClearEvent(&pDevContext->InferCompleteEvent);
 
 		// 4. Register input image pages in page table
@@ -443,11 +455,9 @@ VOID npudriverEvtIoDeviceControl(
 			WdfSpinLockAcquire(pDevContext->PageTableLock);
 			for (i = 0; i < pageCount; i++) {
 				UINT64 physAddr = ((UINT64)pfnArray[i] << PAGE_SHIFT);
-				// EXPERIMENT: drop |1 valid-bit ONLY for OUTPUT PTEs.  Hypothesis:
-				// the LSB might be a "read-allowed" flag and chip refuses to write
-				// to a PTE marked read-only.  All other PTEs (DescRing, SB, Input,
-				// Param, etc.) keep |1 since they need to be readable.
-				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr);
+				// libedgetpu/gasket: every PTE entry written as `pa | GASKET_VALID_SLOT_FLAG (=1)`.
+				// OUTPUT PTE 도 valid bit 켜야 chip MMU 가 outbound write 를 허가함.
+				apex_write_register(bar2, APEX_REG_PAGE_TABLE + ((pteIdx + i) * 8), physAddr | 1);
 			}
 			WdfSpinLockRelease(pDevContext->PageTableLock);
 
@@ -636,23 +646,42 @@ VOID npudriverEvtIoDeviceControl(
 			HOST_QUEUE_DESC *ring = (HOST_QUEUE_DESC *)pDevContext->DescRingBase;
 
 			if (withParam) {
+				// libedgetpu trace 패턴: PARAM 먼저 TAIL=1 로 enqueue, 그 IRQ 처리
+				// 후 (or in parallel scheduling) INFER 를 TAIL=2 로 enqueue.
+				// chip 내부적으로 PARAM SC_HOST_INT_STATUS W1C ack 가 다음 SC_HOST_0
+				// edge 를 가능하게 만드는 구조 — 한 번에 TAIL=2 던지면 두 번째 SC_HOST
+				// edge 가 안 뜸. 우리도 같은 순서로 분할 submit.
 				UINT32 slotP = pDevContext->DescRingTail % 256;
 				ring[slotP].address       = pDevContext->CachedParamBitstreamDeviceVA;
 				ring[slotP].size_in_bytes = pDevContext->CachedParamBitstreamSize;
 				ring[slotP].reserved      = 0;
+				KeMemoryBarrier();
 
-				UINT32 slotI = (pDevContext->DescRingTail + 1) % 256;
+				pDevContext->DescRingTail += 1;
+				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
+				DbgPrint("[INFER_WITH_PARAM] PARAM slot=%u VA=0x%llx size=0x%x | TAIL=%u (1st submit)\n",
+					slotP, ring[slotP].address, ring[slotP].size_in_bytes,
+					pDevContext->DescRingTail);
+
+				// Wait briefly for PARAM IQ_INT to fire.  ISR will W1C-ack it.
+				// 50us is plenty — IQ fetch is microseconds; we're just sequencing
+				// the TAIL writes so chip sees them as separate transactions.
+				{
+					LARGE_INTEGER d; d.QuadPart = -500LL; // 50us
+					KeDelayExecutionThread(KernelMode, FALSE, &d);
+				}
+
+				UINT32 slotI = pDevContext->DescRingTail % 256;
 				ring[slotI].address       = pInput->BitstreamDeviceVA;
 				ring[slotI].size_in_bytes = (UINT32)pInput->BitstreamSize;
 				ring[slotI].reserved      = 0;
 				KeMemoryBarrier();
 
-				pDevContext->DescRingTail += 2;
+				pDevContext->DescRingTail += 1;
 				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDevContext->DescRingTail);
 
 				UINT64 completed_head = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-				DbgPrint("[INFER_WITH_PARAM] PARAM slot=%u VA=0x%llx size=0x%x | INFER slot=%u VA=0x%llx size=0x%x | TAIL=%u Completed=%llu\n",
-					slotP, ring[slotP].address, ring[slotP].size_in_bytes,
+				DbgPrint("[INFER_WITH_PARAM] INFER  slot=%u VA=0x%llx size=0x%x | TAIL=%u Completed=%llu (2nd submit)\n",
 					slotI, ring[slotI].address, ring[slotI].size_in_bytes,
 					pDevContext->DescRingTail, completed_head);
 			} else {

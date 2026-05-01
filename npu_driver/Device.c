@@ -413,8 +413,11 @@ npudriverEvtDevicePrepareHardware(
 	// too short to trigger auto-idle, but our two-IOCTL flow has a real gap.
 	{
 		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x00000001ULL);
-		DbgPrint("[%s] IdleRegister → 0x1 (enabled, counter=1)\n", __FUNCTION__);
+		// disable_idle=1 (bit31): two-IOCTL flow (PARAM_CACHE / INFER 분리) 에서
+		// 사이 gap 동안 engines 가 자동으로 kHalted 진입하면 RUN_CONTROL re-write
+		// 거부됨. baseline (46d6e07) 처럼 disable_idle 켜서 자동 idle 차단.
+		apex_write_register(bar2, APEX_REG_IDLEGENERATOR, 0x80000001ULL);
+		DbgPrint("[%s] IdleRegister → 0x80000001 (disable_idle=1, counter=1)\n", __FUNCTION__);
 
 		// Re-write HIB MMU config after GCB reset — these registers may have been
 		// cleared by the reset even though they were written in ApexPageTableInit().
@@ -878,10 +881,19 @@ npudriverEvtDevicePrepareHardware(
 		DbgPrint("[BAR0] NOT MAPPED — Windows did not expose BAR0 as a memory resource\n");
 	}
 
-	// HIB credits at end-of-PrepareHardware — these registers are R/O status
-	// counters maintained by the chip; we keep the dump for diagnostics only.
+	// HIB credits explicit init (baseline 46d6e07 동작).
+	// POR 에서 OUTPUT credits 가 0 으로 남으면 OUTFEED → host 방향 outbound DMA 가
+	// gating 됨. instr/input/param 은 POR 에서 nonzero 로 관찰되지만 OUTPUT 만
+	// 0 — 우리 환경에서만 그런 것일 가능성 (libedgetpu/gasket 의 host POR 은 아닌 듯).
+	// 4 개를 명시적으로 같은 패밀리 값으로 통일.
 	{
 		PVOID b2 = deviceContext->Bar2BaseAddress;
+		apex_write_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS,  0x00000800);
+		apex_write_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS,   0x00000800);
+		apex_write_register_32(b2, APEX_REG_HIB_PARAM_CREDITS,        0x00001000);
+		apex_write_register_32(b2, APEX_REG_HIB_OUTPUT_ACTV_CREDITS,  0x00000800);
+		DbgPrint("[CREDITS-FIX] wrote instr=0x800 input=0x800 param=0x1000 output=0x800\n");
+
 		UINT32 c0 = apex_read_register_32(b2, APEX_REG_HIB_INSTRUCTION_CREDITS);
 		UINT32 c1 = apex_read_register_32(b2, APEX_REG_HIB_INPUT_ACTV_CREDITS);
 		UINT32 c2 = apex_read_register_32(b2, APEX_REG_HIB_PARAM_CREDITS);
@@ -1231,6 +1243,18 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 		apex_write_register(pDevContext->Bar2BaseAddress,
 			APEX_REG_INSTR_QUEUE_INT_STATUS, iqIntStatus);
 	}
+
+	// libedgetpu mmio_driver.cc:174-188 패턴:
+	//   1) ClearInterruptStatus 먼저 — race 방지 (ack 가 count read 보다 먼저
+	//      와야 chip 이 동시에 count 증가시켜도 다음 IRQ 를 놓치지 않음).
+	//   2) sc_host_int_count read → DPC 가 baseline 과 비교할 latest 갱신.
+	if (pending & APEX_WIRE_BITS_SC_HOST_ANY) {
+		apex_write_register(pDevContext->Bar2BaseAddress,
+			APEX_REG_SC_HOST_INT_STATUS, 0xE);
+		pDevContext->LatestScHostIntCount = apex_read_register(
+			pDevContext->Bar2BaseAddress, APEX_REG_SC_HOST_INT_COUNT);
+	}
+
 	apex_write_register(pDevContext->Bar2BaseAddress,
 					   APEX_REG_WIRE_INT_PENDING, pending);
 
@@ -1372,31 +1396,25 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 		DbgPrint("[DPC] FATAL_ERR observed in WIRE_INT_PENDING (bit 0x1000) — see USER_HIB_ERROR\n");
 	}
 
-	// PREMATURE-DPC GATE.
-	// Two ways to recognize "INFER done":
-	//   (1) SCALAR_RUN_STATUS == kIdle(0) or kHalted(4) — the chip's view.
-	//   (2) APEX_WIRE_BIT_SC_HOST_0 (0x10) seen in any ISR for this INFER
-	//       — SCALAR has executed the bitstream's host_interrupt 0 opcode,
-	//         which the Edge TPU compiler places AFTER the OUTFEED drain
-	//         barrier.  Once SC_HOST_0 fires, we trust the compiler promise
-	//         that all OUTFEED writes are done, even if SCALAR_RUN_STATUS
-	//         shows a brief kRun snapshot due to HW pipeline latency.
-	//
-	// Without (2), if ISR fires once with pending=0x11 (IQ_INT + SC_HOST_0)
-	// while SCALAR still shows kRun for a few ms, DPC defers — but no fresh
-	// interrupt comes (level bits already W1C-acked) and we fall back to
-	// the 50ms polling timeout.  Adding (2) lets us complete via the
-	// interrupt path immediately, saving ~45ms per INFER.
-	BOOLEAN scHostSeen = (pDevContext->IsrSeenPendingBits & APEX_WIRE_BIT_SC_HOST_0) != 0;
-	BOOLEAN scalarTerminal = (scStat == 0 || scStat == 4);
-	if (bar2 != NULL && !scalarTerminal && !scHostSeen) {
-		DbgPrint("[DPC] PREMATURE: SCALAR=0x%x OUTFEED=0x%x SeenPending=0x%x — deferring unlock until next interrupt\n",
-			scStat, outStat, pDevContext->IsrSeenPendingBits);
+	// libedgetpu-style 진짜 완료 판정: sc_host_int_count delta 가 expected 도달.
+	//   IQ_COMPLETED_HEAD == TAIL 은 descriptor fetch 신호일 뿐 (OUTFEED 미완)
+	//   SC_HOST_0 비트 한 번 == PARAM 의 완료 신호일 수도 있음
+	//   sc_host_int_count delta 만이 SCALAR host_interrupt 0 = OUTFEED drain
+	//   barrier 뒤 실행됐음을 보장 (libedgetpu 컴파일러 promise).
+	UINT64 latestCount = pDevContext->LatestScHostIntCount;
+	UINT64 baseline    = pDevContext->PreInferScHostIntCount;
+	UINT32 expected    = pDevContext->ExpectedScHostIncrement;
+	UINT64 delta       = latestCount - baseline;  // unsigned wrap 안전
+	BOOLEAN inferDone  = (expected > 0) && (delta >= expected);
+	BOOLEAN fatalErr   = (pDevContext->IsrSeenPendingBits & APEX_WIRE_BIT_FATAL_ERR) != 0;
+
+	DbgPrint("[DPC-COMPLETE] count delta=%llu/%u baseline=%llu latest=%llu fatal=%d SCALAR=0x%x OUTFEED=0x%x\n",
+		delta, expected, baseline, latestCount, fatalErr, scStat, outStat);
+
+	if (!inferDone && !fatalErr) {
+		DbgPrint("[DPC] PREMATURE: count delta=%llu < expected=%u — defer\n",
+			delta, expected);
 		return; // keep MDLs locked, keep event unsignaled
-	}
-	if (!scalarTerminal && scHostSeen) {
-		DbgPrint("[DPC] SC_HOST_0 seen (SeenPending=0x%x) — completing despite SCALAR=0x%x (compiler-promised done)\n",
-			pDevContext->IsrSeenPendingBits, scStat);
 	}
 
 	if (pDevContext->InferOutputMdl != NULL && bar2 != NULL) {
