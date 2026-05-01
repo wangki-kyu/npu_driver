@@ -21,24 +21,24 @@ NTSTATUS ApexPageTableUnmap(
 VOID ApexPageTableCleanup(_In_ WDFDEVICE Device);
 
 // =========================================================================
-// Extended-VA mapping helpers.
+// Extended-VA mapping helpers — coral.sys-style bulk pool.
 //
-// When a buffer's device VA has bit 63 set (extended), the chip MMU walker
-// expects the PTE register at index (6144 + ((VA>>21)&0x1FFF)) to hold the
-// PA of a 4 KB second-level page table (host-resident, 512 entries × 8 B).
-// Each entry in that 2-level PT covers one 4 KB data page.
+// At ApexPageTableInit we allocate ONE 8 MB pool (2048 × 4 KB) covering all
+// extended subtables, and pre-program every chip PTE register [6144..8191]
+// to point at the corresponding 4 KB sub-region (valid bit set).  The pool
+// is zeroed, so every extended slot is a valid (all-entries-zero) 2-level
+// PT from the moment the chip starts walking.
 //
 // ApexExtMapBuffer:
 //   - ExtDeviceVA must have bit 63 set, page-aligned
-//   - Up to 512 pages × 4 KB = 2 MB per extended region (per chip PTE entry).
-//     Caller responsible for staying within one region (single chip PTE).
-//   - Pfns is an array of host PFNs (page frame numbers, PA >> 12).
-//   - Returns STATUS_SUCCESS and stores state in DEVICE_CONTEXT
-//     (ExtSecondLevelKva, ExtSecondLevelPa, ExtChipPteIdx, ExtMappingActive).
+//   - Pfns is an array of host PFNs (PA >> 12).
+//   - Writes per-page entries into the pre-allocated pool — no alloc.
+//   - Crosses 2 MB region boundaries automatically (recurses).
 //
 // ApexExtUnmapBuffer:
-//   - Clears the chip PTE register and frees the second-level PT page.
-//   - Idempotent: returns immediately if ExtMappingActive == FALSE.
+//   - Kept as a no-op alias for backward compatibility.  Pool lives for the
+//     device handle lifetime; per-buffer entry zeroing is handled by
+//     ApexPageTableUnmap.
 // =========================================================================
 NTSTATUS ApexExtMapBuffer(
     _In_ WDFDEVICE Device,

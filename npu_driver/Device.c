@@ -54,11 +54,10 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 		deviceContext->InferInputMdl = NULL;
 		deviceContext->InferOutputMdl = NULL;
 
-		// Extended-VA second-level page table state — inactive on boot.
-		deviceContext->ExtSecondLevelKva = NULL;
-		deviceContext->ExtSecondLevelPa  = 0;
-		deviceContext->ExtChipPteIdx     = 0;
-		deviceContext->ExtMappingActive  = FALSE;
+		// Extended-VA bulk pool — allocated in ApexPageTableInit.
+		deviceContext->ExtPoolKva  = NULL;
+		deviceContext->ExtPoolPa   = 0;
+		deviceContext->ExtPoolSize = 0;
 
 		// Output bounce buffer state — inactive on boot.
 		deviceContext->OutputBounceKva    = NULL;
@@ -406,6 +405,22 @@ npudriverEvtDevicePrepareHardware(
 		apex_write_register(bar2, APEX_REG_EXTENDED_TABLE, 6144);
 		DbgPrint("[%s] PAGE_TABLE_SIZE=%u EXTENDED_TABLE=6144 re-written after GCB reset\n",
 			__FUNCTION__, APEX_PAGE_TABLE_ENTRIES);
+
+		// Re-pre-fill extended chip PTE registers [6144..8191] so every
+		// extended slot points at its 4 KB sub-region of the bulk pool with
+		// valid bit set.  GCB reset wipes these registers even though our
+		// host-side pool memory survives.
+		if (deviceContext->ExtPoolKva != NULL && deviceContext->ExtPoolPa != 0) {
+			UINT32 i;
+			for (i = 0; i < 2048u; i++) {
+				UINT64 subPa = deviceContext->ExtPoolPa + ((UINT64)i << PAGE_SHIFT);
+				apex_write_register(bar2,
+					APEX_REG_PAGE_TABLE + ((6144u + i) * 8),
+					subPa | 0x1ULL);
+			}
+			DbgPrint("[%s] Extended chip PTE [6144..8191] re-pointed at bulk pool (PA=0x%llx)\n",
+				__FUNCTION__, deviceContext->ExtPoolPa);
+		}
 	}
 
 	// =====================================================================
@@ -1515,17 +1530,19 @@ VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject
 					(readPaNoF == expectPA) ? "OK" : "MISMATCH");
 			}
 		} else {
-			UINT32 chipPteIdx     = 6144u + (UINT32)((outVA >> 21) & 0x1FFF);
+			UINT32 subtableIdx    = (UINT32)((outVA >> 21) & 0x1FFF);
+			UINT32 chipPteIdx     = 6144u + subtableIdx;
 			UINT32 hostTableStart = (UINT32)((outVA >> 12) & 0x1FF);
 			UINT64 chipReg = apex_read_register(bar2, APEX_REG_PAGE_TABLE + (chipPteIdx * 8));
-			UINT64 expectPa = pDevContext->ExtSecondLevelPa;
-			DbgPrint("[DPC-PTE] EXT chip PTE[%u] = 0x%llx (expected 2-level PT PA = 0x%llx | 0x1) %s\n",
+			UINT64 expectPa = pDevContext->ExtPoolPa + ((UINT64)subtableIdx << PAGE_SHIFT);
+			DbgPrint("[DPC-PTE] EXT chip PTE[%u] = 0x%llx (expected pool sub-region PA = 0x%llx | 0x1) %s\n",
 				chipPteIdx, chipReg, expectPa,
 				((chipReg & ~1ULL) == expectPa) ? "OK" : "MISMATCH");
 
 			// Dump the host-resident 2-level PT entries we wrote.
-			if (pDevContext->ExtSecondLevelKva != NULL) {
-				UINT64* slot = (UINT64*)pDevContext->ExtSecondLevelKva;
+			if (pDevContext->ExtPoolKva != NULL) {
+				UINT64* slot = (UINT64*)((PUCHAR)pDevContext->ExtPoolKva +
+				                         ((SIZE_T)subtableIdx << PAGE_SHIFT));
 				UINT32 vc = (pageCnt < 4) ? pageCnt : 4;
 				UINT32 ii;
 				for (ii = 0; ii < vc; ii++) {

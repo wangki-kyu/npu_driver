@@ -79,16 +79,67 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
         6144
     );
 
-    // Zero-fill the entire hardware PTE array in BAR2 (0x50000 ~ 0x5FFFF, 8192 * 8 bytes).
-    // Previous driver session may have left dirty PTEs with valid bit=1,
-    // which causes inbound_page_fault when hardware walks unmapped VAs.
+    // Zero-fill simple-VA chip PTE registers [0..6143].  Extended-VA registers
+    // [6144..8191] are programmed below to point at the bulk pool.
     {
         UINT32 j;
-        for (j = 0; j < APEX_PAGE_TABLE_ENTRIES; j++) {
+        for (j = 0; j < APEX_EXTENDED_TABLE_BASE_INDEX; j++) {
             apex_write_register(pDevContext->Bar2BaseAddress,
                                 APEX_REG_PAGE_TABLE + (j * 8), 0);
         }
-        DbgPrint("[%s] Hardware PTE array cleared (8192 entries)\n", __FUNCTION__);
+        DbgPrint("[%s] Simple chip PTE registers [0..%u] cleared\n",
+            __FUNCTION__, APEX_EXTENDED_TABLE_BASE_INDEX - 1);
+    }
+
+    // === coral.sys-style extended-VA bulk pool ===========================
+    // One contiguous 8 MB block (= 2048 × 4 KB) covering every extended
+    // subtable.  < 4 GB so chip's inbound MMU walk reach the PT page.
+    // NonCached so chip writes are immediately visible to CPU and vice versa
+    // without needing explicit flush/invalidate.
+    //
+    // After zero-fill, every chip PTE register [6144..8191] is programmed to
+    // point at its corresponding 4 KB sub-region with valid bit set.  This
+    // means even unmapped extended VAs walk into a valid (all-entries-zero)
+    // 2-level PT page rather than a chip PTE register that reads 0 — which
+    // closes the door on speculative MMU walks landing on invalid registers.
+    {
+        PHYSICAL_ADDRESS lowAddr, highAddr, noBoundary;
+        PHYSICAL_ADDRESS poolPa;
+        UINT32 i;
+
+        lowAddr.QuadPart    = 0;
+        highAddr.QuadPart   = 0xFFFFFFFFLL;     // < 4 GB
+        noBoundary.QuadPart = 0;
+
+        pDevContext->ExtPoolKva = MmAllocateContiguousMemorySpecifyCache(
+            APEX_EXT_POOL_BYTES, lowAddr, highAddr, noBoundary, MmNonCached);
+        if (pDevContext->ExtPoolKva == NULL) {
+            DbgPrint("[%s] Failed to allocate %u-byte extended PT pool < 4 GB\n",
+                __FUNCTION__, APEX_EXT_POOL_BYTES);
+            ExFreePoolWithTag(pDevContext->PageTableBase, 'PTBL');
+            pDevContext->PageTableBase = NULL;
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(pDevContext->ExtPoolKva, APEX_EXT_POOL_BYTES);
+
+        poolPa = MmGetPhysicalAddress(pDevContext->ExtPoolKva);
+        pDevContext->ExtPoolPa   = (UINT64)poolPa.QuadPart;
+        pDevContext->ExtPoolSize = APEX_EXT_POOL_BYTES;
+
+        for (i = 0; i < 2048u; i++) {
+            UINT64 subPa = pDevContext->ExtPoolPa + ((UINT64)i << PAGE_SHIFT);
+            apex_write_register(pDevContext->Bar2BaseAddress,
+                APEX_REG_PAGE_TABLE + ((APEX_EXTENDED_TABLE_BASE_INDEX + i) * 8),
+                subPa | 0x1ULL);
+        }
+
+        DbgPrint("[%s] Extended PT pool: KVA=%p PA=0x%llx size=0x%llx (chip PTE [%u..%u] pre-filled)\n",
+            __FUNCTION__,
+            pDevContext->ExtPoolKva,
+            pDevContext->ExtPoolPa,
+            (UINT64)APEX_EXT_POOL_BYTES,
+            APEX_EXTENDED_TABLE_BASE_INDEX,
+            APEX_EXTENDED_TABLE_BASE_INDEX + 2047u);
     }
 
     // Create spinlock for page table access
@@ -98,6 +149,10 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
     status = WdfSpinLockCreate(&lockAttributes, &pDevContext->PageTableLock);
     if (!NT_SUCCESS(status)) {
         DbgPrint("[%s] WdfSpinLockCreate failed: 0x%x\n", __FUNCTION__, status);
+        if (pDevContext->ExtPoolKva != NULL) {
+            MmFreeContiguousMemory(pDevContext->ExtPoolKva);
+            pDevContext->ExtPoolKva = NULL;
+        }
         ExFreePoolWithTag(pDevContext->PageTableBase, 'PTBL');
         pDevContext->PageTableBase = NULL;
         return status;
@@ -286,33 +341,44 @@ NTSTATUS ApexPageTableUnmap(
     pageCount = (UINT32)((Size + PAGE_SIZE - 1) / PAGE_SIZE);
 
     if ((DeviceAddress & APEX_EXTENDED_VA_BIT) != 0) {
-        // Extended VA: walk subtables and clear matching entries.
-        UINT32 chipPteIdx     = APEX_EXTENDED_TABLE_BASE_INDEX +
-                                (UINT32)((DeviceAddress >> 21) & 0x1FFF);
-        UINT32 hostTableStart = (UINT32)((DeviceAddress >> 12) & 0x1FF);
-        int sIdx;
+        // Extended VA: zero per-page entries in the bulk pool.  Crosses
+        // 2 MB region boundaries by recursing.  Pool itself stays alive
+        // for the device handle lifetime.
+        UINT32 subtableIdx;
+        UINT32 hostTableStart;
+        UINT64* slot;
+        UINT32 thisChunk;
+        UINT32 j;
 
-        for (sIdx = 0; sIdx < APEX_MAX_EXT_SUBTABLES; sIdx++) {
-            if (pDevContext->ExtSubtables[sIdx].Active &&
-                pDevContext->ExtSubtables[sIdx].ChipPteIdx == chipPteIdx) {
-                UINT64* slot = (UINT64*)pDevContext->ExtSubtables[sIdx].Kva;
-                UINT32 j;
-                UINT32 thisChunk = pageCount;
-                if (hostTableStart + thisChunk > APEX_PAGES_PER_SUBTABLE) {
-                    thisChunk = APEX_PAGES_PER_SUBTABLE - hostTableStart;
-                }
-                for (j = 0; j < thisChunk; j++) {
-                    slot[hostTableStart + j] = 0;
-                }
-                DbgPrint("[%s] EXT unmapped %u pages: VA=0x%llx subtable[%d] hostIdx[%u..%u]\n",
-                    __FUNCTION__, thisChunk, DeviceAddress, sIdx,
-                    hostTableStart, hostTableStart + thisChunk - 1);
-                return STATUS_SUCCESS;
-            }
+        if (pDevContext->ExtPoolKva == NULL) {
+            DbgPrint("[%s] EXT unmap: pool not initialized\n", __FUNCTION__);
+            return STATUS_DEVICE_NOT_READY;
         }
-        DbgPrint("[%s] EXT unmap: no subtable found for VA=0x%llx (chipPTE[%u])\n",
-            __FUNCTION__, DeviceAddress, chipPteIdx);
-        return STATUS_NOT_FOUND;
+
+        subtableIdx    = (UINT32)((DeviceAddress >> 21) & 0x1FFF);  // 0..2047
+        hostTableStart = (UINT32)((DeviceAddress >> 12) & 0x1FF);   // 0..511
+
+        thisChunk = pageCount;
+        if (hostTableStart + thisChunk > APEX_PAGES_PER_SUBTABLE) {
+            thisChunk = APEX_PAGES_PER_SUBTABLE - hostTableStart;
+        }
+
+        slot = (UINT64*)((PUCHAR)pDevContext->ExtPoolKva +
+                         ((SIZE_T)subtableIdx << PAGE_SHIFT));
+        for (j = 0; j < thisChunk; j++) {
+            slot[hostTableStart + j] = 0;
+        }
+
+        DbgPrint("[%s] EXT unmapped %u pages: VA=0x%llx subtable[%u] hostIdx[%u..%u]\n",
+            __FUNCTION__, thisChunk, DeviceAddress, subtableIdx,
+            hostTableStart, hostTableStart + thisChunk - 1);
+
+        if (thisChunk < pageCount) {
+            return ApexPageTableUnmap(Device,
+                DeviceAddress + ((UINT64)thisChunk << PAGE_SHIFT),
+                ((SIZE_T)(pageCount - thisChunk)) << PAGE_SHIFT);
+        }
+        return STATUS_SUCCESS;
     }
 
     {
@@ -379,9 +445,31 @@ VOID ApexPageTableCleanup(_In_ WDFDEVICE Device)
         pDevContext->LockedModelSize = 0;
     }
 
-    // Defensive: if extended mapping or bounce was left active, clean it up.
-    ApexExtUnmapBuffer(Device);
+    // Defensive: if bounce was left active, clean it up.
     ApexFreeOutputBounce(Device);
+
+    // Tear down the extended-VA bulk pool.  Clears all chip PTE registers
+    // [6144..8191] and frees the 8 MB block.
+    if (pDevContext->ExtPoolKva != NULL) {
+        UINT32 i;
+        if (pDevContext->Bar2BaseAddress != NULL) {
+            for (i = 0; i < 2048u; i++) {
+                apex_write_register(pDevContext->Bar2BaseAddress,
+                    APEX_REG_PAGE_TABLE +
+                    ((APEX_EXTENDED_TABLE_BASE_INDEX + i) * 8),
+                    0);
+            }
+        }
+        DbgPrint("[%s] Freeing extended PT pool: KVA=%p PA=0x%llx size=0x%llx\n",
+            __FUNCTION__,
+            pDevContext->ExtPoolKva,
+            pDevContext->ExtPoolPa,
+            (UINT64)pDevContext->ExtPoolSize);
+        MmFreeContiguousMemory(pDevContext->ExtPoolKva);
+        pDevContext->ExtPoolKva  = NULL;
+        pDevContext->ExtPoolPa   = 0;
+        pDevContext->ExtPoolSize = 0;
+    }
 
     if (pDevContext->PageTableBase != NULL) {
         ExFreePoolWithTag(pDevContext->PageTableBase, 'PTBL');
@@ -402,76 +490,6 @@ VOID ApexPageTableCleanup(_In_ WDFDEVICE Device)
 //   [11:0]  = Page Offset
 // =========================================================================
 
-// Internal helper: find or allocate a second-level PT for the given chip PTE index.
-// Returns pointer to the slot in the pool (caller fills entries).
-// On failure, returns NULL.
-static int ApexExtFindOrAllocSubtable(
-    _In_ PDEVICE_CONTEXT pDevContext,
-    _In_ UINT32          chipPteIdx)
-{
-    int i;
-    int freeSlot = -1;
-    PHYSICAL_ADDRESS lowAddr, highAddr, noBoundary;
-    PVOID secondLevelKva;
-    PHYSICAL_ADDRESS secondLevelPa;
-
-    // Try to find existing slot for this chipPteIdx.
-    for (i = 0; i < APEX_MAX_EXT_SUBTABLES; i++) {
-        if (pDevContext->ExtSubtables[i].Active &&
-            pDevContext->ExtSubtables[i].ChipPteIdx == chipPteIdx) {
-            return i;
-        }
-        if (!pDevContext->ExtSubtables[i].Active && freeSlot < 0) {
-            freeSlot = i;
-        }
-    }
-
-    if (freeSlot < 0) {
-        DbgPrint("[ExtMap] Subtable pool exhausted (%u entries)\n", APEX_MAX_EXT_SUBTABLES);
-        return -1;
-    }
-
-    // Allocate a new 4 KB second-level PT page < 4 GB, MmNonCached.
-    lowAddr.QuadPart    = 0;
-    highAddr.QuadPart   = 0xFFFFFFFFLL;
-    noBoundary.QuadPart = 0;
-    secondLevelKva = MmAllocateContiguousMemorySpecifyCache(
-        PAGE_SIZE, lowAddr, highAddr, noBoundary, MmNonCached);
-    if (secondLevelKva == NULL) {
-        DbgPrint("[ExtMap] Failed to allocate 2-level PT page (< 4 GB) for chipPteIdx=%u\n",
-            chipPteIdx);
-        return -1;
-    }
-    RtlZeroMemory(secondLevelKva, PAGE_SIZE);
-    secondLevelPa = MmGetPhysicalAddress(secondLevelKva);
-
-    // Write the chip PTE register pointing at this PT page.
-    WdfSpinLockAcquire(pDevContext->PageTableLock);
-    apex_write_register(
-        pDevContext->Bar2BaseAddress,
-        APEX_REG_PAGE_TABLE + (chipPteIdx * 8),
-        (UINT64)secondLevelPa.QuadPart | 0x1ULL);
-    WdfSpinLockRelease(pDevContext->PageTableLock);
-
-    pDevContext->ExtSubtables[freeSlot].Kva        = secondLevelKva;
-    pDevContext->ExtSubtables[freeSlot].Pa         = (UINT64)secondLevelPa.QuadPart;
-    pDevContext->ExtSubtables[freeSlot].ChipPteIdx = chipPteIdx;
-    pDevContext->ExtSubtables[freeSlot].Active     = TRUE;
-
-    // Mirror to legacy single-slot fields for diagnostics.
-    if (!pDevContext->ExtMappingActive) {
-        pDevContext->ExtSecondLevelKva = secondLevelKva;
-        pDevContext->ExtSecondLevelPa  = (UINT64)secondLevelPa.QuadPart;
-        pDevContext->ExtChipPteIdx     = chipPteIdx;
-        pDevContext->ExtMappingActive  = TRUE;
-    }
-
-    DbgPrint("[ExtMap] alloc subtable[%d] chipPTE[%u]=0x%llx kva=%p pa=0x%llx\n",
-        freeSlot, chipPteIdx, (UINT64)secondLevelPa.QuadPart | 0x1ULL,
-        secondLevelKva, (UINT64)secondLevelPa.QuadPart);
-    return freeSlot;
-}
-
 NTSTATUS ApexExtMapBuffer(
     _In_ WDFDEVICE Device,
     _In_ UINT64 ExtDeviceVA,
@@ -481,9 +499,8 @@ NTSTATUS ApexExtMapBuffer(
     PDEVICE_CONTEXT pDevContext = DeviceGetContext(Device);
     UINT64* slot;
     UINT32 i;
-    UINT32 chipPteIdx;
+    UINT32 subtableIdx;
     UINT32 hostTableStart;
-    int subtableIdx;
 
     if (Pfns == NULL || NumPages == 0) {
         return STATUS_INVALID_PARAMETER;
@@ -496,17 +513,27 @@ NTSTATUS ApexExtMapBuffer(
         DbgPrint("[ExtMap] ExtDeviceVA=0x%llx not page-aligned\n", ExtDeviceVA);
         return STATUS_INVALID_PARAMETER;
     }
+    if (pDevContext->ExtPoolKva == NULL) {
+        DbgPrint("[ExtMap] ExtPool not initialized\n");
+        return STATUS_DEVICE_NOT_READY;
+    }
 
-    // Decode chip PTE index and host-table starting offset from the VA.
-    chipPteIdx     = APEX_EXTENDED_TABLE_BASE_INDEX + (UINT32)((ExtDeviceVA >> 21) & 0x1FFF);
+    // 2 MB region index (0..2047) within the bulk pool, and offset of the
+    // first page entry within that 4 KB subtable.
+    subtableIdx    = (UINT32)((ExtDeviceVA >> 21) & 0x1FFF);
     hostTableStart = (UINT32)((ExtDeviceVA >> 12) & 0x1FF);
 
+    if (subtableIdx >= 2048u) {
+        DbgPrint("[ExtMap] subtableIdx=%u out of range (max 2047) VA=0x%llx\n",
+            subtableIdx, ExtDeviceVA);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // Buffer crosses a 2 MB extended region — recurse onto next subtable.
     if (hostTableStart + NumPages > APEX_PAGES_PER_SUBTABLE) {
-        // Buffer crosses a 2 MB extended region. Map across multiple subtables.
         UINT32 firstChunk = APEX_PAGES_PER_SUBTABLE - hostTableStart;
         NTSTATUS s1, s2;
-        s1 = ApexExtMapBuffer(Device, ExtDeviceVA,
-                              Pfns, firstChunk);
+        s1 = ApexExtMapBuffer(Device, ExtDeviceVA, Pfns, firstChunk);
         if (!NT_SUCCESS(s1)) return s1;
         s2 = ApexExtMapBuffer(Device,
                               ExtDeviceVA + ((UINT64)firstChunk << PAGE_SHIFT),
@@ -515,21 +542,17 @@ NTSTATUS ApexExtMapBuffer(
         return s2;
     }
 
-    // Find existing subtable for this chip PTE idx, or allocate new one.
-    subtableIdx = ApexExtFindOrAllocSubtable(pDevContext, chipPteIdx);
-    if (subtableIdx < 0) {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    // Fill the 2-level PT entries.
-    slot = (UINT64*)pDevContext->ExtSubtables[subtableIdx].Kva;
+    // Write per-page entries into the pre-allocated pool sub-region.
+    slot = (UINT64*)((PUCHAR)pDevContext->ExtPoolKva +
+                     ((SIZE_T)subtableIdx << PAGE_SHIFT));
     for (i = 0; i < NumPages; i++) {
         UINT64 dataPa = ((UINT64)Pfns[i]) << PAGE_SHIFT;
         slot[hostTableStart + i] = dataPa | 0x1ULL;
     }
 
-    DbgPrint("[ExtMap] VA=0x%llx -> subtable[%d] chipPTE[%u] hostIdx[%u..%u] %u pages\n",
-        ExtDeviceVA, subtableIdx, chipPteIdx,
+    DbgPrint("[ExtMap] VA=0x%llx -> subtable[%u] chipPTE[%u] hostIdx[%u..%u] %u pages\n",
+        ExtDeviceVA, subtableIdx,
+        APEX_EXTENDED_TABLE_BASE_INDEX + subtableIdx,
         hostTableStart, hostTableStart + NumPages - 1, NumPages);
     {
         UINT32 dumpN = (NumPages < 4) ? NumPages : 4;
@@ -632,44 +655,12 @@ VOID ApexFreeOutputBounce(_In_ WDFDEVICE Device)
     pDevContext->OutputBounceActive = FALSE;
 }
 
+// Backward-compatible no-op.  In the new bulk-pool design, per-buffer
+// teardown is done via ApexPageTableUnmap (which zeroes only the entries
+// for the requested VA range).  The 8 MB pool itself is freed once at
+// ApexPageTableCleanup.  Callers can leave their existing call sites in
+// place with no change of meaning.
 VOID ApexExtUnmapBuffer(_In_ WDFDEVICE Device)
 {
-    PDEVICE_CONTEXT pDevContext = DeviceGetContext(Device);
-    int i;
-    int freed = 0;
-
-    for (i = 0; i < APEX_MAX_EXT_SUBTABLES; i++) {
-        if (!pDevContext->ExtSubtables[i].Active) continue;
-
-        // Clear the chip PTE register before freeing the host PT page.
-        if (pDevContext->Bar2BaseAddress != NULL) {
-            WdfSpinLockAcquire(pDevContext->PageTableLock);
-            apex_write_register(
-                pDevContext->Bar2BaseAddress,
-                APEX_REG_PAGE_TABLE + (pDevContext->ExtSubtables[i].ChipPteIdx * 8),
-                0);
-            WdfSpinLockRelease(pDevContext->PageTableLock);
-        }
-        if (pDevContext->ExtSubtables[i].Kva != NULL) {
-            MmFreeContiguousMemory(pDevContext->ExtSubtables[i].Kva);
-        }
-        DbgPrint("[ExtUnmap] subtable[%d] cleared chipPTE[%u] freed pa=0x%llx\n",
-            i,
-            pDevContext->ExtSubtables[i].ChipPteIdx,
-            pDevContext->ExtSubtables[i].Pa);
-        pDevContext->ExtSubtables[i].Kva        = NULL;
-        pDevContext->ExtSubtables[i].Pa         = 0;
-        pDevContext->ExtSubtables[i].ChipPteIdx = 0;
-        pDevContext->ExtSubtables[i].Active     = FALSE;
-        freed++;
-    }
-
-    pDevContext->ExtSecondLevelKva = NULL;
-    pDevContext->ExtSecondLevelPa  = 0;
-    pDevContext->ExtChipPteIdx     = 0;
-    pDevContext->ExtMappingActive  = FALSE;
-
-    if (freed > 0) {
-        DbgPrint("[ExtUnmap] freed %d subtable(s)\n", freed);
-    }
+    UNREFERENCED_PARAMETER(Device);
 }

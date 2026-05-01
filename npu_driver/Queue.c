@@ -1248,16 +1248,19 @@ VOID npudriverEvtIoDeviceControl(
 								(readPaNoF == expectPA) ? "OK" : "MISMATCH");
 						}
 					} else {
-						UINT32 chipPteIdx     = 6144u + (UINT32)((outVA >> 21) & 0x1FFF);
+						UINT32 subtableIdx    = (UINT32)((outVA >> 21) & 0x1FFF);
+						UINT32 chipPteIdx     = 6144u + subtableIdx;
 						UINT32 hostTableStart = (UINT32)((outVA >> 12) & 0x1FF);
 						UINT64 chipReg = apex_read_register(bar2,
 							APEX_REG_PAGE_TABLE + (chipPteIdx * 8));
-						UINT64 expectPa = pDevContext->ExtSecondLevelPa;
-						DbgPrint("[DONE-PTE] EXT chip PTE[%u] = 0x%llx (expected 2-level PT PA = 0x%llx | 0x1) %s\n",
+						UINT64 expectPa = pDevContext->ExtPoolPa +
+							((UINT64)subtableIdx << PAGE_SHIFT);
+						DbgPrint("[DONE-PTE] EXT chip PTE[%u] = 0x%llx (expected pool sub-region PA = 0x%llx | 0x1) %s\n",
 							chipPteIdx, chipReg, expectPa,
 							((chipReg & ~1ULL) == expectPa) ? "OK" : "MISMATCH");
-						if (pDevContext->ExtSecondLevelKva != NULL) {
-							UINT64* slot = (UINT64*)pDevContext->ExtSecondLevelKva;
+						if (pDevContext->ExtPoolKva != NULL) {
+							UINT64* slot = (UINT64*)((PUCHAR)pDevContext->ExtPoolKva +
+								((SIZE_T)subtableIdx << PAGE_SHIFT));
 							UINT32 vc = (outPageCnt < 4) ? outPageCnt : 4;
 							UINT32 ii;
 							for (ii = 0; ii < vc; ii++) {
@@ -1442,14 +1445,10 @@ VOID npudriverEvtIoDeviceControl(
 		}
 
 		// Tear down ONLY the INFER-scoped mappings (INPUT + OUTPUT).
-		// We must NOT call ApexExtUnmapBuffer here — that frees ALL extended
-		// subtables, including the one shared with cached PARAM data and the
-		// PARAM bitstream.  Wiping those leaves the chip PTE pointing at a
-		// freed host PT page on the next INFER → MMU walk fault or, worse,
-		// stale-PFN walk into reclaimed kernel memory.
-		// ApexPageTableUnmap zeroes only the requested VA range's entries
-		// (extended: 2-level PT entries; simple: chip PTE registers) so cached
-		// PARAM mappings stay intact.
+		// In the bulk-pool design, ApexPageTableUnmap zeroes only the per-page
+		// entries inside the pre-allocated 8 MB pool — chip PTE registers and
+		// pool itself stay intact, so cached PARAM data / PARAM bitstream
+		// mappings are unaffected.
 		if (pDevContext->InferInputDeviceVA != 0 && pDevContext->InferInputSize != 0) {
 			ApexPageTableUnmap(device,
 				pDevContext->InferInputDeviceVA,

@@ -132,45 +132,29 @@ typedef struct _DEVICE_CONTEXT
 	UINT64 InputChecksumByteCount;
 
 	// =====================================================================
-	// Extended-VA second-level page table pool.
+	// Extended-VA second-level page table pool — coral.sys-style bulk alloc.
 	//
-	// libedgetpu lays out every buffer (PARAM bitstream, INFER bitstream,
-	// INPUT, OUTPUT[*], cached PARAM data) in the extended VA space starting
-	// at 0x8000000000000000.  Each 2 MB chunk of extended VA needs its own
-	// second-level page table page, indexed by chip PTE[6144 + (VA>>21)&0x1FFF].
+	// At PrepareHardware we allocate ONE contiguous 8 MB block (< 4 GB,
+	// NonCached) covering ALL 2048 extended subtables (2048 × 4 KB = 8 MB).
+	// Each chip PTE register at index [6144..8191] is then pre-programmed
+	// to point at the corresponding 4 KB sub-region of this pool with the
+	// valid bit set, so every extended slot is a valid (zeroed) 2-level PT
+	// from the moment the chip starts walking — no on-demand alloc, no
+	// lazy gaps that could trip a speculative MMU walk into an invalid
+	// chip PTE register.
 	//
-	// Multiple buffers can share one 2 MB region (different host_idx slots in
-	// the same second-level PT).  The pool below tracks all currently-active
-	// second-level PTs so we can:
-	//   1) reuse the same PT when another buffer maps into the same 2 MB chunk
-	//   2) free them at IOCTL_UNMAP_BUFFER / cleanup time
+	// Subtable[i] for chip PTE register (6144 + i) lives at:
+	//   KVA: ExtPoolKva + i*PAGE_SIZE
+	//   PA : ExtPoolPa  + i*PAGE_SIZE
 	//
-	// Layout per slot:
-	//   Kva        : kernel VA of 4 KB second-level PT page (MmNonCached, < 4 GB)
-	//   Pa         : PA of that page (written into chip PTE register)
-	//   ChipPteIdx : 6144 + (VA>>21)&0x1FFF (the chip register slot we wrote)
-	//   Active     : TRUE while this slot is mapped, FALSE = free slot
-	//
-	// MAX_SUBTABLES is sized for typical workload: PARAM data may need 3 slots
-	// (1500 pages = 6 MB across 3 chunks), plus 1 slot for INFER bitstream/INPUT/
-	// OUTPUT/PARAM bitstream.  16 is comfortably above that.
-	//
-	// Legacy single-slot fields (ExtSecondLevelKva/Pa/ChipPteIdx) kept for
-	// backward compatibility with diagnostics that reference the "primary"
-	// extended mapping.  They mirror ExtSubtables[0] when active.
-	#define APEX_MAX_EXT_SUBTABLES 16
-	struct {
-		PVOID   Kva;
-		UINT64  Pa;
-		UINT32  ChipPteIdx;
-		BOOLEAN Active;
-	} ExtSubtables[APEX_MAX_EXT_SUBTABLES];
-
-	// Legacy fields — alias for ExtSubtables[0] (kept so diagnostic dumps work).
-	PVOID    ExtSecondLevelKva;
-	UINT64   ExtSecondLevelPa;
-	UINT32   ExtChipPteIdx;
-	BOOLEAN  ExtMappingActive;
+	// IOCTL_MAP_BUFFER (extended) only writes the per-page 8-byte entries
+	// inside this pool — never alloc.  IOCTL_UNMAP_BUFFER zeroes them.
+	// Pool itself lives for the device-handle lifetime, freed at
+	// ApexPageTableCleanup.
+	#define APEX_EXT_POOL_BYTES   (2048u * PAGE_SIZE)   /* = 8 MB */
+	PVOID    ExtPoolKva;
+	UINT64   ExtPoolPa;
+	SIZE_T   ExtPoolSize;
 
 	// Output bounce buffer (extended-VA path only).
 	//
