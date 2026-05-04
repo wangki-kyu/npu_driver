@@ -9,7 +9,9 @@
       "Bash(gh api *)",
       "WebFetch(domain:raw.githubusercontent.com)",
       "WebFetch(domain:api.github.com)",
-      "Bash(grep -v \"//\")"
+      "Bash(grep -v \"//\")",
+      "Bash(git -C E:/work/project/npu_driver branch --show-current)",
+      "Bash(git -C E:/work/project/npu_driver log --oneline main -20)"
     ]
   }
 }
