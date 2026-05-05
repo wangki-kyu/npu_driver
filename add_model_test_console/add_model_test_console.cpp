@@ -40,14 +40,26 @@ static const uint8_t kGoldenOutput[16] = {
 };
 
 // Extended VA mode (matches libedgetpu working trace layout pattern).
-static const uint64_t EXT_VA_BIT = 0x8000000000000000ULL;
-static const uint64_t VA_PARAM_DATA      = EXT_VA_BIT | 0x000000ULL;  // exe1 parameters
-static const uint64_t VA_PARAM_BITSTREAM = EXT_VA_BIT | 0x840000ULL;  // exe1 bitstream
-static const uint64_t VA_INFER_BITSTREAM = EXT_VA_BIT | 0x900000ULL;  // exe0 bitstream (INFER)
-static const uint64_t VA_INPUT           = EXT_VA_BIT | 0x880000ULL;
-static const uint64_t VA_OUTPUT          = EXT_VA_BIT | 0x844000ULL;
-static const uint64_t VA_SCRATCH         = EXT_VA_BIT | 0x848000ULL;
-static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = EXT_VA_BIT | 0x800000ULL; // libedgetpu pattern
+//static const uint64_t EXT_VA_BIT = 0x8000000000000000ULL;
+//static const uint64_t VA_PARAM_DATA = EXT_VA_BIT | 0x000000ULL;  // exe1 parameters
+//static const uint64_t VA_PARAM_BITSTREAM = EXT_VA_BIT | 0x840000ULL;  // exe1 bitstream
+//static const uint64_t VA_INFER_BITSTREAM = EXT_VA_BIT | 0x900000ULL;  // exe0 bitstream (INFER)
+//static const uint64_t VA_INPUT = EXT_VA_BIT | 0x000000ULL;
+//static const uint64_t VA_OUTPUT = EXT_VA_BIT | 0x002000ULL;
+//static const uint64_t VA_SCRATCH = EXT_VA_BIT | 0x003000ULL;
+//static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = EXT_VA_BIT | 0x800000ULL; // libedgetpu pattern
+
+// Simple VA mode (1-level chip PTE register file, [0..6143]).
+//   - bit63 안 셋팅 → ApexPageTableMap / IOCTL_ALLOC_IO_BUFFERS 의 simple-VA 분기로 들어간다.
+//   - PTE 인덱스 = VA >> 12. 모두 < 6144 (= 0x600_0000) 이어야 함.
+//   - VA_PARAM_DATA 와 VA_INPUT 은 의도적으로 같은 슬롯 (Phase1 끝나면 Phase2 가 재사용).
+static const uint64_t VA_PARAM_DATA            = 0x000000ULL;  // exe1 parameters (Phase 1)
+static const uint64_t VA_PARAM_BITSTREAM       = 0x840000ULL;  // exe1 bitstream      (PTE idx 0x840 = 2112)
+static const uint64_t VA_INFER_BITSTREAM       = 0x900000ULL;  // exe0 bitstream      (PTE idx 0x900 = 2304)
+static const uint64_t VA_INPUT                 = 0x000000ULL;  //                     (PTE idx 0)
+static const uint64_t VA_OUTPUT                = 0x002000ULL;  //                     (PTE idx 2)
+static const uint64_t VA_SCRATCH               = 0x003000ULL;  //                     (PTE idx 3)
+static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern  (PTE idx 0x800 = 2048)
 
 // -----------------------------------------------------------------------------
 // Utilities
@@ -166,6 +178,31 @@ int main(int argc, char** argv)
     bool useInferWithParam = false;
     uint64_t param_va = 0;
 
+    // ioctl -> contiguous allocate 
+    IOCTL_ALLOC_IO_BUFFERS_IN allocIn = {};
+    IOCTL_ALLOC_IO_BUFFERS_OUT allocOut = {};
+    allocIn.InputSize = INPUT_SIZE;
+    allocIn.InputDeviceVA = VA_INPUT;
+    allocIn.OutputSize = OUTPUT_SIZE;
+    allocIn.OutputDeviceVA = VA_OUTPUT;
+    allocIn.ScratchSize = SCRATCH_SIZE;
+    allocIn.ScratchDeviceVA = (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0;
+
+    if (!DeviceIoControl(handle, IOCTL_ALLOC_IO_BUFFERS, &allocIn, sizeof(allocIn), &allocOut, sizeof(allocOut), &bytesReturned, nullptr)) {
+        std::cout << "[main] FAIL: IOCTL_ALLOC_IO_BUFFERS: " << GetLastError() << std::endl;
+        goto cleanup;
+    }
+
+    pInputBuf = (void*)allocOut.InputUserVA;
+    pOutputBuf = (void*)allocOut.OutputUserVA;
+    pScratchBuf = (SCRATCH_SIZE > 0) ? (void*)allocOut.ScratchUserVA : nullptr;
+
+    std::cout << "[main] driver-allocated buffers:"
+        << " input=" << pInputBuf << " (PA 0x" << std::hex << allocOut.InputPa << ")"
+        << " output=" << pOutputBuf << " (PA 0x" << allocOut.OutputPa << ")"
+        << " scratch=" << pScratchBuf << " (PA 0x" << allocOut.ScratchPa << ")"
+        << std::dec << std::endl;
+
     // -------------------------------------------------------------------------
     // Phase 1: parameter caching (only if model has it)
     // -------------------------------------------------------------------------
@@ -281,16 +318,10 @@ int main(int argc, char** argv)
                   << std::hex << VA_INFER_BITSTREAM << std::dec << std::endl;
     }
 
+
     // -------------------------------------------------------------------------
     // Allocate input/output/scratch. Fill input with the 16-byte golden vector.
     // -------------------------------------------------------------------------
-    pInputBuf  = AlignedAlloc4K(INPUT_SIZE);
-    pOutputBuf = AlignedAlloc4K(OUTPUT_SIZE);
-    pScratchBuf = (SCRATCH_SIZE > 0) ? AlignedAlloc4K(SCRATCH_SIZE) : nullptr;
-    if (!pInputBuf || !pOutputBuf || (SCRATCH_SIZE > 0 && !pScratchBuf)) {
-        std::cout << "[main] FAIL: alloc in/out/scratch" << std::endl;
-        goto cleanup;
-    }
 
     // Fill input. Padding (if any) stays zero.
     memset(pInputBuf, 0, INPUT_SIZE);
@@ -399,10 +430,13 @@ int main(int argc, char** argv)
     }
 
 cleanup:
-    AlignedFree(pInputBuf);
-    AlignedFree(pOutputBuf);
-    AlignedFree(pScratchBuf);
     AlignedFree(pInferBitstream);
+
+    {
+        DeviceIoControl(handle, IOCTL_FREE_IO_BUFFERS,
+            nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
+    }
+
     if (handle && handle != INVALID_HANDLE_VALUE) CloseHandle(handle);
     AlignedFree(pParamData);       // safe to free after FileCleanup unlocked the MDLs
     AlignedFree(pParamBitstream);

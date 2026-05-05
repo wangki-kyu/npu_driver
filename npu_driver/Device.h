@@ -9,6 +9,15 @@
 
 EXTERN_C_START
 
+typedef struct _ALLOC_IO_SLOT {
+	PVOID   Kva;          // MmAllocateContiguousMemorySpecifyCache 결과
+	PMDL    Mdl;          // user-map 용 MDL (IoAllocateMdl + MmBuildMdlForNonPagedPool)
+	PVOID   UserVa;       // MmMapLockedPagesSpecifyCache(UserMode) 결과
+	UINT64  DeviceVa;     // chip PTE 박은 위치
+	SIZE_T  Size;         // 4 KB 배수
+} ALLOC_IO_SLOT;
+
+
 typedef struct _DEVICE_CONTEXT
 {
 	// BAR2
@@ -178,6 +187,8 @@ typedef struct _DEVICE_CONTEXT
 	// Mirrors Linux gasket_interrupt_reinit_msix() behavior.
 	UINT32 SavedMsixTable[4 * 4];        // 4 vectors x {addr_lo, addr_hi, data, ctrl}
 	BOOLEAN MsixTableSaved;
+
+	ALLOC_IO_SLOT IOSlots[3];	// 0=input, 1=output, 2=scratch
 
 	ULONG PrivateDeviceData;  // just a placeholder
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;

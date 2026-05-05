@@ -1209,6 +1209,18 @@ npudriverEvtFileCleanup(
 		deviceContext->CachedParamBitstreamPageCount = 0;
 		deviceContext->CachedParamBitstreamDeviceVA = 0;
 	}
+
+	// Cleanup contiguous allocation
+	for (int i = 0; i < 3; i++) {
+		ALLOC_IO_SLOT* slot = &deviceContext->IOSlots[i];
+		if (slot->UserVa) { MmUnmapLockedPages(slot->UserVa, slot->Mdl); slot->UserVa = NULL; }
+		if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
+		if (slot->Kva) {
+			ApexPageTableUnmap(device, slot->DeviceVa, slot->Size);
+			MmFreeContiguousMemory(slot->Kva);
+			slot->Kva = NULL; slot->Size = 0; slot->DeviceVa = 0;
+		}
+	}
 }
 
 // Coral

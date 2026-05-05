@@ -1653,6 +1653,192 @@ VOID npudriverEvtIoDeviceControl(
 		DbgPrint("[PARAM_CACHE] Done, status=0x%x\n", status);
 		break;
 	}
+	case IOCTL_ALLOC_IO_BUFFERS: 
+	{
+		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
+		WDFMEMORY inMem, outMem;
+		IOCTL_ALLOC_IO_BUFFERS_IN* pIn = NULL;
+		IOCTL_ALLOC_IO_BUFFERS_OUT* pOut = NULL;
+		int i;
+
+		if (InputBufferLength < sizeof(*pIn) ||
+			OutputBufferLength < sizeof(*pOut)
+			) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+		status = WdfRequestRetrieveInputMemory(Request, &inMem);
+		if (!NT_SUCCESS(status)) break;
+		status = WdfRequestRetrieveOutputMemory(Request, &outMem);
+		if (!NT_SUCCESS(status)) break;
+
+		pIn = (IOCTL_ALLOC_IO_BUFFERS_IN*)WdfMemoryGetBuffer(inMem, NULL);
+		pOut = (IOCTL_ALLOC_IO_BUFFERS_OUT*)WdfMemoryGetBuffer(outMem, NULL);
+		RtlZeroMemory(pOut, sizeof(*pOut));
+
+		struct { UINT64 size, devVa; UINT64* outUserVa, * outPa; } req[3] = {
+			{ pIn->InputSize, pIn->InputDeviceVA, &pOut->InputUserVA, &pOut->InputPa },
+			{ pIn->OutputSize, pIn->OutputDeviceVA, &pOut->OutputUserVA, &pOut->OutputPa },
+			{ pIn->ScratchSize, pIn->ScratchDeviceVA, &pOut->ScratchUserVA, &pOut->ScratchPa }
+		};
+
+		// 한 번에 셋 다 잡고 셋 다 매핑한다. 중간에 실패하면 이미 잡힌거 전부 되돌림
+		for (i = 0; i < 3; i++) {
+			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
+			SIZE_T size4k;
+			PHYSICAL_ADDRESS lo, hi, none;
+			PHYSICAL_ADDRESS pa;
+
+			if (req[i].size == 0) continue;
+			if (slot->Kva != NULL) {
+				// 이미 잡혀있다면 명시적 free 강제. (재진입 방지)
+				DbgPrint("[ALLOC_IO] slot %d already allocated — call IOCTL_FREE_IO_BUFFERS first\n", i);
+				status = STATUS_DEVICE_BUSY;
+				goto alloc_io_fail;
+			}
+
+			size4k = (SIZE_T)((req[i].size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+			lo.QuadPart = 0;
+			hi.QuadPart = 0xFFFFFFFFLL; // < 4GB. chip MMU 가 32-bit PA만 받으면 필수.
+			none.QuadPart = 0;
+
+			slot->Kva = MmAllocateContiguousMemorySpecifyCache(size4k, lo, hi, none, MmCached);
+			if (slot->Kva == NULL) {
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto alloc_io_fail;
+			}
+			RtlZeroMemory(slot->Kva, size4k);
+			slot->Size = size4k;
+			slot->DeviceVa = req[i].devVa;
+
+			pa = MmGetPhysicalAddress(slot->Kva);
+
+			// user-mode 매핑 - calling process 컨텍스트에서만 호출되면 안전
+			slot->Mdl = IoAllocateMdl(slot->Kva, (ULONG)size4k, FALSE, FALSE, NULL);
+			if (slot->Mdl == NULL) {
+				MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto alloc_io_fail;
+			}
+			MmBuildMdlForNonPagedPool(slot->Mdl); // contiguous-nonpaged 라 ok
+
+			__try {
+				slot->UserVa = MmMapLockedPagesSpecifyCache(
+					slot->Mdl,
+					UserMode,
+					MmCached,
+					NULL,
+					FALSE,
+					NormalPagePriority
+				);
+			}
+			__except (EXCEPTION_EXECUTE_HANDLER) {
+				slot->UserVa = NULL;
+			}
+
+			if (slot->UserVa = NULL) {
+				IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+				MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto alloc_io_fail;
+			}
+
+			{
+				UINT64 baseDevVa = slot->DeviceVa;
+				UINT64 basePa = (UINT64)pa.QuadPart;
+				UINT32 pageCount = (UINT32)(size4k >> PAGE_SHIFT);
+				BOOLEAN isExtended = (baseDevVa & 0x8000000000000000ULL) != 0;
+				UINT32 j;
+
+				// 4kb check
+				if ((baseDevVa & (PAGE_SIZE - 1)) != 0) {
+					DbgPrint("[ALLOC_IO] slot %d DeviceVa=0x%llx not page-aligned\n", i, baseDevVa);
+					MmUnmapLockedPages(slot->UserVa, slot->Mdl);
+					IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+					MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+					slot->UserVa = NULL;
+					status = STATUS_INVALID_PARAMETER;
+					goto alloc_io_fail;
+				}
+
+				WdfSpinLockAcquire(pDC->PageTableLock);
+
+				if (!isExtended) {
+					// -- simpe VA
+					UINT32 startPte = (UINT32)(baseDevVa >> PAGE_SHIFT);
+					if (startPte + pageCount > pDC->PageTableSize) {
+						WdfSpinLockRelease(pDC->PageTableLock);
+						DbgPrint("[ALLOC_IO] slot %d simple-VA out of range: PTE[%u..%u] > %u\n",
+							i, startPte, startPte + pageCount - 1, pDC->PageTableSize);
+						MmUnmapLockedPages(slot->UserVa, slot->Mdl);
+						IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+						MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+						slot->UserVa = NULL;
+						status = STATUS_INVALID_PARAMETER;
+						goto alloc_io_fail;
+					}
+					for (j = 0; j < pageCount; j++) {
+						UINT64 pagePa = basePa + ((UINT64)j << PAGE_SHIFT);	// 4096을 j 인덱스에 곱해서 basePa에 4096만큼 더해준다 
+						apex_write_register(
+							pDC->Bar2BaseAddress,
+							APEX_REG_PAGE_TABLE + ((startPte + j) * 8),
+							pagePa | 0x1ULL
+						);
+					}
+					DbgPrint("[ALLOC_IO] slot %d simple PTE[%u..%u] = (PA 0x%llx + i*4K) | 1\n",
+						i, startPte, startPte + pageCount - 1, basePa);
+				}
+				else {
+					// not yet
+				}
+
+				WdfSpinLockRelease(pDC->PageTableLock);
+				slot->DeviceVa = baseDevVa;
+			}
+
+			*req[i].outUserVa = (UINT64)slot->UserVa;
+			*req[i].outPa = (UINT64)pa.QuadPart;
+			
+			DbgPrint("[ALLOC_IO] slot %d: KVA=%p UserVA=%p PA=0x%llx DeviceVA=0x%llx size=0x%llx\n",
+				i, slot->Kva, slot->UserVa, (UINT64)pa.QuadPart, slot->DeviceVa, (UINT64)size4k);
+		}
+
+		bytesReturned = sizeof(*pOut);
+		status = STATUS_SUCCESS;
+		break;
+
+	alloc_io_fail:
+		for (i = 0; i < 3; i++) {
+			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
+			if (slot->UserVa) { MmUnmapLockedPages(slot->UserVa, slot->Mdl); slot->UserVa = NULL; }
+			if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
+			if (slot->Kva) {
+				ApexPageTableUnmap(device, slot->DeviceVa, slot->Size);
+				MmFreeContiguousMemory(slot->Kva);
+				slot->Kva = NULL; slot->Size = 0; slot->DeviceVa = 0;
+			}
+		}
+
+		break;
+	}
+
+	case IOCTL_FREE_IO_BUFFERS: 
+	{
+		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
+		int i;
+		for (i = 0; i < 3; i++) {
+			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
+			if (slot->UserVa) { MmUnmapLockedPages(slot->UserVa, slot->Mdl); slot->UserVa = NULL; }
+			if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
+			if (slot->Kva) {
+				ApexPageTableUnmap(device, slot->DeviceVa, slot->Size);
+				MmFreeContiguousMemory(slot->Kva);
+				slot->Kva = NULL; slot->Size = 0; slot->DeviceVa = 0;
+			}
+		}
+		status = STATUS_SUCCESS;
+		break;
+	}
 
 	default:
 		DbgPrint("[%s] Unknown IOCTL: 0x%x\n", __FUNCTION__, IoControlCode);

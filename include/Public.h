@@ -24,6 +24,29 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 #define IOCTL_INFER_WITH_PARAM \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
 
+#define IOCTL_ALLOC_IO_BUFFERS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+#define IOCTL_FREE_IO_BUFFERS \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
+    UINT64 InputSize;       // bytes (0 = skip)
+    UINT64 InputDeviceVA;       // chip device VA (4 KB align). extended VA 권장.
+    UINT64 OutputSize;
+    UINT64 OutputDeviceVA;
+    UINT64 ScratchSize;
+    UINT64 ScratchDeviceVA; // 0 + ScratchSize = 0 이면 skip
+} IOCTL_ALLOC_IO_BUFFERS_IN;
+
+typedef struct _IOCTL_ALLOC_IO_BUFFERS_OUT {
+    UINT64 InputUserVA;      // 호출한 process 의 user-mode VA
+    UINT64 OutputUserVA;
+    UINT64 ScratchUserVA;
+    UINT64 InputPa;          // (디버그용) 첫 페이지 PA. contiguous 라 한 개로 충분.
+    UINT64 OutputPa;
+    UINT64 ScratchPa;
+} IOCTL_ALLOC_IO_BUFFERS_OUT;
 
 // parameter caching (Phase 1): load weights into on-chip SRAM via PARAMETER_CACHING executable
 typedef struct {
