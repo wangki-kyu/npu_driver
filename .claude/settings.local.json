@@ -11,7 +11,8 @@
       "WebFetch(domain:api.github.com)",
       "Bash(grep -v \"//\")",
       "Bash(git -C E:/work/project/npu_driver branch --show-current)",
-      "Bash(git -C E:/work/project/npu_driver log --oneline main -20)"
+      "Bash(git -C E:/work/project/npu_driver log --oneline main -20)",
+      "Bash(git *)"
     ]
   }
 }

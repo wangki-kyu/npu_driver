@@ -91,7 +91,7 @@ NTSTATUS npudriverCreateDevice(PWDFDEVICE_INIT DeviceInit)
 				WDF_INTERRUPT_CONFIG interruptConfig;
 				WDF_INTERRUPT_CONFIG_INIT(&interruptConfig,
 					npudriverEvtInterruptIsr,
-					npudriverEvtInterruptDpc);
+					npudriverEvtInterruptDpcNew);
 				interruptConfig.EvtInterruptEnable  = npudriverEvtInterruptEnable;
 				interruptConfig.EvtInterruptDisable = npudriverEvtInterruptDisable;
 				status = WdfInterruptCreate(device, &interruptConfig,
@@ -588,7 +588,8 @@ npudriverEvtDevicePrepareHardware(
 		deviceContext->DescRingBase = NULL;
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
-	RtlZeroMemory(deviceContext->StatusBlockBase, PAGE_SIZE);
+	//RtlZeroMemory(deviceContext->StatusBlockBase, PAGE_SIZE);
+	RtlFillMemory(deviceContext->StatusBlockBase, PAGE_SIZE, 0xA5);	// 값 채워 넣기 
 	{
 		PHYSICAL_ADDRESS sblkPhys = MmGetPhysicalAddress(deviceContext->StatusBlockBase);
 		deviceContext->StatusBlockDeviceVA = (UINT64)4097 * PAGE_SIZE;  // 0x1001000
@@ -1211,7 +1212,7 @@ npudriverEvtFileCleanup(
 	}
 
 	// Cleanup contiguous allocation
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < IO_SLOT_COUNT; i++) {
 		ALLOC_IO_SLOT* slot = &deviceContext->IOSlots[i];
 		if (slot->UserVa) { MmUnmapLockedPages(slot->UserVa, slot->Mdl); slot->UserVa = NULL; }
 		if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
@@ -1286,10 +1287,13 @@ BOOLEAN npudriverEvtInterruptIsr(WDFINTERRUPT Interrupt, ULONG MessageID)
 	// (WIRE_INT_PENDING). Without this the chip re-asserts MSI-X immediately
 	// and we storm.
 	//
-	// SC_HOST_INT_STATUS (0x486a8) — REAL INFER completion source. libedgetpu
-	// writes 0xE here on every SC_HOST fire (W1C bits 1..3, leaving bit 0 for
-	// the count register to latch). Without this ack the next INFER's SC_HOST_0
-	// edge is lost and OUTFEED appears to never complete. This was missing.
+	// SC_HOST_INT_STATUS (0x486a8) — REAL INFER completion source.
+	// W0C policy (libedgetpu/driver/interrupt/interrupt_controller.cc:62-79):
+	// write 0 to clear a bit, write 1 to leave it untouched. We only use
+	// SC_HOST_0 for INFER completion, so 0xE clears bit 0 and keeps bits 1..3.
+	// This matches libedgetpu's ClearInterruptStatus(id=0). Without this ack
+	// the next INFER's SC_HOST_0 edge is lost and OUTFEED appears to never
+	// complete.
 	if (pending & APEX_WIRE_BITS_SC_HOST_ANY) {
 		apex_write_register(pDevContext->Bar2BaseAddress,
 			APEX_REG_SC_HOST_INT_STATUS, 0xE);
@@ -1369,6 +1373,70 @@ NTSTATUS npudriverEvtInterruptDisable(WDFINTERRUPT Interrupt, WDFDEVICE Device)
 	UNREFERENCED_PARAMETER(Device);
 	DbgPrint("[%s] KMDF disabling MSI-X\n", __FUNCTION__);
 	return STATUS_SUCCESS;
+}
+
+VOID npudriverEvtInterruptDpcNew(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)
+{
+	UNREFERENCED_PARAMETER(AssociatedObject);
+
+	WDFDEVICE device = WdfInterruptGetDevice(Interrupt);
+	PDEVICE_CONTEXT pDevContext = DeviceGetContext(device);
+	PVOID bar2 = pDevContext->Bar2BaseAddress;
+
+	if (bar2 == NULL) return;
+
+	// 1) ISR이 OR 해 둔 pending bits 확인
+	LONG seen = pDevContext->IsrSeenPendingBits;
+	BOOLEAN scHostSeen = (seen & APEX_WIRE_BIT_SC_HOST_0) != 0;
+	BOOLEAN fatalSeen = (seen & APEX_WIRE_BIT_FATAL_ERR) != 0;
+
+	// 2) Run_status 스냅샷
+	UINT32 gateSc = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+	UINT32 gateIn = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
+	UINT32 gateOut = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+	UINT32 gateAv = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
+
+	BOOLEAN allIdle = (gateSc == 0) && (gateIn == 0) && (gateOut == 0) && (gateAv == 0);
+	BOOLEAN anyHalted = (gateSc == 4) || (gateOut == 4);
+	BOOLEAN terminal = allIdle || anyHalted || fatalSeen;
+
+	// 3) settle 폴링: SC_HOST_0 봤는데 아직 idle 아니면 짧게 대기 
+	// SCALAR 코어가 비트스트림 안에 박혀있는 host_interrupt 0 opcode를 실행하면 set된다. 
+	if (scHostSeen && !terminal) {
+		for (ULONG i = 0; i < 200; i++) {
+			KeStallExecutionProcessor(10); // 10us
+			gateSc = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+			gateIn = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
+			gateOut = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+			gateAv = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
+			DbgPrint("[DPC-NEW] settle polling | gateSc=%lu | gateIn=%lu | gateOut=%lu | gateAv=%lu\n", gateSc, gateIn, gateOut, gateAv);
+			allIdle = (gateSc == 0) && (gateIn == 0) && (gateOut == 0) && (gateAv == 0);
+			anyHalted = (gateSc == 4) || (gateOut == 4);
+			terminal = allIdle || anyHalted;
+			if (terminal) break;
+		}
+	}
+
+	// 4) 완료 트리거 판정 - 표 매트릭스 그대로: 
+	//    a) fatalSeen : HIB fatal - deadlock 방지로 즉시 완료 
+	//    b) anyHalted : 엔진 자발 halt - IOCTL 측 진단으로 surface
+	//    c) allIdle && scHostSeen  : 정상 완료 
+	//    셋 중 하나라도 아니면 defer (다음 MSI-X에서 재평가)
+	BOOLEAN shouldComplete = fatalSeen || anyHalted || (allIdle && scHostSeen);
+
+	if (!shouldComplete) {
+		DbgPrint("[DPC-NEW] defer: SC=0x%x IN=0x%x OUT=0x%x AV=0x%x scHost=%d\n",
+			gateSc, gateIn, gateOut, gateAv, scHostSeen);
+		return; // event unsignaled 유지 — 다음 MSI-X 가 다시 DPC 큐잉
+	}
+
+	// 5) 완료 - IO 슬롯은 IOCTL가 잡아둔 driver-allocated contiguous 라 
+	// DPC가 unlock/free 하지 않는다. 게이트 통과 = 슬롯 내용 유효 보장 
+	UINT64 outfeedStatus = apex_read_register(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+	DbgPrint("[DPC-NEW] complete: SC=0x%x OUT=0x%x scHost=%d fatal=%d halted=%d outfeed=%llx\n",
+		gateSc, gateOut, scHostSeen, fatalSeen, anyHalted, outfeedStatus);
+
+	KeSetEvent(&pDevContext->InferCompleteEvent, IO_NO_INCREMENT, FALSE);
 }
 
 VOID npudriverEvtInterruptDpc(WDFINTERRUPT Interrupt, WDFOBJECT AssociatedObject)

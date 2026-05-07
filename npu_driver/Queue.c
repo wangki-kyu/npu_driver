@@ -4,7 +4,10 @@
 
 
 #ifdef ALLOC_PRAGMA
-#pragma alloc_text(PAGE, npudriverEvtIoDeviceControl)
+// IOCTL 핸들러는 spinlock을 잡거나 (PageTableLock) MMIO와 즉결 처리가 필요하므로
+// NONPAGED로 둔다. PAGED 로 두면 lock 안에서의 DbgPrint 등 정적 데이터 접근이 
+// DISPATCH_LEVEL 에서 page fault -> D3 BSOD 를 일으킨다. 
+//#pragma alloc_text(PAGE, npudriverEvtIoDeviceControl)
 #endif
 
 VOID npudriverEvtIoDeviceControl(
@@ -115,6 +118,211 @@ VOID npudriverEvtIoDeviceControl(
 		break;
 	}
 	case IOCTL_INFER_WITH_PARAM:
+		break;
+	case IOCTL_INFER_NEW:	// direct typing 
+	{
+		DbgPrint("IOCTL_INFER_NEW Start!\n");
+		PDEVICE_CONTEXT pDc = DeviceGetContext(device);
+		PVOID bar2 = pDc->Bar2BaseAddress;
+		WDFMEMORY inMem;
+		IOCTL_INFER_INFO* pIn = NULL;
+		ALLOC_IO_SLOT* inSlot = NULL, * outSlot = NULL, * scSlot = NULL;
+		UINT32 i;
+
+		// infeed가 바라보는 실제 값이 존재하는지 체크 
+		PUCHAR inputKva = (PUCHAR)pDc->IOSlots[0].Kva;
+		SIZE_T inputSize = pDc->IOSlots[0].Size;
+		if (inputKva != NULL && inputSize > 0) {
+			DbgPrint("[INFER_NEW] Infeed Data (First 16 bytes): \n");
+			DbgPrint("%02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X\n",
+				inputKva[0], inputKva[1], inputKva[2], inputKva[3],
+				inputKva[4], inputKva[5], inputKva[6], inputKva[7],
+				inputKva[8], inputKva[9], inputKva[10], inputKva[11],
+				inputKva[12], inputKva[13], inputKva[14], inputKva[15]);
+		}
+
+		// [1] retrieve
+		if (InputBufferLength < sizeof(IOCTL_INFER_INFO)) {
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+		status = WdfRequestRetrieveInputMemory(Request, &inMem);
+		if (!NT_SUCCESS(status)) break;
+		pIn = (IOCTL_INFER_INFO*)WdfMemoryGetBuffer(inMem, NULL);
+
+		// simple VA 만 - extended bit 셋이면 즉시 거부 
+		if ((pIn->InputDeviceVA & (1ULL << 63)) ||	// 64 비트가 1이면 extended 영역이라서 그렇게 하는거 .. 
+			(pIn->OutputDeviceVA & (1ULL << 63)) ||
+			((pIn->ScratchSize > 0) && (pIn->ScratchDeviceVA & (1ULL << 63)))) {
+			DbgPrint("[INFER_NEW] extended VA not supported in this path\n");
+			status = STATUS_INVALID_PARAMETER;
+			break;
+		}
+
+		// [2] IoSlots lookup - IOCTL_ALLOC_IO_BUFFERS 가 잡아둔 슬롯 셋을 찾는다.
+		// lock 안함
+		// MDL 안만듦
+		// pte 안박음
+		for (i = 0; i < IO_SLOT_COUNT; i++) {
+			ALLOC_IO_SLOT* s = &pDc->IOSlots[i];
+			if (s->Kva == NULL) continue;
+			if ((UINT64)s->UserVa == pIn->InputImageAddr && s->DeviceVa == pIn->InputDeviceVA) inSlot = s;
+			if ((UINT64)s->UserVa == pIn->OutputBufferAddr && s->DeviceVa == pIn->OutputDeviceVA) outSlot = s;
+			if (pIn->ScratchSize > 0 && 
+				(UINT64)s->UserVa == pIn->ScratchAddr && s->DeviceVa == pIn->ScratchDeviceVA) scSlot = s;
+		}
+		if (!inSlot || !outSlot || (pIn->ScratchSize > 0 && !scSlot)) {
+			DbgPrint("[INFER_NEW] caller buffer not registered via IOCTL_ALLOC_IO_BUFFERS "
+				"(in=%p out=%p sc=%p)\n", inSlot, outSlot, scSlot);
+			status = STATUS_INVALID_DEVICE_STATE;
+			break;
+		}
+
+		// [3] 완료 이벤트 reset + 모든 engine kRun
+		// tile_config0 도 다시 박아준다. (engine 이 RUN_CONTROL 거부 방지).
+		KeClearEvent(&pDc->InferCompleteEvent);
+		pDc->IsrSeenPendingBits = 0;
+		
+		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
+		KeStallExecutionProcessor(50);
+
+		// 왜 한줄에 하나씩 전부 키는건가? 
+		// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로, 
+		// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다. 
+		//																		// 엔진 종류			
+		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL, 1);			// Scalar Core, 제어 흐름 / 주소 계산 담당 스칼라 프로세서 기동 		
+		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL, 1);		// Activation	activation 데이터를 narrow memory -> 연산 유닛으로 push 
+		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);	// 가중치(Weights)를 parameter memory -> MAC array로 push
+		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL, 1);			// host -> chip 입력 데이터 DMA 엔진 기동 
+		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL, 1);			// chip -> host 출력 데이터 dma 엔진 기동 
+		apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL, 1);			// MAC array 연산 명령 디스패처, 실제 compute 수행
+		apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL, 1);	// narrow(int8) -> wide(int32 accumulator) 폭 변환 버스 
+		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL, 1);	// wide(int32 acc) -> narrow(int8 quantized) 폭 변환 버스 
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #0
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #1
+		apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL, 1);	// 칩이 호스트로 완료/응답을 보내는 ring 송신 엔진
+		KeStallExecutionProcessor(1000); // 1ms settle
+
+		if (pDc->StatusBlockBase != NULL) {
+			PUCHAR base = (PUCHAR)pDc->StatusBlockBase;
+			DbgPrint("[INFER_NEW] | [test debug] | before desc submit | %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X\n",
+				base[0], base[1], base[2], base[3], base[4], base[5], base[6], base[7],
+				base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
+		}
+
+		// [4] descriptor submit (single INFER, no PARAM)
+		{
+			typedef struct {
+				UINT64 address;
+				UINT64 size_in_bytes;
+				UINT32 reserved;
+			} HOST_QUEUE_DESC;
+
+			HOST_QUEUE_DESC* ring = (HOST_QUEUE_DESC*)pDc->DescRingBase;
+			UINT32 slot = pDc->DescRingTail % 256;
+
+			ring[slot].address = pIn->BitstreamDeviceVA;
+			ring[slot].size_in_bytes = (UINT32)pIn->BitstreamSize;
+			ring[slot].reserved = 0;
+			KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록
+
+			pDc->DescRingTail++;
+			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
+		}
+
+		// sc_host_int_count 스냅샷 - 완료 판정 기준선
+		pDc->LastScHostIntCount = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
+
+		// [5] 완료 대기 - IRQ-only (5s timeout = 진짜 실패, 폴링 fallback 없음)
+		{
+			LARGE_INTEGER t1; t1.QuadPart = -30000000LL;   // 5 s (음수 = relative, 100ns 단위)
+			status = KeWaitForSingleObject(&pDc->InferCompleteEvent, Executive, KernelMode, FALSE, &t1);
+		}
+
+		if (status == STATUS_TIMEOUT) {
+			// 폴링으로 SC_HOST_INT_COUNT 보지 않음 — IRQ가 안 왔다는 사실 자체를 에러로.
+			DbgPrint("[INFER_NEW] IRQ TIMEOUT — interrupt path failed\n");
+			DbgPrint("[INFER_NEW]   ISR fire count   = %d\n", pDc->IsrCallCount);
+			DbgPrint("[INFER_NEW]   IsrSeenPending   = 0x%x\n",
+				(UINT32)pDc->IsrSeenPendingBits);
+			DbgPrint("[INFER_NEW]   WIRE_INT_PENDING = 0x%llx\n",
+				apex_read_register(bar2, APEX_REG_WIRE_INT_PENDING));
+			DbgPrint("[INFER_NEW]   SC_HOST_COUNT    = 0x%llx (pre=0x%llx)\n",
+				apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT),
+				pDc->LastScHostIntCount);
+			DbgPrint("[INFER_NEW]   HIB_ERROR        = 0x%llx\n",
+				apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS));
+			DbgPrint("[INFER_NEW]   SC_RUN/IN/OUT    = 0x%x / 0x%x / 0x%x\n",
+				apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS),
+				apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS),
+				apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS));
+			status = STATUS_IO_TIMEOUT;
+			break;   // 슬롯 unlock은 IOCTL_FREE_IO_BUFFERS / FileCleanup 책임
+		}
+
+		// post-wait 진단
+		// dpc는 터미널 상태 도달만 알리고, success / failure 판정은 ioctl 책임
+		// anyhalted / fatalSeen 트리거로 깨어났을 수 있으니 에러 레지스터 확인. 
+		{
+			UINT32 hibErr = apex_read_register_32(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
+			UINT32 scErr = apex_read_register_32(bar2, APEX_REG_SCALAR_CORE_ERROR_STATUS);
+			UINT32 scStat = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+			UINT32 outStat = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+			BOOLEAN fatal = (pDc->IsrSeenPendingBits & APEX_WIRE_BIT_FATAL_ERR) != 0;
+
+			if (fatal || hibErr != 0) {
+				DbgPrint("[INFER_NEW] FATAL: HIB_ERR=0x%x ISR_seen=0x%x\n",
+					hibErr, (UINT32)pDc->IsrSeenPendingBits);
+				status = STATUS_DEVICE_HARDWARE_ERROR;
+				break;
+			}
+
+			if (scStat == 4 || outStat == 4) {
+				DbgPrint("[INFER_NEW] engine halted: SC=0x%x OUT=0x%x SC_ERR=0x%x\n",
+					scStat, outStat, scErr);
+				status = STATUS_DEVICE_DATA_ERROR;
+				break;
+			}
+		}
+
+		// output kva로 확인하기 
+		PUCHAR kva = (PUCHAR)pDc->IOSlots[1].Kva;
+		SIZE_T size = pDc->IOSlots[1].Size;
+		if (kva != NULL && size > 0) {
+			DbgPrint("[DPC-OUT-NEW] kva=%p size=%zu first16: "
+				"%02x %02x %02x %02x %02x %02x %02x %02x  "
+				"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+				kva, size,
+				kva[0], kva[1], kva[2], kva[3],
+				kva[4], kva[5], kva[6], kva[7],
+				kva[8], kva[9], kva[10], kva[11],
+				kva[12], kva[13], kva[14], kva[15]);
+		}
+
+		// test debug
+		UINT64 val_46010 = apex_read_register(bar2, 0x46010);  // translation_enable
+		UINT64 val_46000 = apex_read_register(bar2, 0x46000);  // page_table_size
+		UINT64 val_48738 = apex_read_register(bar2, 0x48738);  // infeed_page_fault_address
+		UINT64 val_486f0 = apex_read_register(bar2, 0x486f0);  // user_hib_error_status
+
+		DbgPrint("[INFER_NEW] [test debug] val_46010=%llu val_46000=%llu val_48738=%llu val_486f0=%llu\n", 
+			val_46010, val_46000, val_48738, val_486f0);
+
+		if (pDc->StatusBlockBase != NULL) {
+			PUCHAR base = (PUCHAR)pDc->StatusBlockBase;
+			DbgPrint("[INFER_NEW] | [test debug] | after desc submit | %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X\n",
+				base[0], base[1], base[2], base[3], base[4], base[5], base[6], base[7],
+				base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
+		}
+
+		// 정상 - dpc 가 (allIdle && scHostSeen) 게이트 통과해서 깨운 경우 
+		DbgPrint("[INFER_NEW] inference complete via IRQ (ISR fires=%d)\n", pDc->IsrCallCount);
+		break;
+	}
 	case IOCTL_INFER:
 	{
 		WDFMEMORY inputMemory;
@@ -1655,6 +1863,7 @@ VOID npudriverEvtIoDeviceControl(
 	}
 	case IOCTL_ALLOC_IO_BUFFERS: 
 	{
+		DbgPrint("IOCTL_ALLOC_IO_BUFFERS Start!\n");
 		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
 		WDFMEMORY inMem, outMem;
 		IOCTL_ALLOC_IO_BUFFERS_IN* pIn = NULL;
@@ -1674,16 +1883,18 @@ VOID npudriverEvtIoDeviceControl(
 
 		pIn = (IOCTL_ALLOC_IO_BUFFERS_IN*)WdfMemoryGetBuffer(inMem, NULL);
 		pOut = (IOCTL_ALLOC_IO_BUFFERS_OUT*)WdfMemoryGetBuffer(outMem, NULL);
+		IOCTL_ALLOC_IO_BUFFERS_IN in = *pIn;
 		RtlZeroMemory(pOut, sizeof(*pOut));
 
-		struct { UINT64 size, devVa; UINT64* outUserVa, * outPa; } req[3] = {
-			{ pIn->InputSize, pIn->InputDeviceVA, &pOut->InputUserVA, &pOut->InputPa },
-			{ pIn->OutputSize, pIn->OutputDeviceVA, &pOut->OutputUserVA, &pOut->OutputPa },
-			{ pIn->ScratchSize, pIn->ScratchDeviceVA, &pOut->ScratchUserVA, &pOut->ScratchPa }
+		struct { UINT64 size, devVa; UINT64* outUserVa, * outPa; } req[IO_SLOT_COUNT] = {
+			{ in.InputSize, in.InputDeviceVA, &pOut->InputUserVA, &pOut->InputPa },
+			{ in.OutputSize, in.OutputDeviceVA, &pOut->OutputUserVA, &pOut->OutputPa },
+			{ in.ScratchSize, in.ScratchDeviceVA, &pOut->ScratchUserVA, &pOut->ScratchPa },
+			{ in.Exe0BitstreamSize, in.Exe0BitstreamDeviceVA, &pOut->Exe0BitStreamUserVA, &pOut->Exe0BitstreamPa}
 		};
 
 		// 한 번에 셋 다 잡고 셋 다 매핑한다. 중간에 실패하면 이미 잡힌거 전부 되돌림
-		for (i = 0; i < 3; i++) {
+		for (i = 0; i < IO_SLOT_COUNT; i++) {
 			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
 			SIZE_T size4k;
 			PHYSICAL_ADDRESS lo, hi, none;
@@ -1736,7 +1947,7 @@ VOID npudriverEvtIoDeviceControl(
 				slot->UserVa = NULL;
 			}
 
-			if (slot->UserVa = NULL) {
+			if (slot->UserVa == NULL) {
 				IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
 				MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
 				status = STATUS_INSUFFICIENT_RESOURCES;
@@ -1761,22 +1972,24 @@ VOID npudriverEvtIoDeviceControl(
 					goto alloc_io_fail;
 				}
 
+				UINT32 startPte = (UINT32)(baseDevVa >> PAGE_SHIFT);
+				if (startPte + pageCount > pDC->PageTableSize) {
+					WdfSpinLockRelease(pDC->PageTableLock);
+					DbgPrint("[ALLOC_IO] slot %d simple-VA out of range: PTE[%u..%u] > %u\n",
+						i, startPte, startPte + pageCount - 1, pDC->PageTableSize);
+					MmUnmapLockedPages(slot->UserVa, slot->Mdl);
+					IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+					MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+					slot->UserVa = NULL;
+					status = STATUS_INVALID_PARAMETER;
+					goto alloc_io_fail;
+				}
+
 				WdfSpinLockAcquire(pDC->PageTableLock);
 
 				if (!isExtended) {
 					// -- simpe VA
-					UINT32 startPte = (UINT32)(baseDevVa >> PAGE_SHIFT);
-					if (startPte + pageCount > pDC->PageTableSize) {
-						WdfSpinLockRelease(pDC->PageTableLock);
-						DbgPrint("[ALLOC_IO] slot %d simple-VA out of range: PTE[%u..%u] > %u\n",
-							i, startPte, startPte + pageCount - 1, pDC->PageTableSize);
-						MmUnmapLockedPages(slot->UserVa, slot->Mdl);
-						IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-						MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
-						slot->UserVa = NULL;
-						status = STATUS_INVALID_PARAMETER;
-						goto alloc_io_fail;
-					}
+					
 					for (j = 0; j < pageCount; j++) {
 						UINT64 pagePa = basePa + ((UINT64)j << PAGE_SHIFT);	// 4096을 j 인덱스에 곱해서 basePa에 4096만큼 더해준다 
 						apex_write_register(
@@ -1785,14 +1998,16 @@ VOID npudriverEvtIoDeviceControl(
 							pagePa | 0x1ULL
 						);
 					}
-					DbgPrint("[ALLOC_IO] slot %d simple PTE[%u..%u] = (PA 0x%llx + i*4K) | 1\n",
-						i, startPte, startPte + pageCount - 1, basePa);
 				}
 				else {
 					// not yet
 				}
 
 				WdfSpinLockRelease(pDC->PageTableLock);
+
+				DbgPrint("[ALLOC_IO] slot %d simple PTE[%u..%u] = (PA 0x%llx + i*4K) | 1\n",
+					i, startPte, startPte + pageCount - 1, basePa);
+
 				slot->DeviceVa = baseDevVa;
 			}
 
@@ -1808,7 +2023,8 @@ VOID npudriverEvtIoDeviceControl(
 		break;
 
 	alloc_io_fail:
-		for (i = 0; i < 3; i++) {
+		DbgPrint("[ALLOC_IO] alloc_io_fail cleanup!\n");
+		for (i = 0; i < IO_SLOT_COUNT; i++) {
 			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
 			if (slot->UserVa) { MmUnmapLockedPages(slot->UserVa, slot->Mdl); slot->UserVa = NULL; }
 			if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
@@ -1826,7 +2042,7 @@ VOID npudriverEvtIoDeviceControl(
 	{
 		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
 		int i;
-		for (i = 0; i < 3; i++) {
+		for (i = 0; i < IO_SLOT_COUNT; i++) {
 			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
 			if (slot->UserVa) { MmUnmapLockedPages(slot->UserVa, slot->Mdl); slot->UserVa = NULL; }
 			if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }

@@ -17,6 +17,14 @@ typedef struct _ALLOC_IO_SLOT {
 	SIZE_T  Size;         // 4 KB 배수
 } ALLOC_IO_SLOT;
 
+typedef enum _IO_SLOT_INDEX {
+	IO_SLOT_INPUT = 0,
+	IO_SLOT_OUTPUT = 1,
+	IO_SLOT_SCRATCH = 2,
+	IO_SLOT_EXE0_BS = 3,
+	IO_SLOT_COUNT
+} IO_SLOT_INDEX;
+
 
 typedef struct _DEVICE_CONTEXT
 {
@@ -188,7 +196,7 @@ typedef struct _DEVICE_CONTEXT
 	UINT32 SavedMsixTable[4 * 4];        // 4 vectors x {addr_lo, addr_hi, data, ctrl}
 	BOOLEAN MsixTableSaved;
 
-	ALLOC_IO_SLOT IOSlots[3];	// 0=input, 1=output, 2=scratch
+	ALLOC_IO_SLOT IOSlots[IO_SLOT_COUNT];	// 0=input, 1=output, 2=scratch
 
 	ULONG PrivateDeviceData;  // just a placeholder
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
@@ -209,6 +217,7 @@ EVT_WDF_FILE_CLEANUP npudriverEvtFileCleanup;
 EVT_WDF_INTERRUPT_ISR npudriverEvtInterruptIsr;
 
 EVT_WDF_INTERRUPT_DPC npudriverEvtInterruptDpc;
+EVT_WDF_INTERRUPT_DPC npudriverEvtInterruptDpcNew;
 
 EVT_WDF_INTERRUPT_ENABLE  npudriverEvtInterruptEnable;
 EVT_WDF_INTERRUPT_DISABLE npudriverEvtInterruptDisable;

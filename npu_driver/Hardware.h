@@ -176,16 +176,19 @@
 #define APEX_REG_SC_HOST_INT_CONTROL        0x486a0  // write 0xF = enable all 4 SC_HOST completion interrupts (kNumInterrupts=4)
 // SC_HOST_INT_STATUS / SC_HOST_INT_COUNT — REAL INFER completion signal.
 // libedgetpu's canonical post-inference handshake (per host_queue.h + working
-// runtime trace):
+// runtime trace; ack policy from interrupt_controller.cc:62-79):
 //   1) SCALAR reaches host_interrupt 0 opcode (after OUTFEED drain) → fires
 //      SC_HOST_0 wire interrupt (WIRE_INT_PENDING bit 4 = 0x10).
-//   2) ISR writes 0xE to SC_HOST_INT_STATUS to W1C-clear bits 1..3 (leaves
-//      bit 0 alone — chip latches that one for the count register).
+//   2) ISR acks SC_HOST_INT_STATUS using W0C policy: write 0 to the bit you
+//      want cleared, write 1 to leave a bit untouched. To clear SC_HOST_0
+//      while leaving SC_HOST_1..3 alone, write 0xE (= 0b1110: bit0=0 clear,
+//      bits1..3=1 keep). For id N in [0..3] the libedgetpu formula is
+//      0xF & ~(1<<N): id=0→0xE, id=1→0xD, id=2→0xB, id=3→0x7.
 //   3) ISR reads SC_HOST_INT_COUNT — monotonic counter of SCALAR-issued
 //      host_interrupt 0 events. Compare to last cached value to detect new
 //      completion. Polling this register (not IQ_COMPLETED_HEAD) is what
 //      guarantees OUTFEED has actually written results back to host RAM.
-#define APEX_REG_SC_HOST_INT_STATUS         0x486a8  // W1C: write 0xE to ack SC_HOST 1..3
+#define APEX_REG_SC_HOST_INT_STATUS         0x486a8  // W0C: write 0xE to ack SC_HOST_0 (bit0=clear, bits1..3=keep)
 #define APEX_REG_SC_HOST_INT_COUNT          0x486d0  // monotonic SC_HOST_0 fire count (REAL INFER done)
 #define APEX_REG_STATUS_BLOCK_UPDATE        0x486e8  // 0 = disable periodic status block auto-write
 #define APEX_REG_TOP_LEVEL_INT_CONTROL      0x486b0  // write 0xF = enable top-level aggregator interrupts

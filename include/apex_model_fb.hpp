@@ -488,7 +488,7 @@ inline void DumpPatchRawValues(const ApexModelFb& model, const char* tag) {
             tag, pi, desc_name, pos_name, p.name.c_str(),
             (unsigned)(p.offset_bit / 8), cur);
         std::cout << buf;
-        OutputDebugStringA(buf);
+        //OutputDebugStringA(buf);
     }
 }
 

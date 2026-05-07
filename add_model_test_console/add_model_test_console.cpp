@@ -143,10 +143,14 @@ int main(int argc, char** argv)
     const size_t INPUT_SIZE   = model.input_layers[0].size_bytes;
     const size_t OUTPUT_SIZE  = model.total_output_size_bytes;
     const size_t SCRATCH_SIZE = model.scratch_size_bytes;
+    const size_t EX0_BITSTREAM_SIZE = model.bitstream.size();
+
     std::cout << "[main] input_size=" << INPUT_SIZE
               << "  output_size=" << OUTPUT_SIZE
-              << "  scratch_size=" << SCRATCH_SIZE << std::endl;
+              << "  scratch_size=" << SCRATCH_SIZE 
+              << "  ex0 bitstream size=" << EX0_BITSTREAM_SIZE << std::endl;
 
+    
     if (INPUT_SIZE != 16 || OUTPUT_SIZE < 16) {
         std::cout << "[main] WARNING: expected 16-byte in/out for add_int8, got "
                   << INPUT_SIZE << "/" << OUTPUT_SIZE
@@ -187,6 +191,8 @@ int main(int argc, char** argv)
     allocIn.OutputDeviceVA = VA_OUTPUT;
     allocIn.ScratchSize = SCRATCH_SIZE;
     allocIn.ScratchDeviceVA = (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0;
+    allocIn.Exe0BitstreamSize = EX0_BITSTREAM_SIZE;
+    allocIn.Exe0BitstreamDeviceVA = VA_INFER_BITSTREAM;
 
     if (!DeviceIoControl(handle, IOCTL_ALLOC_IO_BUFFERS, &allocIn, sizeof(allocIn), &allocOut, sizeof(allocOut), &bytesReturned, nullptr)) {
         std::cout << "[main] FAIL: IOCTL_ALLOC_IO_BUFFERS: " << GetLastError() << std::endl;
@@ -196,11 +202,13 @@ int main(int argc, char** argv)
     pInputBuf = (void*)allocOut.InputUserVA;
     pOutputBuf = (void*)allocOut.OutputUserVA;
     pScratchBuf = (SCRATCH_SIZE > 0) ? (void*)allocOut.ScratchUserVA : nullptr;
+    pInferBitstream = (void*)allocOut.Exe0BitStreamUserVA;
 
     std::cout << "[main] driver-allocated buffers:"
         << " input=" << pInputBuf << " (PA 0x" << std::hex << allocOut.InputPa << ")"
         << " output=" << pOutputBuf << " (PA 0x" << allocOut.OutputPa << ")"
         << " scratch=" << pScratchBuf << " (PA 0x" << allocOut.ScratchPa << ")"
+        << " infer bitstream=" << pInferBitstream << " (PA 0x" << allocOut.Exe0BitstreamPa << ")"
         << std::dec << std::endl;
 
     // -------------------------------------------------------------------------
@@ -298,26 +306,8 @@ int main(int argc, char** argv)
         apex_fb::DumpPatchedVAs(model);
         apex_fb::DumpPatchRawValues(model, "POST-PATCH");
 
-        pInferBitstream = AlignedAlloc4K(model.bitstream.size());
-        if (!pInferBitstream) {
-            std::cout << "[main] FAIL: alloc INFER bitstream buffer" << std::endl;
-            goto cleanup;
-        }
-        memcpy(pInferBitstream, model.bitstream.data(), model.bitstream.size());
-
-        MAP_BUFFER_INPUT mapBs = {};
-        mapBs.UserAddress   = (UINT64)pInferBitstream;
-        mapBs.Size          = model.bitstream.size();
-        mapBs.DeviceAddress = VA_INFER_BITSTREAM;
-        if (!DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapBs, sizeof(mapBs),
-                             nullptr, 0, &bytesReturned, nullptr)) {
-            std::cout << "[main] FAIL: IOCTL_MAP_BUFFER (infer bitstream): " << GetLastError() << std::endl;
-            goto cleanup;
-        }
-        std::cout << "[main] mapped INFER bitstream @ 0x"
-                  << std::hex << VA_INFER_BITSTREAM << std::dec << std::endl;
+        memcpy((void*)allocOut.Exe0BitStreamUserVA, model.bitstream.data(), model.bitstream.size());
     }
-
 
     // -------------------------------------------------------------------------
     // Allocate input/output/scratch. Fill input with the 16-byte golden vector.
@@ -338,9 +328,9 @@ int main(int argc, char** argv)
     // INFER
     // -------------------------------------------------------------------------
     {
-        DWORD inferIoctl = useInferWithParam ? IOCTL_INFER_WITH_PARAM : IOCTL_INFER;
+        /*DWORD inferIoctl = useInferWithParam ? IOCTL_INFER_WITH_PARAM : IOCTL_INFER;
         std::cout << "[main] calling " << (useInferWithParam ? "IOCTL_INFER_WITH_PARAM" : "IOCTL_INFER")
-                  << "..." << std::endl;
+                  << "..." << std::endl;*/
 
         IOCTL_INFER_INFO ii = {};
         ii.InputImageAddr    = (UINT64)pInputBuf;
@@ -355,7 +345,7 @@ int main(int argc, char** argv)
         ii.ScratchSize       = SCRATCH_SIZE;
         ii.ScratchDeviceVA   = (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0;
 
-        BOOL ok = DeviceIoControl(handle, inferIoctl, &ii, sizeof(ii),
+        BOOL ok = DeviceIoControl(handle, IOCTL_INFER_NEW, &ii, sizeof(ii),
                                   nullptr, 0, &bytesReturned, nullptr);
         if (ok) {
             std::cout << "[main] INFER OK" << std::endl;
@@ -417,7 +407,7 @@ int main(int argc, char** argv)
     // Unmap INFER bitstream. Param-side stays mapped; the driver releases it
     // during FileCleanup when the device handle is closed.
     // -------------------------------------------------------------------------
-    {
+    /*{
         UNMAP_BUFFER_INPUT um = {};
         um.DeviceAddress = VA_INFER_BITSTREAM;
         um.Size          = model.bitstream.size();
@@ -427,11 +417,9 @@ int main(int argc, char** argv)
         } else {
             std::cout << "[main] IOCTL_UNMAP_BUFFER failed: " << GetLastError() << std::endl;
         }
-    }
+    }*/
 
 cleanup:
-    AlignedFree(pInferBitstream);
-
     {
         DeviceIoControl(handle, IOCTL_FREE_IO_BUFFERS,
             nullptr, 0, nullptr, 0, &bytesReturned, nullptr);
