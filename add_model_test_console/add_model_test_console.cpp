@@ -52,13 +52,18 @@ static const uint8_t kGoldenOutput[16] = {
 // Simple VA mode (1-level chip PTE register file, [0..6143]).
 //   - bit63 안 셋팅 → ApexPageTableMap / IOCTL_ALLOC_IO_BUFFERS 의 simple-VA 분기로 들어간다.
 //   - PTE 인덱스 = VA >> 12. 모두 < 6144 (= 0x600_0000) 이어야 함.
-//   - VA_PARAM_DATA 와 VA_INPUT 은 의도적으로 같은 슬롯 (Phase1 끝나면 Phase2 가 재사용).
-static const uint64_t VA_PARAM_DATA            = 0x000000ULL;  // exe1 parameters (Phase 1)
+//   - VA=0 (PTE[0]) 은 chip이 null/invalid 로 취급할 위험이 있어 *어떤 데이터 슬롯에도 쓰지 말 것*.
+//     libedgetpu도 모든 매핑을 0x1000000 이상에서 시작하며 0번을 비워둠.
+//     VA_PARAM_DATA만 0인 이유: STAND_ALONE 모델에서는 param 단계 자체가 없어서 PTE[0]에
+//     아무것도 안 박힘 (실제 INFER 경로에서 chip이 PTE[0]을 lookup할 일 없음).
+//     param이 있는 모델로 확장할 때는 VA_PARAM_DATA 도 0이 아닌 값(예: 0x004000)으로 옮길 것.
+static const uint64_t VA_PARAM_DATA            = 0x000000ULL;  // exe1 parameters (Phase 1, STAND_ALONE에선 미사용)
 static const uint64_t VA_PARAM_BITSTREAM       = 0x840000ULL;  // exe1 bitstream      (PTE idx 0x840 = 2112)
 static const uint64_t VA_INFER_BITSTREAM       = 0x900000ULL;  // exe0 bitstream      (PTE idx 0x900 = 2304)
-static const uint64_t VA_INPUT                 = 0x000000ULL;  //                     (PTE idx 0)
-static const uint64_t VA_OUTPUT                = 0x002000ULL;  //                     (PTE idx 2)
-static const uint64_t VA_SCRATCH               = 0x003000ULL;  //                     (PTE idx 3)
+//static const uint64_t VA_INPUT = 0x000000ULL;  // input               (PTE idx 1)  ★ 0 금지
+static const uint64_t VA_INPUT                 = 0x001000ULL;  // input               (PTE idx 1)  ★ 0 금지
+static const uint64_t VA_OUTPUT                = 0x002000ULL;  // output              (PTE idx 2)
+static const uint64_t VA_SCRATCH               = 0x003000ULL;  // scratch             (PTE idx 3)
 static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern  (PTE idx 0x800 = 2048)
 
 // -----------------------------------------------------------------------------
@@ -407,7 +412,7 @@ int main(int argc, char** argv)
     // Unmap INFER bitstream. Param-side stays mapped; the driver releases it
     // during FileCleanup when the device handle is closed.
     // -------------------------------------------------------------------------
-    /*{
+    {
         UNMAP_BUFFER_INPUT um = {};
         um.DeviceAddress = VA_INFER_BITSTREAM;
         um.Size          = model.bitstream.size();
@@ -417,7 +422,7 @@ int main(int argc, char** argv)
         } else {
             std::cout << "[main] IOCTL_UNMAP_BUFFER failed: " << GetLastError() << std::endl;
         }
-    }*/
+    }
 
 cleanup:
     {

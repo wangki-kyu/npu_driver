@@ -518,7 +518,17 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
                        ? (uint32_t)(va & 0xFFFFFFFF)
                        : (uint32_t)(va >> 32);
 
-        std::memcpy(model.bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
+        // 6bit 
+        uint32_t shift = p.offset_bit % 8;
+        size_t off = p.offset_bit / 8;
+        uint64_t shifted_val = ((uint64_t)val) << shift;    // 패치 값을 shift만큼 left
+        uint64_t shifted_mask = ((uint64_t)0xFFFFFFFF) << shift; // 덮어쓸 32비트만 1로 표시 
+        uint64_t cur;
+        std::memcpy(&cur, model.bitstream.data() + off, 8); //기존 8바이트 읽기 
+        cur = (cur & ~shifted_mask) | (shifted_val & shifted_mask); // 패치 영역만 교체 
+        std::memcpy(model.bitstream.data() + off, &cur, 8); // 다시 쓰기
+
+        //std::memcpy(model.bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
     }
 }
 

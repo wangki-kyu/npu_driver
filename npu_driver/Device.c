@@ -706,11 +706,14 @@ npudriverEvtDevicePrepareHardware(
 		//   0x44198 = PARAMETER_POP
 		//   0x441d8 = INFEED
 		//   0x44218 = OUTFEED
-		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,        1);
-		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    1);
-		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);
-		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,        1);
-		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       1);
+		// libedgetpu run_controller.cc:79+ uses 64-bit Write for all RUN_CONTROL
+		// regs. 32-bit access can leave the upper half undefined and the engine
+		// silently never starts (OUTFEED stays idle, output buffer 0).
+		apex_write_register(bar2, APEX_REG_SCALAR_RUN_CONTROL,        1);
+		apex_write_register(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,    1);
+		apex_write_register(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_INFEED_RUN_CONTROL,        1);
+		apex_write_register(bar2, APEX_REG_OUTFEED_RUN_CONTROL,       1);
 
 		// Phase 2: TILE_CONFIG0 broadcast + readback confirm.
 		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
@@ -734,16 +737,16 @@ npudriverEvtDevicePrepareHardware(
 		//   0x40190 = RING_BUS_CONSUMER0
 		//   0x401d0 = RING_BUS_CONSUMER1
 		//   0x40210 = RING_BUS_PRODUCER
-		apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
-		apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
-		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
-		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
-		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
-		apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
+		apex_write_register(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
+		apex_write_register(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
+		apex_write_register(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
+		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
 		DbgPrint("[%s] Run controls set (all units kRunning)\n", __FUNCTION__);
 
 		// Phase 4: STATUS_BLOCK_UPDATE = 0 (must come AFTER all run controls per

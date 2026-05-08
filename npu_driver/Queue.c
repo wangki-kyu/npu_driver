@@ -178,6 +178,99 @@ VOID npudriverEvtIoDeviceControl(
 			break;
 		}
 
+		// ============================================================================
+		// BS-FULL DUMP — bitstream 전체 hex dump + patch placeholder 스캔
+		//   2384 byte 짜리 identity 모델 정도면 통째 dump해도 KD 콘솔이 감당 가능.
+		//   목적: bitstream 안에 OUTFEED destination VA가 0x2000(우리 output)으로 박혔는지,
+		//         아니면 placeholder/엉뚱한 VA가 박혔는지 확인.
+		//   토글: BS_FULL_DUMP 1→0 으로 끄기.
+		// ============================================================================
+		#define BS_FULL_DUMP 1
+		#if BS_FULL_DUMP
+		do {
+			ALLOC_IO_SLOT* bsSlot = &pDc->IOSlots[IO_SLOT_EXE0_BS];
+			if (bsSlot->Kva == NULL) {
+				DbgPrint("[BS-FULL] EXE0_BS slot empty — skipping bitstream dump\n");
+				break;
+			}
+
+			SIZE_T claimed = (SIZE_T)pIn->BitstreamSize;
+			SIZE_T slotSz = bsSlot->Size;
+			SIZE_T sz = claimed;
+			if (sz == 0 || sz > slotSz) sz = slotSz;
+
+			DbgPrint("[BS-FULL] BitstreamDeviceVA=0x%llx claimed_size=0x%llx (%llu B) "
+				"slot_size=0x%llx | InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx ScratchSize=0x%llx\n",
+				pIn->BitstreamDeviceVA, (UINT64)claimed, (UINT64)claimed,
+				(UINT64)slotSz,
+				pIn->InputDeviceVA, pIn->OutputDeviceVA,
+				pIn->ScratchDeviceVA, pIn->ScratchSize);
+
+			// 16 byte/줄 hex dump — tail 잔여(< 16 byte)는 zero-pad 해서 같은 포맷으로 출력.
+			// slot은 4KB 잡혀 있어서 sz를 16 byte 정렬 위로 round-up 해도 over-read 안 남.
+			PUCHAR bs = (PUCHAR)bsSlot->Kva;
+			SIZE_T szPadded = (sz + 15) & ~(SIZE_T)15;
+			SIZE_T bsOff;
+			for (bsOff = 0; bsOff < szPadded; bsOff += 16) {
+				DbgPrint("[BS-FULL] %04llx: %02x %02x %02x %02x %02x %02x %02x %02x  "
+					"%02x %02x %02x %02x %02x %02x %02x %02x%s\n",
+					(UINT64)bsOff,
+					bs[bsOff+0],bs[bsOff+1],bs[bsOff+2],bs[bsOff+3],
+					bs[bsOff+4],bs[bsOff+5],bs[bsOff+6],bs[bsOff+7],
+					bs[bsOff+8],bs[bsOff+9],bs[bsOff+10],bs[bsOff+11],
+					bs[bsOff+12],bs[bsOff+13],bs[bsOff+14],bs[bsOff+15],
+					(bsOff + 16 > sz) ? "  (incl. post-claimed bytes)" : "");
+			}
+
+			// 32-bit LE 스캔 — 입출력 VA / 일반 placeholder 패턴 / 의심 영역 매칭
+			DbgPrint("[BS-SCAN] looking for InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx "
+				"+ placeholders 0xDEADBEEF / 0xCAFEBABE / 0xABADCAFE / 0x00000000 "
+				"+ IQ/SB area (0x1000000~0x1002000)\n",
+				pIn->InputDeviceVA, pIn->OutputDeviceVA, pIn->ScratchDeviceVA);
+
+			PUINT32 dw = (PUINT32)bs;
+			SIZE_T dwords = sz / 4;
+			SIZE_T k;
+			ULONG hit_in = 0, hit_out = 0, hit_sc = 0, hit_magic = 0, hit_iq = 0;
+			for (k = 0; k < dwords; ++k) {
+				UINT32 v = dw[k];
+				const char* tag = NULL;
+				if (v == (UINT32)pIn->InputDeviceVA  && pIn->InputDeviceVA  != 0) { tag = "INPUT_VA"; hit_in++; }
+				else if (v == (UINT32)pIn->OutputDeviceVA && pIn->OutputDeviceVA != 0) { tag = "OUTPUT_VA"; hit_out++; }
+				else if (v == (UINT32)pIn->ScratchDeviceVA && pIn->ScratchDeviceVA != 0) { tag = "SCRATCH_VA"; hit_sc++; }
+				else if (v == 0xDEADBEEFu) { tag = "DEADBEEF"; hit_magic++; }
+				else if (v == 0xCAFEBABEu) { tag = "CAFEBABE"; hit_magic++; }
+				else if (v == 0xABADCAFEu) { tag = "ABADCAFE"; hit_magic++; }
+				else if (v >= 0x01000000u && v < 0x01002000u) { tag = "IQ/SB_AREA"; hit_iq++; }
+				// 기존 if-else 체인 끝에 한 가지 더:
+				else if (v != 0 && v < 0x01000000u && (v & 0xFFFu) == 0) {
+					// page-aligned, < 16MB (simple PT 영역) — VA 후보
+					tag = "VA?";
+				}
+
+				if (tag) {
+					DbgPrint("[BS-SCAN] +0x%04llx: 0x%08x  (%s)\n",
+						(UINT64)(k*4), v, tag);
+				}
+			}
+
+			DbgPrint("[BS-SCAN] hits: input=%u output=%u scratch=%u magic=%u iq_area=%u\n",
+				hit_in, hit_out, hit_sc, hit_magic, hit_iq);
+
+			// 진단 힌트
+			if (hit_out == 0 && pIn->OutputDeviceVA != 0) {
+				DbgPrint("[BS-SCAN] !!! OutputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
+					"compiler가 다른 VA를 hardcode했거나 patch 단계가 누락됨\n",
+					pIn->OutputDeviceVA);
+			}
+			if (hit_in == 0 && pIn->InputDeviceVA != 0) {
+				DbgPrint("[BS-SCAN] !!! InputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
+					"input도 patch 누락 또는 bitstream이 다른 VA 기대\n",
+					pIn->InputDeviceVA);
+			}
+		} while (0);
+		#endif
+
 		// [3] 완료 이벤트 reset + 모든 engine kRun
 		// tile_config0 도 다시 박아준다. (engine 이 RUN_CONTROL 거부 방지).
 		KeClearEvent(&pDc->InferCompleteEvent);
@@ -190,21 +283,21 @@ VOID npudriverEvtIoDeviceControl(
 		// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로, 
 		// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다. 
 		//																		// 엔진 종류			
-		apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL, 1);			// Scalar Core, 제어 흐름 / 주소 계산 담당 스칼라 프로세서 기동 		
-		apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL, 1);		// Activation	activation 데이터를 narrow memory -> 연산 유닛으로 push 
-		apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);	// 가중치(Weights)를 parameter memory -> MAC array로 push
-		apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL, 1);			// host -> chip 입력 데이터 DMA 엔진 기동 
-		apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL, 1);			// chip -> host 출력 데이터 dma 엔진 기동 
-		apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL, 1);			// MAC array 연산 명령 디스패처, 실제 compute 수행
-		apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL, 1);	// narrow(int8) -> wide(int32 accumulator) 폭 변환 버스 
-		apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL, 1);	// wide(int32 acc) -> narrow(int8 quantized) 폭 변환 버스 
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
-		apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
-		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #0
-		apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #1
-		apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL, 1);	// 칩이 호스트로 완료/응답을 보내는 ring 송신 엔진
+		apex_write_register(bar2, APEX_REG_SCALAR_RUN_CONTROL, 1);			// Scalar Core, 제어 흐름 / 주소 계산 담당 스칼라 프로세서 기동
+		apex_write_register(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL, 1);		// Activation	activation 데이터를 narrow memory -> 연산 유닛으로 push
+		apex_write_register(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);	// 가중치(Weights)를 parameter memory -> MAC array로 push
+		apex_write_register(bar2, APEX_REG_INFEED_RUN_CONTROL, 1);			// host -> chip 입력 데이터 DMA 엔진 기동
+		apex_write_register(bar2, APEX_REG_OUTFEED_RUN_CONTROL, 1);			// chip -> host 출력 데이터 dma 엔진 기동
+		apex_write_register(bar2, APEX_REG_TILE_OP_RUN_CONTROL, 1);			// MAC array 연산 명령 디스패처, 실제 compute 수행
+		apex_write_register(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL, 1);	// narrow(int8) -> wide(int32 accumulator) 폭 변환 버스
+		apex_write_register(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL, 1);	// wide(int32 acc) -> narrow(int8 quantized) 폭 변환 버스
+		apex_write_register(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #0
+		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #1
+		apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL, 1);	// 칩이 호스트로 완료/응답을 보내는 ring 송신 엔진
 		KeStallExecutionProcessor(1000); // 1ms settle
 
 		if (pDc->StatusBlockBase != NULL) {
@@ -213,6 +306,93 @@ VOID npudriverEvtIoDeviceControl(
 				base[0], base[1], base[2], base[3], base[4], base[5], base[6], base[7],
 				base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
 		}
+
+		// ============================================================================
+		// PTE TRAP HACK — diagnostic only.
+		//   목적: chip이 OUTFEED를 *어디든* 쏘기만 하면 받아내는 honeypot.
+		//   동작: simple PT 슬롯(0..6143) 중 valid한 PTE 모두 backup → output buffer
+		//         host PA 로 redirect. 단 chip이 read 해야 하는 슬롯(DescRing, StatusBlock,
+		//         input, scratch, bitstream)은 제외 — 안 그러면 chip이 garbage instruction
+		//         읽고 hang.
+		//   복구: KeWaitForSingleObject 직후 무조건 1회 (timeout/success 무관).
+		//   결과: 인퍼런스 끝나고 outSlot->Kva 에 0xCC 외 데이터가 보이면 → chip이
+		//         어딘가에 OUTFEED write 한 것 → patch 누락 확정.
+		//         여전히 0xCC 그대로면 → chip이 OUTFEED 시동 자체를 안 함.
+		//   토글: TRAP_ENABLE 1→0 으로 끄기.
+		// ============================================================================
+		#define TRAP_ENABLE 1
+		UINT64* trapBackup = NULL;
+		BOOLEAN trapActive = FALSE;
+		ULONG trapRedirected = 0;
+		#if TRAP_ENABLE
+		do {
+			if (outSlot == NULL || outSlot->Kva == NULL) {
+				DbgPrint("[TRAP] outSlot null — skipping trap setup\n");
+				break;
+			}
+
+			// 0xCC sentinel fill — chip write 여부를 0xCC→다른값으로 판정
+			RtlFillMemory(outSlot->Kva, outSlot->Size, 0xCC);
+
+			PHYSICAL_ADDRESS outPa = MmGetPhysicalAddress(outSlot->Kva);
+			UINT64 trapPte = ((UINT64)outPa.QuadPart & ~0xFFFULL) | 1;
+
+			// 6144 entries × 8B = 48KB. NonPagedPoolNx, 'TRAP' tag.
+			// (StatusBlockBase 할당과 동일한 deprecation 우회 패턴)
+			#pragma warning(push)
+			#pragma warning(disable:4996)
+			trapBackup = (UINT64*)ExAllocatePoolWithTag(NonPagedPoolNx,
+				sizeof(UINT64) * 6144, 'TRAP');
+			#pragma warning(pop)
+			if (trapBackup == NULL) {
+				DbgPrint("[TRAP] backup alloc failed — skipping\n");
+				break;
+			}
+			RtlZeroMemory(trapBackup, sizeof(UINT64) * 6144);
+
+			// 제외할 PTE 범위 계산 — 각 보호 슬롯의 [start..start+pages) 구간
+			UINT32 inPte    = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
+				? (UINT32)(pDc->IOSlots[IO_SLOT_INPUT].DeviceVa >> 12) : 0xFFFFFFFFu;
+			UINT32 inPages  = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
+				? (UINT32)((pDc->IOSlots[IO_SLOT_INPUT].Size + 0xFFF) >> 12) : 0;
+			UINT32 scPte    = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
+				? (UINT32)(pDc->IOSlots[IO_SLOT_SCRATCH].DeviceVa >> 12) : 0xFFFFFFFFu;
+			UINT32 scPages  = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
+				? (UINT32)((pDc->IOSlots[IO_SLOT_SCRATCH].Size + 0xFFF) >> 12) : 0;
+			UINT32 bsPte    = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
+				? (UINT32)(pDc->IOSlots[IO_SLOT_EXE0_BS].DeviceVa >> 12) : 0xFFFFFFFFu;
+			UINT32 bsPages  = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
+				? (UINT32)((pDc->IOSlots[IO_SLOT_EXE0_BS].Size + 0xFFF) >> 12) : 0;
+
+			UINT32 idx;
+			for (idx = 0; idx < 6144; ++idx) {
+				// hard-exclude — DescRing(4096), StatusBlock(4097)
+				if (idx == 4096 || idx == 4097) continue;
+
+				// input 범위 (chip이 input data를 read)
+				if (inPages && idx >= inPte && idx < inPte + inPages) continue;
+				// scratch 범위 (chip이 intermediate를 read/write)
+				if (scPages && idx >= scPte && idx < scPte + scPages) continue;
+				// bitstream 범위 (chip이 instruction body를 read)
+				if (bsPages && idx >= bsPte && idx < bsPte + bsPages) continue;
+
+				UINT64 pte = apex_read_register(bar2, APEX_REG_PAGE_TABLE + idx * 8);
+				if (!(pte & 1)) continue;  // invalid skip
+
+				trapBackup[idx] = pte;
+				apex_write_register(bar2, APEX_REG_PAGE_TABLE + idx * 8, trapPte);
+				trapRedirected++;
+			}
+
+			DbgPrint("[TRAP] redirected %u valid PTEs → output_pa=0x%llx "
+				"(skip: in[%u..%u] sc[%u..%u] bs[%u..%u] DescRing=4096 SB=4097)\n",
+				trapRedirected, (UINT64)outPa.QuadPart,
+				inPte, inPte + inPages,
+				scPte, scPte + scPages,
+				bsPte, bsPte + bsPages);
+			trapActive = TRUE;
+		} while (0);
+		#endif
 
 		// [4] descriptor submit (single INFER, no PARAM)
 		{
@@ -242,6 +422,56 @@ VOID npudriverEvtIoDeviceControl(
 			LARGE_INTEGER t1; t1.QuadPart = -30000000LL;   // 5 s (음수 = relative, 100ns 단위)
 			status = KeWaitForSingleObject(&pDc->InferCompleteEvent, Executive, KernelMode, FALSE, &t1);
 		}
+
+		// ============================================================================
+		// PTE TRAP RESTORE — 무조건 실행 (timeout / success / error 무관).
+		//   trap setup 시 backup 한 PTE 들을 원래대로 복구. 이후 IOCTL_FREE_IO_BUFFERS
+		//   가 정상 동작해야 하므로 chip page table 이 깨끗해야 함.
+		//   복구 후 trap buffer (= outSlot->Kva) 의 첫 16 byte + non-0xCC 카운트 dump
+		//   → 분석 키:
+		//      non-0xCC count = 0     → chip이 OUTFEED 시동 안 함 (가설 B)
+		//      non-0xCC count > 0    → chip이 어딘가에 write 함 → patch 누락 (가설 A)
+		// ============================================================================
+		#if TRAP_ENABLE
+		if (trapActive && trapBackup != NULL) {
+			ULONG restored = 0;
+			UINT32 idx;
+			for (idx = 0; idx < 6144; ++idx) {
+				if (trapBackup[idx] != 0) {
+					apex_write_register(bar2, APEX_REG_PAGE_TABLE + idx * 8, trapBackup[idx]);
+					restored++;
+				}
+			}
+
+			if (outSlot != NULL && outSlot->Kva != NULL) {
+				PUCHAR p = (PUCHAR)outSlot->Kva;
+				ULONG nonCC = 0;
+				ULONG j;
+				for (j = 0; j < outSlot->Size; ++j) if (p[j] != 0xCC) nonCC++;
+
+				DbgPrint("[TRAP-RESULT] restored %u/%u PTEs | wait_status=0x%x | "
+					"non-0xCC bytes: %u / %llu | first16: "
+					"%02X %02X %02X %02X %02X %02X %02X %02X  "
+					"%02X %02X %02X %02X %02X %02X %02X %02X\n",
+					restored, trapRedirected, (UINT32)status,
+					nonCC, (UINT64)outSlot->Size,
+					p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+					p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+
+				if (nonCC == 0) {
+					DbgPrint("[TRAP-RESULT] DIAGNOSIS: chip이 OUTFEED 시동 안 함 (가설 B) — "
+						"OUTFEED_RUN_CONTROL/STATUS, descriptor binary, instruction stream 점검 필요\n");
+				} else {
+					DbgPrint("[TRAP-RESULT] DIAGNOSIS: chip이 OUTFEED를 어딘가에 write 함 (가설 A) — "
+						"bitstream의 output VA가 우리가 매핑한 VA와 다름 → patch 누락\n");
+				}
+			}
+
+			ExFreePoolWithTag(trapBackup, 'TRAP');
+			trapBackup = NULL;
+			trapActive = FALSE;
+		}
+		#endif
 
 		if (status == STATUS_TIMEOUT) {
 			// 폴링으로 SC_HOST_INT_COUNT 보지 않음 — IRQ가 안 왔다는 사실 자체를 에러로.
@@ -275,8 +505,56 @@ VOID npudriverEvtIoDeviceControl(
 			BOOLEAN fatal = (pDc->IsrSeenPendingBits & APEX_WIRE_BIT_FATAL_ERR) != 0;
 
 			if (fatal || hibErr != 0) {
-				DbgPrint("[INFER_NEW] FATAL: HIB_ERR=0x%x ISR_seen=0x%x\n",
-					hibErr, (UINT32)pDc->IsrSeenPendingBits);
+				// === HIB 진단 — 정확한 레지스터 분리 ===
+				//   0x486f0 hib_error_status        : 현재 에러 비트맵 (real-time)   ← 위 hibErr
+				//   0x48700 hib_first_error_status  : 첫 에러 비트맵 (latched)
+				//   0x48708 hib_first_error_ts     : 첫 에러 cycle 타임스탬프
+				//   0x48738 page_fault_address     : ★ 진짜 fault VA latch ★
+				//   bit 분해 (common_csr_helper.h:108-109): bit0=inbound_page_fault, bit1=extended_page_fault
+				UINT64 hibFirstStatus = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
+				UINT64 hibFirstTs     = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR_TS);
+				UINT64 faultVA        = apex_read_register(bar2, APEX_REG_INFEED_PAGE_FAULT_ADDR);
+
+				DbgPrint("[INFER_NEW] FATAL: HIB_ERR=0x%x ISR_seen=0x%x SC_ERR=0x%x\n",
+					hibErr, (UINT32)pDc->IsrSeenPendingBits, scErr);
+				DbgPrint("[INFER_NEW]   hib_error_status(0x486f0)         = 0x%x  (real-time)\n", hibErr);
+				DbgPrint("[INFER_NEW]   hib_first_error_status(0x48700)   = 0x%llx  (latched)\n", hibFirstStatus);
+				DbgPrint("[INFER_NEW]   hib_first_error_timestamp(0x48708)= 0x%llx\n", hibFirstTs);
+				DbgPrint("[INFER_NEW]   page_fault_address(0x48738)       = 0x%llx  ★ fault VA\n", faultVA);
+
+				// 비트 분해 — real-time + latched 합산
+				UINT32 combined = hibErr | (UINT32)hibFirstStatus;
+				if (combined & (1u<<0))  DbgPrint("[INFER_NEW]   bit0 inbound_page_fault\n");
+				if (combined & (1u<<1))  DbgPrint("[INFER_NEW]   bit1 extended_page_fault\n");
+				combined &= ~0x3u;
+				if (combined)            DbgPrint("[INFER_NEW]   other bits set: 0x%x (별도 디코드 필요)\n", combined);
+
+				// fault VA 가 어느 슬롯/PTE 영역에 해당하는지
+				if (faultVA != 0) {
+					UINT64 faultPteIdx = faultVA >> 12;
+					DbgPrint("[INFER_NEW]   fault VA → PTE[%llu] (%s)\n",
+						faultPteIdx,
+						(faultPteIdx < 6144) ? "simple" : (faultPteIdx < 8192 ? "extended" : "OUT_OF_RANGE"));
+
+					ULONG s;
+					BOOLEAN matchedSlot = FALSE;
+					for (s = 0; s < IO_SLOT_COUNT; ++s) {
+						ALLOC_IO_SLOT* sl = &pDc->IOSlots[s];
+						if (!sl->Kva) continue;
+						if (faultVA >= sl->DeviceVa && faultVA < sl->DeviceVa + sl->Size) {
+							DbgPrint("[INFER_NEW]   fault VA inside slot %u (DeviceVA=0x%llx size=0x%llx) — 매핑은 됐는데 fault\n",
+								s, sl->DeviceVa, (UINT64)sl->Size);
+							matchedSlot = TRUE;
+							break;
+						}
+					}
+					if (!matchedSlot) {
+						DbgPrint("[INFER_NEW]   fault VA가 알려진 슬롯에 없음 — bitstream이 우리가 매핑 안 한 VA를 access함\n");
+					}
+				} else {
+					DbgPrint("[INFER_NEW]   fault VA = 0 → 페이지폴트 아님. instruction stream / descriptor 문제 의심\n");
+				}
+
 				status = STATUS_DEVICE_HARDWARE_ERROR;
 				break;
 			}
@@ -803,21 +1081,21 @@ VOID npudriverEvtIoDeviceControl(
 
 			// kMoveToRun(1) to EVERY engine, regardless of current status.
 			// Don't skip SCALAR — if it's already kRun the write is a no-op.
-			apex_write_register_32(bar2, APEX_REG_SCALAR_RUN_CONTROL,             1);
-			apex_write_register_32(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,         1);
-			apex_write_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL,      1);
-			apex_write_register_32(bar2, APEX_REG_INFEED_RUN_CONTROL,             1);
-			apex_write_register_32(bar2, APEX_REG_OUTFEED_RUN_CONTROL,            1);
-			apex_write_register_32(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
-			apex_write_register_32(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
-			apex_write_register_32(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
-			apex_write_register_32(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
-			apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
-			apex_write_register_32(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
-			apex_write_register_32(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
+			apex_write_register(bar2, APEX_REG_SCALAR_RUN_CONTROL,             1);
+			apex_write_register(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL,         1);
+			apex_write_register(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL,      1);
+			apex_write_register(bar2, APEX_REG_INFEED_RUN_CONTROL,             1);
+			apex_write_register(bar2, APEX_REG_OUTFEED_RUN_CONTROL,            1);
+			apex_write_register(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
+			apex_write_register(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
+			apex_write_register(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
+			apex_write_register(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
+			apex_write_register(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
+			apex_write_register(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
+			apex_write_register(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
+			apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
+			apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
+			apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
 
 			// Settle. 1 ms — much longer than previous 200us.
 			KeStallExecutionProcessor(1000);
@@ -1913,7 +2191,7 @@ VOID npudriverEvtIoDeviceControl(
 			hi.QuadPart = 0xFFFFFFFFLL; // < 4GB. chip MMU 가 32-bit PA만 받으면 필수.
 			none.QuadPart = 0;
 
-			slot->Kva = MmAllocateContiguousMemorySpecifyCache(size4k, lo, hi, none, MmCached);
+			slot->Kva = MmAllocateContiguousMemorySpecifyCache(size4k, lo, hi, none, MmNonCached);
 			if (slot->Kva == NULL) {
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				goto alloc_io_fail;
