@@ -22,6 +22,8 @@ typedef enum _IO_SLOT_INDEX {
 	IO_SLOT_OUTPUT = 1,
 	IO_SLOT_SCRATCH = 2,
 	IO_SLOT_EXE0_BS = 3,
+	IO_SLOT_PARAM_DATA = 4,	// Phase 1 (PARAMETER_CACHING) weights blob
+	IO_SLOT_EXE1_BS = 5,	// Phase 1 bitstream (exe1)
 	IO_SLOT_COUNT
 } IO_SLOT_INDEX;
 

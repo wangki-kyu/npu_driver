@@ -188,8 +188,8 @@ int main(int argc, char** argv)
     uint64_t param_va = 0;
 
     // ioctl -> contiguous allocate 
-    IOCTL_ALLOC_IO_BUFFERS_IN allocIn = {};
-    IOCTL_ALLOC_IO_BUFFERS_OUT allocOut = {};
+    IOCTL_ALLOC_IO_BUFFERS_IN allocIn = { 0 };
+    IOCTL_ALLOC_IO_BUFFERS_OUT allocOut = { 0 };
     allocIn.InputSize = INPUT_SIZE;
     allocIn.InputDeviceVA = VA_INPUT;
     allocIn.OutputSize = OUTPUT_SIZE;
@@ -198,6 +198,10 @@ int main(int argc, char** argv)
     allocIn.ScratchDeviceVA = (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0;
     allocIn.Exe0BitstreamSize = EX0_BITSTREAM_SIZE;
     allocIn.Exe0BitstreamDeviceVA = VA_INFER_BITSTREAM;
+    allocIn.ParamDataSize = 0;
+    allocIn.ParamDataDeviceVA = 0;
+    allocIn.Exe1BitstreamSize = 0;
+    allocIn.Exe1BitstreamDeviceVA = 0;
 
     if (!DeviceIoControl(handle, IOCTL_ALLOC_IO_BUFFERS, &allocIn, sizeof(allocIn), &allocOut, sizeof(allocOut), &bytesReturned, nullptr)) {
         std::cout << "[main] FAIL: IOCTL_ALLOC_IO_BUFFERS: " << GetLastError() << std::endl;

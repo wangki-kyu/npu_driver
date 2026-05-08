@@ -252,8 +252,13 @@ inline ApexModelFb LoadModel(const std::string& path) {
         for (size_t pi = 0; pi < model.patches.size(); pi++) {
             const auto& p = model.patches[pi];
             uint32_t cur = 0;
-            if (p.offset_bit / 8 + 4 <= (int32_t)model.bitstream.size())
-                std::memcpy(&cur, model.bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+            if (p.offset_bit / 8 + 8 <= (int32_t)model.bitstream.size()) {
+                uint32_t shift = p.offset_bit % 8;
+                size_t off = p.offset_bit / 8;
+                uint64_t raw = 0;
+                std::memcpy(&raw, model.bitstream.data() + off, 8);
+                cur = (uint32_t)((raw >> shift) & 0xFFFFFFFF);
+            }
 
             const char* desc_name = "?";
             switch (p.desc) {
@@ -378,8 +383,13 @@ inline ApexModelFb LoadModel(const std::string& path) {
                     for (size_t pi = 0; pi < model.param_patches.size(); pi++) {
                         const auto& p = model.param_patches[pi];
                         uint32_t cur = 0;
-                        if (p.offset_bit / 8 + 4 <= (int32_t)model.param_bitstream.size())
-                            std::memcpy(&cur, model.param_bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+                        if (p.offset_bit / 8 + 8 <= (int32_t)model.param_bitstream.size()) {
+                            uint32_t shift = p.offset_bit % 8;
+                            size_t off = p.offset_bit / 8;
+                            uint64_t raw = 0;
+                            std::memcpy(&raw, model.param_bitstream.data() + off, 8);
+                            cur = (uint32_t)((raw >> shift) & 0xFFFFFFFF);
+                        }
 
                         const char* desc_name = "?";
                         switch (p.desc) {
@@ -423,9 +433,12 @@ inline void DumpPatchedVAs(const ApexModelFb& model) {
     std::vector<uint64_t> out_hi(model.output_layers.size(), 0);
 
     for (const auto& p : model.patches) {
-        if (p.offset_bit / 8 + 4 > (int32_t)model.bitstream.size()) continue;
-        uint32_t val = 0;
-        std::memcpy(&val, model.bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+        if (p.offset_bit / 8 + 8 > (int32_t)model.bitstream.size()) continue;
+        uint32_t shift = p.offset_bit % 8;
+        size_t off = p.offset_bit / 8;
+        uint64_t cur = 0;
+        std::memcpy(&cur, model.bitstream.data() + off, 8);
+        uint32_t val = (uint32_t)((cur >> shift) & 0xFFFFFFFF);
         bool lo = (p.position == Position_LOWER_32BIT);
         switch (p.desc) {
         case Description_BASE_ADDRESS_INPUT_ACTIVATION:
@@ -468,9 +481,14 @@ inline void DumpPatchRawValues(const ApexModelFb& model, const char* tag) {
     using namespace platforms::darwinn;
     for (size_t pi = 0; pi < model.patches.size(); pi++) {
         const auto& p = model.patches[pi];
-        uint32_t cur = 0;
-        if (p.offset_bit / 8 + 4 <= (int32_t)model.bitstream.size())
-            std::memcpy(&cur, model.bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+        uint32_t val = 0;
+        if (p.offset_bit / 8 + 8 <= (int32_t)model.bitstream.size()) {
+            uint32_t shift = p.offset_bit % 8;
+            size_t off = p.offset_bit / 8;
+            uint64_t cur = 0;
+            std::memcpy(&cur, model.bitstream.data() + off, 8);
+            val = (uint32_t)((cur >> shift) & 0xFFFFFFFF);
+        }
         const char* desc_name = "?";
         switch (p.desc) {
         case Description_BASE_ADDRESS_INPUT_ACTIVATION:  desc_name = "INPUT";   break;
@@ -486,7 +504,7 @@ inline void DumpPatchRawValues(const ApexModelFb& model, const char* tag) {
         sprintf_s(buf, sizeof(buf),
             "[%s] patch[%zu] %s.%s name='%s' off=0x%x value=0x%08x\n",
             tag, pi, desc_name, pos_name, p.name.c_str(),
-            (unsigned)(p.offset_bit / 8), cur);
+            (unsigned)(p.offset_bit / 8), val);
         std::cout << buf;
         //OutputDebugStringA(buf);
     }
@@ -518,7 +536,7 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
                        ? (uint32_t)(va & 0xFFFFFFFF)
                        : (uint32_t)(va >> 32);
 
-        // 6bit 
+        // 6bit offset
         uint32_t shift = p.offset_bit % 8;
         size_t off = p.offset_bit / 8;
         uint64_t shifted_val = ((uint64_t)val) << shift;    // 패치 값을 shift만큼 left
@@ -536,16 +554,59 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
 inline void PatchParamBitstreamVAs(ApexModelFb& model, uint64_t param_va) {
     using namespace platforms::darwinn;
     for (const auto& p : model.param_patches) {
-        if (p.offset_bit / 8 + 4 > (int32_t)model.param_bitstream.size()) continue;
         uint64_t va = 0;
         switch (p.desc) {
         case Description_BASE_ADDRESS_PARAMETER: va = param_va; break;
         default: continue;
         }
+
+        if (p.offset_bit / 8 + 8 > (int32_t)model.param_bitstream.size()) continue;
+
         uint32_t val = (p.position == Position_LOWER_32BIT)
                        ? (uint32_t)(va & 0xFFFFFFFF)
                        : (uint32_t)(va >> 32);
-        std::memcpy(model.param_bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
+
+        // 6bit offset
+        uint32_t shift = p.offset_bit % 8;
+        size_t off = p.offset_bit / 8;
+        uint64_t shifted_val = ((uint64_t)val) << shift;    // 패치 값을 shift만큼 left
+        uint64_t shifted_mask = ((uint64_t)0xFFFFFFFF) << shift; // 덮어쓸 32비트만 1로 표시 
+        uint64_t cur;
+        std::memcpy(&cur, model.param_bitstream.data() + off, 8); //기존 8바이트 읽기 
+        cur = (cur & ~shifted_mask) | (shifted_val & shifted_mask); // 패치 영역만 교체 
+        std::memcpy(model.param_bitstream.data() + off, &cur, 8); // 다시 쓰기
+
+        //std::memcpy(model.param_bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
+    }
+}
+
+inline void DumpParamPatchRawValues(const ApexModelFb& model) {
+    using namespace platforms::darwinn;
+    if (model.param_patches.empty()) {
+        std::cout << "  [param patches] none" << std::endl;
+        return;
+    }
+    for (size_t pi = 0; pi < model.param_patches.size(); pi++) {
+        const auto& p = model.param_patches[pi];
+        uint32_t val = 0;
+        if (p.offset_bit / 8 + 8 <= (int32_t)model.param_bitstream.size()) {
+            uint32_t shift = p.offset_bit % 8;
+            size_t off = p.offset_bit / 8;
+            uint64_t cur = 0;
+            std::memcpy(&cur, model.param_bitstream.data() + off, 8);
+            val = (uint32_t)((cur >> shift) & 0xFFFFFFFF);
+        }
+        const char* desc_name = "?";
+        switch (p.desc) {
+        case Description_BASE_ADDRESS_PARAMETER: desc_name = "PARAM"; break;
+        default: break;
+        }
+        const char* pos_name =
+            (p.position == Position_LOWER_32BIT) ? "LO32" :
+            (p.position == Position_UPPER_32BIT) ? "HI32" : "?";
+        std::cout << "  [param patch " << pi << "] " << desc_name << "." << pos_name
+                  << " off=0x" << std::hex << (p.offset_bit / 8)
+                  << " value=0x" << std::setfill('0') << std::setw(8) << val << std::dec << std::endl;
     }
 }
 
@@ -553,9 +614,12 @@ inline void DumpParamPatchedVAs(const ApexModelFb& model) {
     using namespace platforms::darwinn;
     uint64_t param_lo = 0, param_hi = 0;
     for (const auto& p : model.param_patches) {
-        if (p.offset_bit / 8 + 4 > (int32_t)model.param_bitstream.size()) continue;
-        uint32_t val = 0;
-        std::memcpy(&val, model.param_bitstream.data() + p.offset_bit / 8, sizeof(uint32_t));
+        if (p.offset_bit / 8 + 8 > (int32_t)model.param_bitstream.size()) continue;
+        uint32_t shift = p.offset_bit % 8;
+        size_t off = p.offset_bit / 8;
+        uint64_t cur = 0;
+        std::memcpy(&cur, model.param_bitstream.data() + off, 8);
+        uint32_t val = (uint32_t)((cur >> shift) & 0xFFFFFFFF);
         bool lo = (p.position == Position_LOWER_32BIT);
         if (p.desc == Description_BASE_ADDRESS_PARAMETER) {
             if (lo) param_lo = val; else param_hi = val;

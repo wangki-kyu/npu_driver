@@ -20,6 +20,15 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 
+// device VA 세팅 
+static const uint64_t VA_PARAM_DATA = 0x000000ULL;  // exe1 parameters (Phase 1, STAND_ALONE에선 미사용)
+static const uint64_t VA_PARAM_BITSTREAM = 0x840000ULL;  // exe1 bitstream      (PTE idx 0x840 = 2112)
+static const uint64_t VA_INFER_BITSTREAM = 0x900000ULL;  // exe0 bitstream      (PTE idx 0x900 = 2304)
+static const uint64_t VA_INPUT = 0x001000ULL;  // input               (PTE idx 1)  ★ 0 금지
+static const uint64_t VA_OUTPUT = 0x002000ULL;  // output              (PTE idx 2)
+static const uint64_t VA_SCRATCH = 0x003000ULL;  // scratch             (PTE idx 3)
+static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern  (PTE idx 0x800 = 2048)
+
 // Load model file from disk
 std::vector<char> LoadModelFile(const char* filename)
 {
@@ -181,12 +190,12 @@ int main()
     // Initialize COM for WIC
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
-    // 1. Load model using apex_model_fb.hpp
     std::cout << "Loading model..." << std::endl;
     //apex_fb::ApexModelFb model = apex_fb::LoadModel(".\\models\\ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite");
     apex_fb::ApexModelFb model = apex_fb::LoadModel(".\\models\\ssd_mobilenet_v2_face_quant_postprocess_edgetpu.tflite");
 
     if (model.bitstream.empty()) {
+    // 1. Load model using apex_model_fb.hpp
         std::cout << "Failed to load or parse model file" << std::endl;
         CloseHandle(handle);
         return 1;
@@ -203,8 +212,16 @@ int main()
     std::cout << "Input layer: " << model.input_layers[0].name << " (size: " << model.input_layers[0].size_bytes << " bytes)" << std::endl;
     std::cout << "Output layer: " << model.output_layers[0].name << " (size: " << model.output_layers[0].size_bytes << " bytes)" << std::endl;
     
-
     DWORD bytesReturned = 0;
+
+    // User buffer pointers -- single cleanup path frees them all.
+    //void* pParamData = nullptr; // exe1.parameters() data
+    //void* pParamBitstream = nullptr; // exe1 bitstream
+    //void* pExe0Phase1Bs = nullptr; // exe0 bitstream copy mapped during Phase1
+    //void* pInferBitstream = nullptr; // exe0 bitstream (patched) for INFER mapping
+    //void* pInputBuf = nullptr;
+    //void* pOutputBuf = nullptr;
+    //void* pScratchBuf = nullptr;
 
     // EXTENDED VA mode — match working libedgetpu trace exactly.  All buffers
     // (PARAM data/bitstream, INFER bitstream, INPUT, OUTPUT, SCRATCH) live in

@@ -33,6 +33,9 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 #define IOCTL_INFER_NEW \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_IN_DIRECT, FILE_WRITE_ACCESS)
 
+#define IOCTL_PARAM_CACHE_NEW \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
 typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
     UINT64 InputSize;       // bytes (0 = skip)
     UINT64 InputDeviceVA;       // chip device VA (4 KB align). extended VA 권장.
@@ -42,6 +45,11 @@ typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
     UINT64 ScratchDeviceVA; // 0 + ScratchSize = 0 이면 skip
     UINT64 Exe0BitstreamSize;
     UINT64 Exe0BitstreamDeviceVA;
+    // Phase 1 (PARAMETER_CACHING) 슬롯. STAND_ALONE 모델은 size=0 으로 두면 driver 가 skip.
+    UINT64 ParamDataSize;        // exe1.parameters() blob (weights, ~MB 단위)
+    UINT64 ParamDataDeviceVA;
+    UINT64 Exe1BitstreamSize;    // PARAMETER_CACHING bitstream
+    UINT64 Exe1BitstreamDeviceVA;
 } IOCTL_ALLOC_IO_BUFFERS_IN;
 
 typedef struct _IOCTL_ALLOC_IO_BUFFERS_OUT {
@@ -49,10 +57,14 @@ typedef struct _IOCTL_ALLOC_IO_BUFFERS_OUT {
     UINT64 OutputUserVA;
     UINT64 ScratchUserVA;
     UINT64 Exe0BitStreamUserVA;
+    UINT64 ParamDataUserVA;
+    UINT64 Exe1BitstreamUserVA;
     UINT64 InputPa;          // (디버그용) 첫 페이지 PA contiguous 라 한 개로 충분.
     UINT64 OutputPa;
     UINT64 ScratchPa;
     UINT64 Exe0BitstreamPa;
+    UINT64 ParamDataPa;
+    UINT64 Exe1BitstreamPa;
 } IOCTL_ALLOC_IO_BUFFERS_OUT;
 
 // parameter caching (Phase 1): load weights into on-chip SRAM via PARAMETER_CACHING executable

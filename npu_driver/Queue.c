@@ -185,91 +185,91 @@ VOID npudriverEvtIoDeviceControl(
 		//         아니면 placeholder/엉뚱한 VA가 박혔는지 확인.
 		//   토글: BS_FULL_DUMP 1→0 으로 끄기.
 		// ============================================================================
-		#define BS_FULL_DUMP 1
-		#if BS_FULL_DUMP
-		do {
-			ALLOC_IO_SLOT* bsSlot = &pDc->IOSlots[IO_SLOT_EXE0_BS];
-			if (bsSlot->Kva == NULL) {
-				DbgPrint("[BS-FULL] EXE0_BS slot empty — skipping bitstream dump\n");
-				break;
-			}
+		//#define BS_FULL_DUMP 1
+		//#if BS_FULL_DUMP
+		//do {
+		//	ALLOC_IO_SLOT* bsSlot = &pDc->IOSlots[IO_SLOT_EXE0_BS];
+		//	if (bsSlot->Kva == NULL) {
+		//		DbgPrint("[BS-FULL] EXE0_BS slot empty — skipping bitstream dump\n");
+		//		break;
+		//	}
 
-			SIZE_T claimed = (SIZE_T)pIn->BitstreamSize;
-			SIZE_T slotSz = bsSlot->Size;
-			SIZE_T sz = claimed;
-			if (sz == 0 || sz > slotSz) sz = slotSz;
+		//	SIZE_T claimed = (SIZE_T)pIn->BitstreamSize;
+		//	SIZE_T slotSz = bsSlot->Size;
+		//	SIZE_T sz = claimed;
+		//	if (sz == 0 || sz > slotSz) sz = slotSz;
 
-			DbgPrint("[BS-FULL] BitstreamDeviceVA=0x%llx claimed_size=0x%llx (%llu B) "
-				"slot_size=0x%llx | InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx ScratchSize=0x%llx\n",
-				pIn->BitstreamDeviceVA, (UINT64)claimed, (UINT64)claimed,
-				(UINT64)slotSz,
-				pIn->InputDeviceVA, pIn->OutputDeviceVA,
-				pIn->ScratchDeviceVA, pIn->ScratchSize);
+		//	DbgPrint("[BS-FULL] BitstreamDeviceVA=0x%llx claimed_size=0x%llx (%llu B) "
+		//		"slot_size=0x%llx | InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx ScratchSize=0x%llx\n",
+		//		pIn->BitstreamDeviceVA, (UINT64)claimed, (UINT64)claimed,
+		//		(UINT64)slotSz,
+		//		pIn->InputDeviceVA, pIn->OutputDeviceVA,
+		//		pIn->ScratchDeviceVA, pIn->ScratchSize);
 
-			// 16 byte/줄 hex dump — tail 잔여(< 16 byte)는 zero-pad 해서 같은 포맷으로 출력.
-			// slot은 4KB 잡혀 있어서 sz를 16 byte 정렬 위로 round-up 해도 over-read 안 남.
-			PUCHAR bs = (PUCHAR)bsSlot->Kva;
-			SIZE_T szPadded = (sz + 15) & ~(SIZE_T)15;
-			SIZE_T bsOff;
-			for (bsOff = 0; bsOff < szPadded; bsOff += 16) {
-				DbgPrint("[BS-FULL] %04llx: %02x %02x %02x %02x %02x %02x %02x %02x  "
-					"%02x %02x %02x %02x %02x %02x %02x %02x%s\n",
-					(UINT64)bsOff,
-					bs[bsOff+0],bs[bsOff+1],bs[bsOff+2],bs[bsOff+3],
-					bs[bsOff+4],bs[bsOff+5],bs[bsOff+6],bs[bsOff+7],
-					bs[bsOff+8],bs[bsOff+9],bs[bsOff+10],bs[bsOff+11],
-					bs[bsOff+12],bs[bsOff+13],bs[bsOff+14],bs[bsOff+15],
-					(bsOff + 16 > sz) ? "  (incl. post-claimed bytes)" : "");
-			}
+		//	// 16 byte/줄 hex dump — tail 잔여(< 16 byte)는 zero-pad 해서 같은 포맷으로 출력.
+		//	// slot은 4KB 잡혀 있어서 sz를 16 byte 정렬 위로 round-up 해도 over-read 안 남.
+		//	PUCHAR bs = (PUCHAR)bsSlot->Kva;
+		//	SIZE_T szPadded = (sz + 15) & ~(SIZE_T)15;
+		//	SIZE_T bsOff;
+		//	for (bsOff = 0; bsOff < szPadded; bsOff += 16) {
+		//		DbgPrint("[BS-FULL] %04llx: %02x %02x %02x %02x %02x %02x %02x %02x  "
+		//			"%02x %02x %02x %02x %02x %02x %02x %02x%s\n",
+		//			(UINT64)bsOff,
+		//			bs[bsOff+0],bs[bsOff+1],bs[bsOff+2],bs[bsOff+3],
+		//			bs[bsOff+4],bs[bsOff+5],bs[bsOff+6],bs[bsOff+7],
+		//			bs[bsOff+8],bs[bsOff+9],bs[bsOff+10],bs[bsOff+11],
+		//			bs[bsOff+12],bs[bsOff+13],bs[bsOff+14],bs[bsOff+15],
+		//			(bsOff + 16 > sz) ? "  (incl. post-claimed bytes)" : "");
+		//	}
 
-			// 32-bit LE 스캔 — 입출력 VA / 일반 placeholder 패턴 / 의심 영역 매칭
-			DbgPrint("[BS-SCAN] looking for InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx "
-				"+ placeholders 0xDEADBEEF / 0xCAFEBABE / 0xABADCAFE / 0x00000000 "
-				"+ IQ/SB area (0x1000000~0x1002000)\n",
-				pIn->InputDeviceVA, pIn->OutputDeviceVA, pIn->ScratchDeviceVA);
+		//	// 32-bit LE 스캔 — 입출력 VA / 일반 placeholder 패턴 / 의심 영역 매칭
+		//	DbgPrint("[BS-SCAN] looking for InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx "
+		//		"+ placeholders 0xDEADBEEF / 0xCAFEBABE / 0xABADCAFE / 0x00000000 "
+		//		"+ IQ/SB area (0x1000000~0x1002000)\n",
+		//		pIn->InputDeviceVA, pIn->OutputDeviceVA, pIn->ScratchDeviceVA);
 
-			PUINT32 dw = (PUINT32)bs;
-			SIZE_T dwords = sz / 4;
-			SIZE_T k;
-			ULONG hit_in = 0, hit_out = 0, hit_sc = 0, hit_magic = 0, hit_iq = 0;
-			for (k = 0; k < dwords; ++k) {
-				UINT32 v = dw[k];
-				const char* tag = NULL;
-				if (v == (UINT32)pIn->InputDeviceVA  && pIn->InputDeviceVA  != 0) { tag = "INPUT_VA"; hit_in++; }
-				else if (v == (UINT32)pIn->OutputDeviceVA && pIn->OutputDeviceVA != 0) { tag = "OUTPUT_VA"; hit_out++; }
-				else if (v == (UINT32)pIn->ScratchDeviceVA && pIn->ScratchDeviceVA != 0) { tag = "SCRATCH_VA"; hit_sc++; }
-				else if (v == 0xDEADBEEFu) { tag = "DEADBEEF"; hit_magic++; }
-				else if (v == 0xCAFEBABEu) { tag = "CAFEBABE"; hit_magic++; }
-				else if (v == 0xABADCAFEu) { tag = "ABADCAFE"; hit_magic++; }
-				else if (v >= 0x01000000u && v < 0x01002000u) { tag = "IQ/SB_AREA"; hit_iq++; }
-				// 기존 if-else 체인 끝에 한 가지 더:
-				else if (v != 0 && v < 0x01000000u && (v & 0xFFFu) == 0) {
-					// page-aligned, < 16MB (simple PT 영역) — VA 후보
-					tag = "VA?";
-				}
+		//	PUINT32 dw = (PUINT32)bs;
+		//	SIZE_T dwords = sz / 4;
+		//	SIZE_T k;
+		//	ULONG hit_in = 0, hit_out = 0, hit_sc = 0, hit_magic = 0, hit_iq = 0;
+		//	for (k = 0; k < dwords; ++k) {
+		//		UINT32 v = dw[k];
+		//		const char* tag = NULL;
+		//		if (v == (UINT32)pIn->InputDeviceVA  && pIn->InputDeviceVA  != 0) { tag = "INPUT_VA"; hit_in++; }
+		//		else if (v == (UINT32)pIn->OutputDeviceVA && pIn->OutputDeviceVA != 0) { tag = "OUTPUT_VA"; hit_out++; }
+		//		else if (v == (UINT32)pIn->ScratchDeviceVA && pIn->ScratchDeviceVA != 0) { tag = "SCRATCH_VA"; hit_sc++; }
+		//		else if (v == 0xDEADBEEFu) { tag = "DEADBEEF"; hit_magic++; }
+		//		else if (v == 0xCAFEBABEu) { tag = "CAFEBABE"; hit_magic++; }
+		//		else if (v == 0xABADCAFEu) { tag = "ABADCAFE"; hit_magic++; }
+		//		else if (v >= 0x01000000u && v < 0x01002000u) { tag = "IQ/SB_AREA"; hit_iq++; }
+		//		// 기존 if-else 체인 끝에 한 가지 더:
+		//		else if (v != 0 && v < 0x01000000u && (v & 0xFFFu) == 0) {
+		//			// page-aligned, < 16MB (simple PT 영역) — VA 후보
+		//			tag = "VA?";
+		//		}
 
-				if (tag) {
-					DbgPrint("[BS-SCAN] +0x%04llx: 0x%08x  (%s)\n",
-						(UINT64)(k*4), v, tag);
-				}
-			}
+		//		if (tag) {
+		//			DbgPrint("[BS-SCAN] +0x%04llx: 0x%08x  (%s)\n",
+		//				(UINT64)(k*4), v, tag);
+		//		}
+		//	}
 
-			DbgPrint("[BS-SCAN] hits: input=%u output=%u scratch=%u magic=%u iq_area=%u\n",
-				hit_in, hit_out, hit_sc, hit_magic, hit_iq);
+		//	DbgPrint("[BS-SCAN] hits: input=%u output=%u scratch=%u magic=%u iq_area=%u\n",
+		//		hit_in, hit_out, hit_sc, hit_magic, hit_iq);
 
-			// 진단 힌트
-			if (hit_out == 0 && pIn->OutputDeviceVA != 0) {
-				DbgPrint("[BS-SCAN] !!! OutputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
-					"compiler가 다른 VA를 hardcode했거나 patch 단계가 누락됨\n",
-					pIn->OutputDeviceVA);
-			}
-			if (hit_in == 0 && pIn->InputDeviceVA != 0) {
-				DbgPrint("[BS-SCAN] !!! InputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
-					"input도 patch 누락 또는 bitstream이 다른 VA 기대\n",
-					pIn->InputDeviceVA);
-			}
-		} while (0);
-		#endif
+		//	// 진단 힌트
+		//	if (hit_out == 0 && pIn->OutputDeviceVA != 0) {
+		//		DbgPrint("[BS-SCAN] !!! OutputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
+		//			"compiler가 다른 VA를 hardcode했거나 patch 단계가 누락됨\n",
+		//			pIn->OutputDeviceVA);
+		//	}
+		//	if (hit_in == 0 && pIn->InputDeviceVA != 0) {
+		//		DbgPrint("[BS-SCAN] !!! InputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
+		//			"input도 patch 누락 또는 bitstream이 다른 VA 기대\n",
+		//			pIn->InputDeviceVA);
+		//	}
+		//} while (0);
+		//#endif
 
 		// [3] 완료 이벤트 reset + 모든 engine kRun
 		// tile_config0 도 다시 박아준다. (engine 이 RUN_CONTROL 거부 방지).
@@ -277,8 +277,21 @@ VOID npudriverEvtIoDeviceControl(
 		pDc->IsrSeenPendingBits = 0;
 		
 		apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
-		KeStallExecutionProcessor(50);
+		int tile_poll;
+		for (tile_poll = 0; tile_poll < 1000; tile_poll++) {
+			UINT64 v = apex_read_register(bar2, APEX_REG_TILE_CONFIG0);
+			if (v == 0x7F) {
+				DbgPrint("[INFER_NEW] | tile_polling | SUCCESS\n");
+				break;
+			}
+			KeStallExecutionProcessor(10);
+		}
 
+		if (tile_poll == 1000) {
+			DbgPrint("[INFER_NEW] TILE_CONFIG0 broadcast 미수렴: last=0x%llx\n",
+				apex_read_register(bar2, APEX_REG_TILE_CONFIG0));
+		}
+		
 		// 왜 한줄에 하나씩 전부 키는건가? 
 		// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로, 
 		// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다. 
@@ -320,79 +333,79 @@ VOID npudriverEvtIoDeviceControl(
 		//         여전히 0xCC 그대로면 → chip이 OUTFEED 시동 자체를 안 함.
 		//   토글: TRAP_ENABLE 1→0 으로 끄기.
 		// ============================================================================
-		#define TRAP_ENABLE 1
-		UINT64* trapBackup = NULL;
-		BOOLEAN trapActive = FALSE;
-		ULONG trapRedirected = 0;
-		#if TRAP_ENABLE
-		do {
-			if (outSlot == NULL || outSlot->Kva == NULL) {
-				DbgPrint("[TRAP] outSlot null — skipping trap setup\n");
-				break;
-			}
+		//#define TRAP_ENABLE 1
+		//UINT64* trapBackup = NULL;
+		//BOOLEAN trapActive = FALSE;
+		//ULONG trapRedirected = 0;
+		//#if TRAP_ENABLE
+		//do {
+		//	if (outSlot == NULL || outSlot->Kva == NULL) {
+		//		DbgPrint("[TRAP] outSlot null — skipping trap setup\n");
+		//		break;
+		//	}
 
-			// 0xCC sentinel fill — chip write 여부를 0xCC→다른값으로 판정
-			RtlFillMemory(outSlot->Kva, outSlot->Size, 0xCC);
+		//	// 0xCC sentinel fill — chip write 여부를 0xCC→다른값으로 판정
+		//	RtlFillMemory(outSlot->Kva, outSlot->Size, 0xCC);
 
-			PHYSICAL_ADDRESS outPa = MmGetPhysicalAddress(outSlot->Kva);
-			UINT64 trapPte = ((UINT64)outPa.QuadPart & ~0xFFFULL) | 1;
+		//	PHYSICAL_ADDRESS outPa = MmGetPhysicalAddress(outSlot->Kva);
+		//	UINT64 trapPte = ((UINT64)outPa.QuadPart & ~0xFFFULL) | 1;
 
-			// 6144 entries × 8B = 48KB. NonPagedPoolNx, 'TRAP' tag.
-			// (StatusBlockBase 할당과 동일한 deprecation 우회 패턴)
-			#pragma warning(push)
-			#pragma warning(disable:4996)
-			trapBackup = (UINT64*)ExAllocatePoolWithTag(NonPagedPoolNx,
-				sizeof(UINT64) * 6144, 'TRAP');
-			#pragma warning(pop)
-			if (trapBackup == NULL) {
-				DbgPrint("[TRAP] backup alloc failed — skipping\n");
-				break;
-			}
-			RtlZeroMemory(trapBackup, sizeof(UINT64) * 6144);
+		//	// 6144 entries × 8B = 48KB. NonPagedPoolNx, 'TRAP' tag.
+		//	// (StatusBlockBase 할당과 동일한 deprecation 우회 패턴)
+		//	#pragma warning(push)
+		//	#pragma warning(disable:4996)
+		//	trapBackup = (UINT64*)ExAllocatePoolWithTag(NonPagedPoolNx,
+		//		sizeof(UINT64) * 6144, 'TRAP');
+		//	#pragma warning(pop)
+		//	if (trapBackup == NULL) {
+		//		DbgPrint("[TRAP] backup alloc failed — skipping\n");
+		//		break;
+		//	}
+		//	RtlZeroMemory(trapBackup, sizeof(UINT64) * 6144);
 
-			// 제외할 PTE 범위 계산 — 각 보호 슬롯의 [start..start+pages) 구간
-			UINT32 inPte    = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
-				? (UINT32)(pDc->IOSlots[IO_SLOT_INPUT].DeviceVa >> 12) : 0xFFFFFFFFu;
-			UINT32 inPages  = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
-				? (UINT32)((pDc->IOSlots[IO_SLOT_INPUT].Size + 0xFFF) >> 12) : 0;
-			UINT32 scPte    = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
-				? (UINT32)(pDc->IOSlots[IO_SLOT_SCRATCH].DeviceVa >> 12) : 0xFFFFFFFFu;
-			UINT32 scPages  = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
-				? (UINT32)((pDc->IOSlots[IO_SLOT_SCRATCH].Size + 0xFFF) >> 12) : 0;
-			UINT32 bsPte    = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
-				? (UINT32)(pDc->IOSlots[IO_SLOT_EXE0_BS].DeviceVa >> 12) : 0xFFFFFFFFu;
-			UINT32 bsPages  = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
-				? (UINT32)((pDc->IOSlots[IO_SLOT_EXE0_BS].Size + 0xFFF) >> 12) : 0;
+		//	// 제외할 PTE 범위 계산 — 각 보호 슬롯의 [start..start+pages) 구간
+		//	UINT32 inPte    = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
+		//		? (UINT32)(pDc->IOSlots[IO_SLOT_INPUT].DeviceVa >> 12) : 0xFFFFFFFFu;
+		//	UINT32 inPages  = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
+		//		? (UINT32)((pDc->IOSlots[IO_SLOT_INPUT].Size + 0xFFF) >> 12) : 0;
+		//	UINT32 scPte    = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
+		//		? (UINT32)(pDc->IOSlots[IO_SLOT_SCRATCH].DeviceVa >> 12) : 0xFFFFFFFFu;
+		//	UINT32 scPages  = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
+		//		? (UINT32)((pDc->IOSlots[IO_SLOT_SCRATCH].Size + 0xFFF) >> 12) : 0;
+		//	UINT32 bsPte    = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
+		//		? (UINT32)(pDc->IOSlots[IO_SLOT_EXE0_BS].DeviceVa >> 12) : 0xFFFFFFFFu;
+		//	UINT32 bsPages  = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
+		//		? (UINT32)((pDc->IOSlots[IO_SLOT_EXE0_BS].Size + 0xFFF) >> 12) : 0;
 
-			UINT32 idx;
-			for (idx = 0; idx < 6144; ++idx) {
-				// hard-exclude — DescRing(4096), StatusBlock(4097)
-				if (idx == 4096 || idx == 4097) continue;
+		//	UINT32 idx;
+		//	for (idx = 0; idx < 6144; ++idx) {
+		//		// hard-exclude — DescRing(4096), StatusBlock(4097)
+		//		if (idx == 4096 || idx == 4097) continue;
 
-				// input 범위 (chip이 input data를 read)
-				if (inPages && idx >= inPte && idx < inPte + inPages) continue;
-				// scratch 범위 (chip이 intermediate를 read/write)
-				if (scPages && idx >= scPte && idx < scPte + scPages) continue;
-				// bitstream 범위 (chip이 instruction body를 read)
-				if (bsPages && idx >= bsPte && idx < bsPte + bsPages) continue;
+		//		// input 범위 (chip이 input data를 read)
+		//		if (inPages && idx >= inPte && idx < inPte + inPages) continue;
+		//		// scratch 범위 (chip이 intermediate를 read/write)
+		//		if (scPages && idx >= scPte && idx < scPte + scPages) continue;
+		//		// bitstream 범위 (chip이 instruction body를 read)
+		//		if (bsPages && idx >= bsPte && idx < bsPte + bsPages) continue;
 
-				UINT64 pte = apex_read_register(bar2, APEX_REG_PAGE_TABLE + idx * 8);
-				if (!(pte & 1)) continue;  // invalid skip
+		//		UINT64 pte = apex_read_register(bar2, APEX_REG_PAGE_TABLE + idx * 8);
+		//		if (!(pte & 1)) continue;  // invalid skip
 
-				trapBackup[idx] = pte;
-				apex_write_register(bar2, APEX_REG_PAGE_TABLE + idx * 8, trapPte);
-				trapRedirected++;
-			}
+		//		trapBackup[idx] = pte;
+		//		apex_write_register(bar2, APEX_REG_PAGE_TABLE + idx * 8, trapPte);
+		//		trapRedirected++;
+		//	}
 
-			DbgPrint("[TRAP] redirected %u valid PTEs → output_pa=0x%llx "
-				"(skip: in[%u..%u] sc[%u..%u] bs[%u..%u] DescRing=4096 SB=4097)\n",
-				trapRedirected, (UINT64)outPa.QuadPart,
-				inPte, inPte + inPages,
-				scPte, scPte + scPages,
-				bsPte, bsPte + bsPages);
-			trapActive = TRUE;
-		} while (0);
-		#endif
+		//	DbgPrint("[TRAP] redirected %u valid PTEs → output_pa=0x%llx "
+		//		"(skip: in[%u..%u] sc[%u..%u] bs[%u..%u] DescRing=4096 SB=4097)\n",
+		//		trapRedirected, (UINT64)outPa.QuadPart,
+		//		inPte, inPte + inPages,
+		//		scPte, scPte + scPages,
+		//		bsPte, bsPte + bsPages);
+		//	trapActive = TRUE;
+		//} while (0);
+		//#endif
 
 		// [4] descriptor submit (single INFER, no PARAM)
 		{
@@ -403,11 +416,23 @@ VOID npudriverEvtIoDeviceControl(
 			} HOST_QUEUE_DESC;
 
 			HOST_QUEUE_DESC* ring = (HOST_QUEUE_DESC*)pDc->DescRingBase;
-			UINT32 slot = pDc->DescRingTail % 256;
 
-			ring[slot].address = pIn->BitstreamDeviceVA;
-			ring[slot].size_in_bytes = (UINT32)pIn->BitstreamSize;
-			ring[slot].reserved = 0;
+			ALLOC_IO_SLOT* exe1Slot = &pDc->IOSlots[IO_SLOT_EXE1_BS];
+			if (exe1Slot->Kva != NULL && exe1Slot->Size > 0) {
+				UINT32 slot1 = pDc->DescRingTail % 256;
+				ring[slot1].address = exe1Slot->DeviceVa;
+				ring[slot1].size_in_bytes = exe1Slot->Size;
+				ring[slot1].reserved = 0;
+				pDc->DescRingTail++;
+				DbgPrint("[INFER_NEW] enqueued exe1: VA=0x%llx size=0x%x slot=%u\n",
+					exe1Slot->DeviceVa, (UINT32)exe1Slot->Size, slot1);
+			}
+
+			UINT32 slot0 = pDc->DescRingTail % 256;
+
+			ring[slot0].address = pIn->BitstreamDeviceVA;
+			ring[slot0].size_in_bytes = (UINT32)pIn->BitstreamSize;
+			ring[slot0].reserved = 0;
 			KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록
 
 			pDc->DescRingTail++;
@@ -432,7 +457,7 @@ VOID npudriverEvtIoDeviceControl(
 		//      non-0xCC count = 0     → chip이 OUTFEED 시동 안 함 (가설 B)
 		//      non-0xCC count > 0    → chip이 어딘가에 write 함 → patch 누락 (가설 A)
 		// ============================================================================
-		#if TRAP_ENABLE
+		/*#if TRAP_ENABLE
 		if (trapActive && trapBackup != NULL) {
 			ULONG restored = 0;
 			UINT32 idx;
@@ -471,7 +496,7 @@ VOID npudriverEvtIoDeviceControl(
 			trapBackup = NULL;
 			trapActive = FALSE;
 		}
-		#endif
+		#endif*/
 
 		if (status == STATUS_TIMEOUT) {
 			// 폴링으로 SC_HOST_INT_COUNT 보지 않음 — IRQ가 안 왔다는 사실 자체를 에러로.
@@ -2165,10 +2190,12 @@ VOID npudriverEvtIoDeviceControl(
 		RtlZeroMemory(pOut, sizeof(*pOut));
 
 		struct { UINT64 size, devVa; UINT64* outUserVa, * outPa; } req[IO_SLOT_COUNT] = {
-			{ in.InputSize, in.InputDeviceVA, &pOut->InputUserVA, &pOut->InputPa },
-			{ in.OutputSize, in.OutputDeviceVA, &pOut->OutputUserVA, &pOut->OutputPa },
-			{ in.ScratchSize, in.ScratchDeviceVA, &pOut->ScratchUserVA, &pOut->ScratchPa },
-			{ in.Exe0BitstreamSize, in.Exe0BitstreamDeviceVA, &pOut->Exe0BitStreamUserVA, &pOut->Exe0BitstreamPa}
+			{ in.InputSize,         in.InputDeviceVA,         &pOut->InputUserVA,         &pOut->InputPa },
+			{ in.OutputSize,        in.OutputDeviceVA,        &pOut->OutputUserVA,        &pOut->OutputPa },
+			{ in.ScratchSize,       in.ScratchDeviceVA,       &pOut->ScratchUserVA,       &pOut->ScratchPa },
+			{ in.Exe0BitstreamSize, in.Exe0BitstreamDeviceVA, &pOut->Exe0BitStreamUserVA, &pOut->Exe0BitstreamPa },
+			{ in.ParamDataSize,     in.ParamDataDeviceVA,     &pOut->ParamDataUserVA,     &pOut->ParamDataPa },
+			{ in.Exe1BitstreamSize, in.Exe1BitstreamDeviceVA, &pOut->Exe1BitstreamUserVA, &pOut->Exe1BitstreamPa },
 		};
 
 		// 한 번에 셋 다 잡고 셋 다 매핑한다. 중간에 실패하면 이미 잡힌거 전부 되돌림
