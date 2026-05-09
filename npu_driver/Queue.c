@@ -366,94 +366,6 @@ VOID npudriverEvtIoDeviceControl(
 				base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
 		}
 
-		// ============================================================================
-		// PTE TRAP HACK — diagnostic only.
-		//   목적: chip이 OUTFEED를 *어디든* 쏘기만 하면 받아내는 honeypot.
-		//   동작: simple PT 슬롯(0..6143) 중 valid한 PTE 모두 backup → output buffer
-		//         host PA 로 redirect. 단 chip이 read 해야 하는 슬롯(DescRing, StatusBlock,
-		//         input, scratch, bitstream)은 제외 — 안 그러면 chip이 garbage instruction
-		//         읽고 hang.
-		//   복구: KeWaitForSingleObject 직후 무조건 1회 (timeout/success 무관).
-		//   결과: 인퍼런스 끝나고 outSlot->Kva 에 0xCC 외 데이터가 보이면 → chip이
-		//         어딘가에 OUTFEED write 한 것 → patch 누락 확정.
-		//         여전히 0xCC 그대로면 → chip이 OUTFEED 시동 자체를 안 함.
-		//   토글: TRAP_ENABLE 1→0 으로 끄기.
-		// ============================================================================
-		//#define TRAP_ENABLE 1
-		//UINT64* trapBackup = NULL;
-		//BOOLEAN trapActive = FALSE;
-		//ULONG trapRedirected = 0;
-		//#if TRAP_ENABLE
-		//do {
-		//	if (outSlot == NULL || outSlot->Kva == NULL) {
-		//		DbgPrint("[TRAP] outSlot null — skipping trap setup\n");
-		//		break;
-		//	}
-
-		//	// 0xCC sentinel fill — chip write 여부를 0xCC→다른값으로 판정
-		//	RtlFillMemory(outSlot->Kva, outSlot->Size, 0xCC);
-
-		//	PHYSICAL_ADDRESS outPa = MmGetPhysicalAddress(outSlot->Kva);
-		//	UINT64 trapPte = ((UINT64)outPa.QuadPart & ~0xFFFULL) | 1;
-
-		//	// 6144 entries × 8B = 48KB. NonPagedPoolNx, 'TRAP' tag.
-		//	// (StatusBlockBase 할당과 동일한 deprecation 우회 패턴)
-		//	#pragma warning(push)
-		//	#pragma warning(disable:4996)
-		//	trapBackup = (UINT64*)ExAllocatePoolWithTag(NonPagedPoolNx,
-		//		sizeof(UINT64) * 6144, 'TRAP');
-		//	#pragma warning(pop)
-		//	if (trapBackup == NULL) {
-		//		DbgPrint("[TRAP] backup alloc failed — skipping\n");
-		//		break;
-		//	}
-		//	RtlZeroMemory(trapBackup, sizeof(UINT64) * 6144);
-
-		//	// 제외할 PTE 범위 계산 — 각 보호 슬롯의 [start..start+pages) 구간
-		//	UINT32 inPte    = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
-		//		? (UINT32)(pDc->IOSlots[IO_SLOT_INPUT].DeviceVa >> 12) : 0xFFFFFFFFu;
-		//	UINT32 inPages  = (pDc->IOSlots[IO_SLOT_INPUT].Kva)
-		//		? (UINT32)((pDc->IOSlots[IO_SLOT_INPUT].Size + 0xFFF) >> 12) : 0;
-		//	UINT32 scPte    = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
-		//		? (UINT32)(pDc->IOSlots[IO_SLOT_SCRATCH].DeviceVa >> 12) : 0xFFFFFFFFu;
-		//	UINT32 scPages  = (pDc->IOSlots[IO_SLOT_SCRATCH].Kva)
-		//		? (UINT32)((pDc->IOSlots[IO_SLOT_SCRATCH].Size + 0xFFF) >> 12) : 0;
-		//	UINT32 bsPte    = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
-		//		? (UINT32)(pDc->IOSlots[IO_SLOT_EXE0_BS].DeviceVa >> 12) : 0xFFFFFFFFu;
-		//	UINT32 bsPages  = (pDc->IOSlots[IO_SLOT_EXE0_BS].Kva)
-		//		? (UINT32)((pDc->IOSlots[IO_SLOT_EXE0_BS].Size + 0xFFF) >> 12) : 0;
-
-		//	UINT32 idx;
-		//	for (idx = 0; idx < 6144; ++idx) {
-		//		// hard-exclude — DescRing(4096), StatusBlock(4097)
-		//		if (idx == 4096 || idx == 4097) continue;
-
-		//		// input 범위 (chip이 input data를 read)
-		//		if (inPages && idx >= inPte && idx < inPte + inPages) continue;
-		//		// scratch 범위 (chip이 intermediate를 read/write)
-		//		if (scPages && idx >= scPte && idx < scPte + scPages) continue;
-		//		// bitstream 범위 (chip이 instruction body를 read)
-		//		if (bsPages && idx >= bsPte && idx < bsPte + bsPages) continue;
-
-		//		UINT64 pte = apex_read_register(bar2, APEX_REG_PAGE_TABLE + idx * 8);
-		//		if (!(pte & 1)) continue;  // invalid skip
-
-		//		trapBackup[idx] = pte;
-		//		apex_write_register(bar2, APEX_REG_PAGE_TABLE + idx * 8, trapPte);
-		//		trapRedirected++;
-		//	}
-
-		//	DbgPrint("[TRAP] redirected %u valid PTEs → output_pa=0x%llx "
-		//		"(skip: in[%u..%u] sc[%u..%u] bs[%u..%u] DescRing=4096 SB=4097)\n",
-		//		trapRedirected, (UINT64)outPa.QuadPart,
-		//		inPte, inPte + inPages,
-		//		scPte, scPte + scPages,
-		//		bsPte, bsPte + bsPages);
-		//	trapActive = TRUE;
-		//} while (0);
-		//#endif
-
-		
 		// input pte 검증 
 		/*{
 			DbgPrint("[INFER_NEW] | [CHECK] PTE readback for INPUT range:\n");
@@ -481,9 +393,10 @@ VOID npudriverEvtIoDeviceControl(
 				apex_read_register(bar2, 0x486f8));
 			typedef struct {
 				UINT64 address;
-				UINT64 size_in_bytes;
+				UINT32 size_in_bytes;
 				UINT32 reserved;
 			} HOST_QUEUE_DESC;
+			C_ASSERT(sizeof(HOST_QUEUE_DESC) == 16);
 
 			HOST_QUEUE_DESC* ring = (HOST_QUEUE_DESC*)pDc->DescRingBase;
 
@@ -491,7 +404,7 @@ VOID npudriverEvtIoDeviceControl(
 			if (exe1Slot->Kva != NULL && exe1Slot->Size > 0) {
 				UINT32 slot1 = pDc->DescRingTail % 256;
 				ring[slot1].address = exe1Slot->DeviceVa;
-				ring[slot1].size_in_bytes = exe1Slot->Size;
+				ring[slot1].size_in_bytes = (UINT32)exe1Slot->ActualSize;
 				ring[slot1].reserved = 0;
 				pDc->DescRingTail++;
 				DbgPrint("[INFER_NEW] enqueued exe1: VA=0x%llx size=0x%x slot=%u\n",
@@ -567,56 +480,6 @@ VOID npudriverEvtIoDeviceControl(
 			LARGE_INTEGER t1; t1.QuadPart = -30000000LL;   // 5 s (음수 = relative, 100ns 단위)
 			status = KeWaitForSingleObject(&pDc->InferCompleteEvent, Executive, KernelMode, FALSE, &t1);
 		}
-
-		// ============================================================================
-		// PTE TRAP RESTORE — 무조건 실행 (timeout / success / error 무관).
-		//   trap setup 시 backup 한 PTE 들을 원래대로 복구. 이후 IOCTL_FREE_IO_BUFFERS
-		//   가 정상 동작해야 하므로 chip page table 이 깨끗해야 함.
-		//   복구 후 trap buffer (= outSlot->Kva) 의 첫 16 byte + non-0xCC 카운트 dump
-		//   → 분석 키:
-		//      non-0xCC count = 0     → chip이 OUTFEED 시동 안 함 (가설 B)
-		//      non-0xCC count > 0    → chip이 어딘가에 write 함 → patch 누락 (가설 A)
-		// ============================================================================
-		/*#if TRAP_ENABLE
-		if (trapActive && trapBackup != NULL) {
-			ULONG restored = 0;
-			UINT32 idx;
-			for (idx = 0; idx < 6144; ++idx) {
-				if (trapBackup[idx] != 0) {
-					apex_write_register(bar2, APEX_REG_PAGE_TABLE + idx * 8, trapBackup[idx]);
-					restored++;
-				}
-			}
-
-			if (outSlot != NULL && outSlot->Kva != NULL) {
-				PUCHAR p = (PUCHAR)outSlot->Kva;
-				ULONG nonCC = 0;
-				ULONG j;
-				for (j = 0; j < outSlot->Size; ++j) if (p[j] != 0xCC) nonCC++;
-
-				DbgPrint("[TRAP-RESULT] restored %u/%u PTEs | wait_status=0x%x | "
-					"non-0xCC bytes: %u / %llu | first16: "
-					"%02X %02X %02X %02X %02X %02X %02X %02X  "
-					"%02X %02X %02X %02X %02X %02X %02X %02X\n",
-					restored, trapRedirected, (UINT32)status,
-					nonCC, (UINT64)outSlot->Size,
-					p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
-					p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
-
-				if (nonCC == 0) {
-					DbgPrint("[TRAP-RESULT] DIAGNOSIS: chip이 OUTFEED 시동 안 함 (가설 B) — "
-						"OUTFEED_RUN_CONTROL/STATUS, descriptor binary, instruction stream 점검 필요\n");
-				} else {
-					DbgPrint("[TRAP-RESULT] DIAGNOSIS: chip이 OUTFEED를 어딘가에 write 함 (가설 A) — "
-						"bitstream의 output VA가 우리가 매핑한 VA와 다름 → patch 누락\n");
-				}
-			}
-
-			ExFreePoolWithTag(trapBackup, 'TRAP');
-			trapBackup = NULL;
-			trapActive = FALSE;
-		}
-		#endif*/
 
 		if (status == STATUS_TIMEOUT) {
 			// 폴링으로 SC_HOST_INT_COUNT 보지 않음 — IRQ가 안 왔다는 사실 자체를 에러로.
@@ -2376,6 +2239,7 @@ VOID npudriverEvtIoDeviceControl(
 			RtlZeroMemory(slot->Kva, size4k);
 			slot->Size = size4k;
 			slot->DeviceVa = req[i].devVa;
+			slot->ActualSize = req[i].size;
 
 			pa = MmGetPhysicalAddress(slot->Kva);
 

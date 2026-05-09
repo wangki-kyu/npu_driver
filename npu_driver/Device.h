@@ -15,6 +15,7 @@ typedef struct _ALLOC_IO_SLOT {
 	PVOID   UserVa;       // MmMapLockedPagesSpecifyCache(UserMode) 결과
 	UINT64  DeviceVa;     // chip PTE 박은 위치
 	SIZE_T  Size;         // 4 KB 배수
+	SIZE_T ActualSize;		// 원본 요청 크기 
 } ALLOC_IO_SLOT;
 
 typedef enum _IO_SLOT_INDEX {
