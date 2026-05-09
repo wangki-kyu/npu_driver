@@ -10,6 +10,52 @@
 //#pragma alloc_text(PAGE, npudriverEvtIoDeviceControl)
 #endif
 
+VOID arm_tile_and_engiend(void* bar2, PDEVICE_CONTEXT pDc) {
+	apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
+	int tile_poll;
+	for (tile_poll = 0; tile_poll < 1000; tile_poll++) {
+		UINT64 v = apex_read_register(bar2, APEX_REG_TILE_CONFIG0);
+		if (v == 0x7F) {
+			DbgPrint("[INFER_NEW] | tile_polling | SUCCESS\n");
+			break;
+		}
+		KeStallExecutionProcessor(10);
+	}
+
+	if (tile_poll == 1000) {
+		DbgPrint("[INFER_NEW] TILE_CONFIG0 broadcast 미수렴: last=0x%llx\n",
+			apex_read_register(bar2, APEX_REG_TILE_CONFIG0));
+	}
+
+	// 왜 한줄에 하나씩 전부 키는건가? 
+	// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로, 
+	// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다. 
+	//																		// 엔진 종류			
+	apex_write_register(bar2, APEX_REG_SCALAR_RUN_CONTROL, 1);			// Scalar Core, 제어 흐름 / 주소 계산 담당 스칼라 프로세서 기동
+	apex_write_register(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL, 1);		// Activation	activation 데이터를 narrow memory -> 연산 유닛으로 push
+	apex_write_register(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);	// 가중치(Weights)를 parameter memory -> MAC array로 push
+	apex_write_register(bar2, APEX_REG_INFEED_RUN_CONTROL, 1);			// host -> chip 입력 데이터 DMA 엔진 기동
+	apex_write_register(bar2, APEX_REG_OUTFEED_RUN_CONTROL, 1);			// chip -> host 출력 데이터 dma 엔진 기동
+	apex_write_register(bar2, APEX_REG_TILE_OP_RUN_CONTROL, 1);			// MAC array 연산 명령 디스패처, 실제 compute 수행
+	apex_write_register(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL, 1);	// narrow(int8) -> wide(int32 accumulator) 폭 변환 버스
+	apex_write_register(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL, 1);	// wide(int32 acc) -> narrow(int8 quantized) 폭 변환 버스
+	apex_write_register(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+	apex_write_register(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+	apex_write_register(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+	apex_write_register(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL, 1);		// 타일 간 mesh interconnect - 한 방향 라우터
+	apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #0
+	apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #1
+	apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL, 1);	// 칩이 호스트로 완료/응답을 보내는 ring 송신 엔진
+	KeStallExecutionProcessor(1000); // 1ms settle
+
+	if (pDc->StatusBlockBase != NULL) {
+		PUCHAR base = (PUCHAR)pDc->StatusBlockBase;
+		DbgPrint("[INFER_NEW] | [test debug] | before desc submit | %02X %02X %02X %02X %02X %02X %02X %02X  %02X %02X %02X %02X %02X %02X %02X %02X\n",
+			base[0], base[1], base[2], base[3], base[4], base[5], base[6], base[7],
+			base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
+	}
+}
+
 VOID npudriverEvtIoDeviceControl(
 	_In_ WDFQUEUE Queue,
 	_In_ WDFREQUEST Request,
@@ -185,91 +231,91 @@ VOID npudriverEvtIoDeviceControl(
 		//         아니면 placeholder/엉뚱한 VA가 박혔는지 확인.
 		//   토글: BS_FULL_DUMP 1→0 으로 끄기.
 		// ============================================================================
-		//#define BS_FULL_DUMP 1
-		//#if BS_FULL_DUMP
-		//do {
-		//	ALLOC_IO_SLOT* bsSlot = &pDc->IOSlots[IO_SLOT_EXE0_BS];
-		//	if (bsSlot->Kva == NULL) {
-		//		DbgPrint("[BS-FULL] EXE0_BS slot empty — skipping bitstream dump\n");
-		//		break;
-		//	}
+		#define BS_FULL_DUMP 0
+		#if BS_FULL_DUMP
+		do {
+			ALLOC_IO_SLOT* bsSlot = &pDc->IOSlots[IO_SLOT_EXE0_BS];
+			if (bsSlot->Kva == NULL) {
+				DbgPrint("[BS-FULL] EXE0_BS slot empty — skipping bitstream dump\n");
+				break;
+			}
 
-		//	SIZE_T claimed = (SIZE_T)pIn->BitstreamSize;
-		//	SIZE_T slotSz = bsSlot->Size;
-		//	SIZE_T sz = claimed;
-		//	if (sz == 0 || sz > slotSz) sz = slotSz;
+			SIZE_T claimed = (SIZE_T)pIn->BitstreamSize;
+			SIZE_T slotSz = bsSlot->Size;
+			SIZE_T sz = claimed;
+			if (sz == 0 || sz > slotSz) sz = slotSz;
 
-		//	DbgPrint("[BS-FULL] BitstreamDeviceVA=0x%llx claimed_size=0x%llx (%llu B) "
-		//		"slot_size=0x%llx | InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx ScratchSize=0x%llx\n",
-		//		pIn->BitstreamDeviceVA, (UINT64)claimed, (UINT64)claimed,
-		//		(UINT64)slotSz,
-		//		pIn->InputDeviceVA, pIn->OutputDeviceVA,
-		//		pIn->ScratchDeviceVA, pIn->ScratchSize);
+			DbgPrint("[BS-FULL] BitstreamDeviceVA=0x%llx claimed_size=0x%llx (%llu B) "
+				"slot_size=0x%llx | InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx ScratchSize=0x%llx\n",
+				pIn->BitstreamDeviceVA, (UINT64)claimed, (UINT64)claimed,
+				(UINT64)slotSz,
+				pIn->InputDeviceVA, pIn->OutputDeviceVA,
+				pIn->ScratchDeviceVA, pIn->ScratchSize);
 
-		//	// 16 byte/줄 hex dump — tail 잔여(< 16 byte)는 zero-pad 해서 같은 포맷으로 출력.
-		//	// slot은 4KB 잡혀 있어서 sz를 16 byte 정렬 위로 round-up 해도 over-read 안 남.
-		//	PUCHAR bs = (PUCHAR)bsSlot->Kva;
-		//	SIZE_T szPadded = (sz + 15) & ~(SIZE_T)15;
-		//	SIZE_T bsOff;
-		//	for (bsOff = 0; bsOff < szPadded; bsOff += 16) {
-		//		DbgPrint("[BS-FULL] %04llx: %02x %02x %02x %02x %02x %02x %02x %02x  "
-		//			"%02x %02x %02x %02x %02x %02x %02x %02x%s\n",
-		//			(UINT64)bsOff,
-		//			bs[bsOff+0],bs[bsOff+1],bs[bsOff+2],bs[bsOff+3],
-		//			bs[bsOff+4],bs[bsOff+5],bs[bsOff+6],bs[bsOff+7],
-		//			bs[bsOff+8],bs[bsOff+9],bs[bsOff+10],bs[bsOff+11],
-		//			bs[bsOff+12],bs[bsOff+13],bs[bsOff+14],bs[bsOff+15],
-		//			(bsOff + 16 > sz) ? "  (incl. post-claimed bytes)" : "");
-		//	}
+			// 16 byte/줄 hex dump — tail 잔여(< 16 byte)는 zero-pad 해서 같은 포맷으로 출력.
+			// slot은 4KB 잡혀 있어서 sz를 16 byte 정렬 위로 round-up 해도 over-read 안 남.
+			PUCHAR bs = (PUCHAR)bsSlot->Kva;
+			SIZE_T szPadded = (sz + 15) & ~(SIZE_T)15;
+			SIZE_T bsOff;
+			for (bsOff = 0; bsOff < szPadded; bsOff += 16) {
+				DbgPrint("[BS-FULL] %04llx: %02x %02x %02x %02x %02x %02x %02x %02x  "
+					"%02x %02x %02x %02x %02x %02x %02x %02x%s\n",
+					(UINT64)bsOff,
+					bs[bsOff+0],bs[bsOff+1],bs[bsOff+2],bs[bsOff+3],
+					bs[bsOff+4],bs[bsOff+5],bs[bsOff+6],bs[bsOff+7],
+					bs[bsOff+8],bs[bsOff+9],bs[bsOff+10],bs[bsOff+11],
+					bs[bsOff+12],bs[bsOff+13],bs[bsOff+14],bs[bsOff+15],
+					(bsOff + 16 > sz) ? "  (incl. post-claimed bytes)" : "");
+			}
 
-		//	// 32-bit LE 스캔 — 입출력 VA / 일반 placeholder 패턴 / 의심 영역 매칭
-		//	DbgPrint("[BS-SCAN] looking for InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx "
-		//		"+ placeholders 0xDEADBEEF / 0xCAFEBABE / 0xABADCAFE / 0x00000000 "
-		//		"+ IQ/SB area (0x1000000~0x1002000)\n",
-		//		pIn->InputDeviceVA, pIn->OutputDeviceVA, pIn->ScratchDeviceVA);
+			// 32-bit LE 스캔 — 입출력 VA / 일반 placeholder 패턴 / 의심 영역 매칭
+			DbgPrint("[BS-SCAN] looking for InputVA=0x%llx OutputVA=0x%llx ScratchVA=0x%llx "
+				"+ placeholders 0xDEADBEEF / 0xCAFEBABE / 0xABADCAFE / 0x00000000 "
+				"+ IQ/SB area (0x1000000~0x1002000)\n",
+				pIn->InputDeviceVA, pIn->OutputDeviceVA, pIn->ScratchDeviceVA);
 
-		//	PUINT32 dw = (PUINT32)bs;
-		//	SIZE_T dwords = sz / 4;
-		//	SIZE_T k;
-		//	ULONG hit_in = 0, hit_out = 0, hit_sc = 0, hit_magic = 0, hit_iq = 0;
-		//	for (k = 0; k < dwords; ++k) {
-		//		UINT32 v = dw[k];
-		//		const char* tag = NULL;
-		//		if (v == (UINT32)pIn->InputDeviceVA  && pIn->InputDeviceVA  != 0) { tag = "INPUT_VA"; hit_in++; }
-		//		else if (v == (UINT32)pIn->OutputDeviceVA && pIn->OutputDeviceVA != 0) { tag = "OUTPUT_VA"; hit_out++; }
-		//		else if (v == (UINT32)pIn->ScratchDeviceVA && pIn->ScratchDeviceVA != 0) { tag = "SCRATCH_VA"; hit_sc++; }
-		//		else if (v == 0xDEADBEEFu) { tag = "DEADBEEF"; hit_magic++; }
-		//		else if (v == 0xCAFEBABEu) { tag = "CAFEBABE"; hit_magic++; }
-		//		else if (v == 0xABADCAFEu) { tag = "ABADCAFE"; hit_magic++; }
-		//		else if (v >= 0x01000000u && v < 0x01002000u) { tag = "IQ/SB_AREA"; hit_iq++; }
-		//		// 기존 if-else 체인 끝에 한 가지 더:
-		//		else if (v != 0 && v < 0x01000000u && (v & 0xFFFu) == 0) {
-		//			// page-aligned, < 16MB (simple PT 영역) — VA 후보
-		//			tag = "VA?";
-		//		}
+			PUINT32 dw = (PUINT32)bs;
+			SIZE_T dwords = sz / 4;
+			SIZE_T k;
+			ULONG hit_in = 0, hit_out = 0, hit_sc = 0, hit_magic = 0, hit_iq = 0;
+			for (k = 0; k < dwords; ++k) {
+				UINT32 v = dw[k];
+				const char* tag = NULL;
+				if (v == (UINT32)pIn->InputDeviceVA  && pIn->InputDeviceVA  != 0) { tag = "INPUT_VA"; hit_in++; }
+				else if (v == (UINT32)pIn->OutputDeviceVA && pIn->OutputDeviceVA != 0) { tag = "OUTPUT_VA"; hit_out++; }
+				else if (v == (UINT32)pIn->ScratchDeviceVA && pIn->ScratchDeviceVA != 0) { tag = "SCRATCH_VA"; hit_sc++; }
+				else if (v == 0xDEADBEEFu) { tag = "DEADBEEF"; hit_magic++; }
+				else if (v == 0xCAFEBABEu) { tag = "CAFEBABE"; hit_magic++; }
+				else if (v == 0xABADCAFEu) { tag = "ABADCAFE"; hit_magic++; }
+				else if (v >= 0x01000000u && v < 0x01002000u) { tag = "IQ/SB_AREA"; hit_iq++; }
+				// 기존 if-else 체인 끝에 한 가지 더:
+				else if (v != 0 && v < 0x01000000u && (v & 0xFFFu) == 0) {
+					// page-aligned, < 16MB (simple PT 영역) — VA 후보
+					tag = "VA?";
+				}
 
-		//		if (tag) {
-		//			DbgPrint("[BS-SCAN] +0x%04llx: 0x%08x  (%s)\n",
-		//				(UINT64)(k*4), v, tag);
-		//		}
-		//	}
+				if (tag) {
+					DbgPrint("[BS-SCAN] +0x%04llx: 0x%08x  (%s)\n",
+						(UINT64)(k*4), v, tag);
+				}
+			}
 
-		//	DbgPrint("[BS-SCAN] hits: input=%u output=%u scratch=%u magic=%u iq_area=%u\n",
-		//		hit_in, hit_out, hit_sc, hit_magic, hit_iq);
+			DbgPrint("[BS-SCAN] hits: input=%u output=%u scratch=%u magic=%u iq_area=%u\n",
+				hit_in, hit_out, hit_sc, hit_magic, hit_iq);
 
-		//	// 진단 힌트
-		//	if (hit_out == 0 && pIn->OutputDeviceVA != 0) {
-		//		DbgPrint("[BS-SCAN] !!! OutputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
-		//			"compiler가 다른 VA를 hardcode했거나 patch 단계가 누락됨\n",
-		//			pIn->OutputDeviceVA);
-		//	}
-		//	if (hit_in == 0 && pIn->InputDeviceVA != 0) {
-		//		DbgPrint("[BS-SCAN] !!! InputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
-		//			"input도 patch 누락 또는 bitstream이 다른 VA 기대\n",
-		//			pIn->InputDeviceVA);
-		//	}
-		//} while (0);
-		//#endif
+			// 진단 힌트
+			if (hit_out == 0 && pIn->OutputDeviceVA != 0) {
+				DbgPrint("[BS-SCAN] !!! OutputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
+					"compiler가 다른 VA를 hardcode했거나 patch 단계가 누락됨\n",
+					pIn->OutputDeviceVA);
+			}
+			if (hit_in == 0 && pIn->InputDeviceVA != 0) {
+				DbgPrint("[BS-SCAN] !!! InputDeviceVA(0x%llx)가 bitstream에 한 번도 안 나타남 — "
+					"input도 patch 누락 또는 bitstream이 다른 VA 기대\n",
+					pIn->InputDeviceVA);
+			}
+		} while (0);
+		#endif
 
 		// [3] 완료 이벤트 reset + 모든 engine kRun
 		// tile_config0 도 다시 박아준다. (engine 이 RUN_CONTROL 거부 방지).
@@ -407,8 +453,32 @@ VOID npudriverEvtIoDeviceControl(
 		//} while (0);
 		//#endif
 
+		
+		// input pte 검증 
+		/*{
+			DbgPrint("[INFER_NEW] | [CHECK] PTE readback for INPUT range:\n");
+			size_t input_i;
+			for (input_i = 0; input_i <= 75; input_i++) {
+				UINT64 pte = apex_read_register(bar2, APEX_REG_PAGE_TABLE + input_i * 8);
+				DbgPrint("  PTE[%2u] = 0x%llx  %s\n", input_i, pte, (pte & 1) ? "valid" : "INVALID");
+			}
+		}*/
+
 		// [4] descriptor submit (single INFER, no PARAM)
 		{
+			DbgPrint("[before-EXE1] page_table_size=0x%llx extended=0x%llx translation_en=0x%llx\n",
+				apex_read_register(bar2, APEX_REG_PAGE_TABLE_SIZE),
+				apex_read_register(bar2, APEX_REG_EXTENDED_TABLE),
+				apex_read_register(bar2, 0x46010));
+
+			// PTE[15] 직접 read (slot 0 input의 fault VA 위치)
+			DbgPrint("[before-EXE1] PTE[15] = 0x%llx (should be PA|0x1)\n",
+				apex_read_register(bar2, APEX_REG_PAGE_TABLE + 15 * 8));   // 정확한 register 매크로 확인 필요
+
+			// HIB_ERROR_MASK 도 확인 (어떤 에러를 활성화하는지 바뀌었는지)
+			DbgPrint("[before-EXE1] hib_error_mask=0x%llx\n",
+
+				apex_read_register(bar2, 0x486f8));
 			typedef struct {
 				UINT64 address;
 				UINT64 size_in_bytes;
@@ -426,6 +496,56 @@ VOID npudriverEvtIoDeviceControl(
 				pDc->DescRingTail++;
 				DbgPrint("[INFER_NEW] enqueued exe1: VA=0x%llx size=0x%x slot=%u\n",
 					exe1Slot->DeviceVa, (UINT32)exe1Slot->Size, slot1);
+				KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록
+				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
+
+
+				// 임시 코드 
+				DbgPrint("[INFER_NEW] enqueued exe1, waiting...\n");
+				LARGE_INTEGER t1; t1.QuadPart = -30000000LL;  // 5s
+				NTSTATUS s1 = KeWaitForSingleObject(&pDc->InferCompleteEvent,
+					Executive, KernelMode, FALSE, &t1);
+				if (s1 == STATUS_TIMEOUT) {
+					DbgPrint("[INFER_NEW] PARAM_CACHE phase TIMEOUT\n");
+					status = STATUS_IO_TIMEOUT;
+					break;
+				}
+				// HIB_ERR check 한 번
+				if (apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS) != 0) {
+					DbgPrint("[INFER_NEW] PARAM_CACHE phase FAULT\n");
+					status = STATUS_DEVICE_HARDWARE_ERROR;
+					break;
+				}
+
+				// ★ exe1 끝났으니 다음 phase 위해 reset
+				KeClearEvent(&pDc->InferCompleteEvent);
+				pDc->IsrSeenPendingBits = 0;
+
+				// exe1 완료 직후, exe0 enqueue 전에 박을 진단:
+				DbgPrint("[POST-EXE1] page_table_size=0x%llx extended=0x%llx translation_en=0x%llx\n",
+					apex_read_register(bar2, APEX_REG_PAGE_TABLE_SIZE),
+					apex_read_register(bar2, APEX_REG_EXTENDED_TABLE),
+					apex_read_register(bar2, 0x46010));
+
+				// PTE[15] 직접 read (slot 0 input의 fault VA 위치)
+				DbgPrint("[POST-EXE1] PTE[15] = 0x%llx (should be PA|0x1)\n",
+					apex_read_register(bar2, APEX_REG_PAGE_TABLE + 15 * 8));   // 정확한 register 매크로 확인 필요
+
+				// HIB_ERROR_MASK 도 확인 (어떤 에러를 활성화하는지 바뀌었는지)
+				DbgPrint("[POST-EXE1] hib_error_mask=0x%llx\n",
+					apex_read_register(bar2, 0x486f8));
+
+				//arm_tile_and_engiend(bar2, pDc);
+
+				//// input pte 검증 
+				//{
+				//	DbgPrint("[INFER_NEW] | [CHECK] PTE readback for INPUT range:\n");
+				//	size_t input_i;
+				//	for (input_i = 0; input_i <= 75; input_i++) {
+				//		UINT64 pte = apex_read_register(bar2, APEX_REG_PAGE_TABLE + input_i * 8);
+				//		DbgPrint("  PTE[%2u] = 0x%llx  %s\n", input_i, pte, (pte & 1) ? "valid" : "INVALID");
+				//	}
+				//}
 			}
 
 			UINT32 slot0 = pDc->DescRingTail % 256;
@@ -433,9 +553,9 @@ VOID npudriverEvtIoDeviceControl(
 			ring[slot0].address = pIn->BitstreamDeviceVA;
 			ring[slot0].size_in_bytes = (UINT32)pIn->BitstreamSize;
 			ring[slot0].reserved = 0;
-			KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록
-
 			pDc->DescRingTail++;
+			KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록'
+
 			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
 		}
 
@@ -523,6 +643,30 @@ VOID npudriverEvtIoDeviceControl(
 		// dpc는 터미널 상태 도달만 알리고, success / failure 판정은 ioctl 책임
 		// anyhalted / fatalSeen 트리거로 깨어났을 수 있으니 에러 레지스터 확인. 
 		{
+			{
+				UINT64 qBase = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_BASE);
+				UINT64 qSize = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_SIZE);
+				UINT64 qTail = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_TAIL);
+				UINT64 qFetch = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
+				UINT64 qComplete = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+				UINT64 qCtrl = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_CONTROL);
+				UINT64 qIntStatus = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_INT_STATUS);
+				DbgPrint("[INFER_NEW] | CHECK INSTRUCTION | QUEUE_BASE=0x%llx SIZE=0x%llx TAIL=0x%llx FETCHED=0x%llx IQ_FETCHED_HEAD=0x%llx CTRL=0x%llx INT_STATUS=0x%llx (IQ_FETCHED_HEAD is fetch progress, not done)\n",
+					qBase, qSize, qTail, qFetch, qComplete, qCtrl, qIntStatus);
+				UINT64 qStatusBlockBase = apex_read_register(bar2, 0x48598);
+				DbgPrint("[INFER_NEW] STATUS_BLOCK_BASE=0x%llx\n", qStatusBlockBase);
+			}
+
+			DbgPrint("[INFER_NEW] | [CHECK] HIB_ERR=0x%llx FIRST_ERR=0x%llx FAULT_VA=0x%llx SC=0x%x INF=0x%x OUT=0x%x PP=0x%x\n",
+				apex_read_register(bar2, 0x486f0),
+				apex_read_register(bar2, 0x48700),
+				apex_read_register(bar2, 0x48738),
+				apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS),
+				apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS),
+				apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS),
+				apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS));
+
+
 			UINT32 hibErr = apex_read_register_32(bar2, APEX_REG_USER_HIB_ERROR_STATUS);
 			UINT32 scErr = apex_read_register_32(bar2, APEX_REG_SCALAR_CORE_ERROR_STATUS);
 			UINT32 scStat = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
@@ -1998,6 +2142,11 @@ VOID npudriverEvtIoDeviceControl(
 
 		break;
 	}
+	case IOCTL_PARAM_CACHE_NEW: 
+	{
+
+		break;
+	}
 
 	case IOCTL_PARAM_CACHE:
 	{
@@ -2196,6 +2345,7 @@ VOID npudriverEvtIoDeviceControl(
 			{ in.Exe0BitstreamSize, in.Exe0BitstreamDeviceVA, &pOut->Exe0BitStreamUserVA, &pOut->Exe0BitstreamPa },
 			{ in.ParamDataSize,     in.ParamDataDeviceVA,     &pOut->ParamDataUserVA,     &pOut->ParamDataPa },
 			{ in.Exe1BitstreamSize, in.Exe1BitstreamDeviceVA, &pOut->Exe1BitstreamUserVA, &pOut->Exe1BitstreamPa },
+			{ in.Exe0ParamSize,		in.Exe0ParamDeviceVA	, &pOut->Exe0ParamUserVA	, &pOut->Exe0ParamPa},
 		};
 
 		// 한 번에 셋 다 잡고 셋 다 매핑한다. 중간에 실패하면 이미 잡힌거 전부 되돌림

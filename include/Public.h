@@ -50,6 +50,8 @@ typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
     UINT64 ParamDataDeviceVA;
     UINT64 Exe1BitstreamSize;    // PARAMETER_CACHING bitstream
     UINT64 Exe1BitstreamDeviceVA;
+    UINT64 Exe0ParamSize;
+    UINT64 Exe0ParamDeviceVA;
 } IOCTL_ALLOC_IO_BUFFERS_IN;
 
 typedef struct _IOCTL_ALLOC_IO_BUFFERS_OUT {
@@ -59,12 +61,14 @@ typedef struct _IOCTL_ALLOC_IO_BUFFERS_OUT {
     UINT64 Exe0BitStreamUserVA;
     UINT64 ParamDataUserVA;
     UINT64 Exe1BitstreamUserVA;
+    UINT64 Exe0ParamUserVA;
     UINT64 InputPa;          // (디버그용) 첫 페이지 PA contiguous 라 한 개로 충분.
     UINT64 OutputPa;
     UINT64 ScratchPa;
     UINT64 Exe0BitstreamPa;
     UINT64 ParamDataPa;
     UINT64 Exe1BitstreamPa;
+    UINT64 Exe0ParamPa;
 } IOCTL_ALLOC_IO_BUFFERS_OUT;
 
 // parameter caching (Phase 1): load weights into on-chip SRAM via PARAMETER_CACHING executable

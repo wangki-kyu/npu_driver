@@ -20,6 +20,25 @@
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
 
+// hex dump : 콘솔로
+inline void DumpHex(const char* tag, const void* base,
+    size_t offset, size_t len)
+{
+    const uint8_t* p = (const uint8_t*)base + offset;
+    printf("=== [%s] base+0x%zx, %zu bytes ===\n", tag, offset, len);
+    for (size_t i = 0; i < len; i += 16) {
+        printf("  [0x%05zx]", offset + i);
+        size_t row = (len - i >= 16) ? 16 : (len - i);
+        for (size_t k = 0; k < row; ++k) printf(" %02x", p[i + k]);
+        printf("  |");
+        for (size_t k = 0; k < row; ++k) {
+            uint8_t b = p[i + k];
+            putchar((b >= 0x20 && b < 0x7f) ? b : '.');
+        }
+        printf("|\n");
+    }
+}
+
 // JPEG 로드 → resize → 24bpp RGB 로 변환해 outBuf 에 채움. (npu_test_console.cpp 와 동일)
 static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT height)
 {
@@ -69,15 +88,25 @@ static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT he
     return true;
 }
 
-// device VA 설정 
-static const uint64_t VA_PARAM_DATA = 0x004000ULL;  // exe1 parameters (Phase 1, STAND_ALONE에선 미사용)
-static const uint64_t VA_PARAM_BITSTREAM = 0x840000ULL;  // exe1 bitstream      (PTE idx 0x840 = 2112)
-static const uint64_t VA_INFER_BITSTREAM = 0x900000ULL;  // exe0 bitstream      (PTE idx 0x900 = 2304)
-//static const uint64_t VA_INPUT = 0x000000ULL;  // input               (PTE idx 1)  ★ 0 금지
-static const uint64_t VA_INPUT = 0x001000ULL;  // input               (PTE idx 1)  ★ 0 금지
-static const uint64_t VA_OUTPUT = 0x002000ULL;  // output              (PTE idx 2)
-static const uint64_t VA_SCRATCH = 0x003000ULL;  // scratch             (PTE idx 3)
-static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern  (PTE idx 0x800 = 2048)
+// device VA 설정
+// ★ 각 slot 의 PTE 점유 범위가 겹치면 안 됨. simple PTE 는 1-level 이라 VA>>12 = PTE 인덱스.
+//   slot size = N pages 이면 [VA, VA + N*0x1000) 전체가 다른 slot 점유 범위와 disjoint 해야 함.
+//
+//   ssd_mobilenet_v2_face 기준 worst case:
+//     INPUT  = 320*320*3 = 307200B  →  75 pages → [VA_INPUT, VA_INPUT+0x4b000)
+//     OUTPUT = 8136*2 (page-aligned) = 0x4000 → 4 pages
+//     PARAM  = 6142720B  → 1500 pages → 0x5dc000
+//     PARAM_BITSTREAM = 9808B → 3 pages
+//     INFER_BITSTREAM = 199776B → 49 pages
+//   여유 있게 1MB 단위로 슬롯 배치:
+static const uint64_t VA_INPUT = 0x001000ULL;  // PTE[1..75]      input           ★ 0 금지
+static const uint64_t VA_OUTPUT = 0x100000ULL;  // PTE[256..]     output          INPUT 너머
+static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch         OUTPUT 너머
+static const uint64_t VA_EXE1_PARAM_DATA = 0x200000ULL;  // PTE[512..2011] parameters  SCRATCH 너머
+static const uint64_t VA_EXE0_PARAM_DATA = 0xA00000ULL;  // 192kb exe0 보조 
+static const uint64_t VA_PARAM_BITSTREAM = 0x840000ULL;  // PTE[2112..2114] exe1 bitstream
+static const uint64_t VA_INFER_BITSTREAM = 0x900000ULL;  // PTE[2304..2352] exe0 bitstream
+static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern
 
 
 int main(int argc, char** argv)
@@ -128,7 +157,8 @@ int main(int argc, char** argv)
     const size_t EX0_BITSTREAM_SIZE = model.bitstream.size();
     const size_t PARAM_SIZE = model.parameters.size();
     const size_t PARAM_BITSTREAM_SIZE = model.param_bitstream.size();
-
+    const size_t EXE0_PARAM_SIZE = model.exe0_parameters.size();
+    
     
    // -------------------------------------------------------------------------
    // Device handle
@@ -146,6 +176,7 @@ int main(int argc, char** argv)
     // User buffer pointers -- single cleanup path frees them all.
     void* pParamData = nullptr; // exe1.parameters() data
     void* pParamBitstream = nullptr; // exe1 bitstream
+    void* pExe0ParamData = nullptr; // exe0 parameters data
     void* pExe0Phase1Bs = nullptr; // exe0 bitstream copy mapped during Phase1
     void* pInferBitstream = nullptr; // exe0 bitstream (patched) for INFER mapping
     void* pInputBuf = nullptr;
@@ -165,15 +196,19 @@ int main(int argc, char** argv)
     
     if (isExistParam) {
         allocIn.ParamDataSize = PARAM_SIZE;
-        allocIn.ParamDataDeviceVA = VA_PARAM_DATA;
+        allocIn.ParamDataDeviceVA = VA_EXE1_PARAM_DATA; // 6.14MB exe1 용
         allocIn.Exe1BitstreamSize = PARAM_BITSTREAM_SIZE;
         allocIn.Exe1BitstreamDeviceVA = VA_PARAM_BITSTREAM;
+        allocIn.Exe0ParamSize = EXE0_PARAM_SIZE;
+        allocIn.Exe0ParamDeviceVA = VA_EXE0_PARAM_DATA;
     }
     else {
         allocIn.ParamDataSize = 0;
         allocIn.ParamDataDeviceVA = 0;
         allocIn.Exe1BitstreamSize = 0;
         allocIn.Exe1BitstreamDeviceVA = 0;
+        allocIn.Exe0ParamSize = 0;
+        allocIn.Exe0ParamDeviceVA = 0;
     }
 
     if (!DeviceIoControl(handle, IOCTL_ALLOC_IO_BUFFERS, &allocIn, sizeof(allocIn), &allocOut, sizeof(allocOut), &bytesReturned, nullptr)) {
@@ -189,6 +224,10 @@ int main(int argc, char** argv)
     if (isExistParam) {
         pParamData = (void*)allocOut.ParamDataUserVA;
         pParamBitstream = (void*)allocOut.Exe1BitstreamUserVA;
+        pExe0ParamData = (void*)allocOut.Exe0ParamUserVA;
+
+        memcpy(pParamData, model.parameters.data(), model.parameters.size());               // <-- exe1 param
+        memcpy(pExe0ParamData, model.exe0_parameters.data(), model.exe0_parameters.size()); // <-- exezhem 0 param
     }
 
     // -------------------------------------------------------------------------
@@ -204,14 +243,27 @@ int main(int argc, char** argv)
     }
 
     {
+        auto dump = [](const char* tag, const uint8_t* p, size_t n) {
+            std::cout << tag;
+            for (size_t i = 0; i < n; ++i) printf(" %02x", p[i]);
+            std::cout << "\n";
+            };
+
+
         std::cout << "\n--- patch device VAs ---" << std::endl;
-        apex_fb::PatchParamBitstreamVAs(model, VA_PARAM_DATA);
+        apex_fb::PatchParamBitstreamVAs(model, VA_EXE1_PARAM_DATA);
+        dump("[SW after patch  byte 0x40..0x5f]",
+            model.param_bitstream.data() + 0x40, 0x20);
+
         apex_fb::DumpParamPatchedVAs(model);
         apex_fb::DumpParamPatchRawValues(model);
         std::cout << "Exe1BitstreamUserVA: " << allocOut.Exe0BitStreamUserVA << std::endl;
         memcpy((void*)allocOut.Exe1BitstreamUserVA, model.param_bitstream.data(), model.param_bitstream.size());
 
-        apex_fb::PatchVAs(model, VA_INPUT, VA_OUTPUT, VA_PARAM_DATA,
+        dump("[CHIP after memcpy byte 0x40..0x5f]",
+            (uint8_t*)allocOut.Exe1BitstreamUserVA + 0x40, 0x20);
+
+        apex_fb::PatchVAs(model, VA_INPUT, VA_OUTPUT, VA_EXE0_PARAM_DATA,
                           (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0);
         apex_fb::DumpPatchedVAs(model);
         memcpy((void*)allocOut.Exe0BitStreamUserVA, model.bitstream.data(), model.bitstream.size());
@@ -224,8 +276,11 @@ int main(int argc, char** argv)
     memcpy(pInferBitstream, model.bitstream.data(), model.bitstream.size());
     if (isExistParam) {
         memcpy(pParamBitstream, model.param_bitstream.data(), model.param_bitstream.size());
-        memcpy(pParamData,      model.parameters.data(),      model.parameters.size());
     }
+
+    apex_fb::DumpChipVisibleBitstream("exe0", pInferBitstream, model.patches);
+    if (isExistParam)
+        apex_fb::DumpChipVisibleBitstream("exe1", pParamBitstream, model.param_patches);
 
     // -------------------------------------------------------------------------
     // input image 로드 → input slot 으로 직접 채움.
@@ -243,6 +298,10 @@ int main(int argc, char** argv)
             goto cleanup;
         }
     }
+
+    DumpHex("after-PC slot0 head", (const void*)allocOut.InputUserVA, 0x0000, 0x100);
+    DumpHex("after-PC slot0 0xe000", (const void*)allocOut.InputUserVA, 0xe000, 0x200);
+    DumpHex("after-PC slot0 0xf000", (const void*)allocOut.InputUserVA, 0xf000, 0x100);
 
     // output slot 0 으로 — chip 이 outfeed 한 데이터인지 판별 가능하게
     memset(pOutputBuf, 0, OUTPUT_SIZE);

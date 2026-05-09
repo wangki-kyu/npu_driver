@@ -43,14 +43,22 @@ struct ApexModelFb {
     std::vector<FieldPatch> patches;
     std::vector<LayerInfo>  input_layers;
     std::vector<LayerInfo>  output_layers;
+    std::vector<uint8_t>    exe0_parameters;
     size_t                  scratch_size_bytes;
     size_t                  total_output_size_bytes; // sum of PageAlignUp(each output layer)
-
+    
+    
     // executable[1]: parameter caching (PARAMETER_CACHING, may be empty)
     std::vector<uint8_t>    param_bitstream;  // exe1 bitstream (~9KB)
     std::vector<FieldPatch> param_patches;    // exe1 VA patches
     std::vector<uint8_t>    parameters;       // exe1 raw parameter data (~6MB)
 };
+
+inline const LayerInfo* FindLayer(const std::vector<LayerInfo>& layers,
+    const std::string& name) {
+    for (const auto& l : layers) if (l.name == name) return &l;
+    return nullptr;
+}
 
 inline uint64_t PageAlignUp(uint64_t n) { return (n + 4095ULL) & ~4095ULL; }
 
@@ -217,6 +225,12 @@ inline ApexModelFb LoadModel(const std::string& path) {
     }
     std::cout << "[LoadModel] bitstream size: " << model.bitstream.size() << " bytes" << std::endl;
 
+    const auto* exe0_params = exec->parameters();
+    if (exe0_params && exe0_params->size() > 0) {
+        model.exe0_parameters.assign(exe0_params->begin(), exe0_params->end());
+    }
+    std::cout << "[LoadModel] exe0_parameters: " << model.exe0_parameters.size() << " bytes" << std::endl;
+
     // 10. Extract scratch_size_bytes
     model.scratch_size_bytes = (size_t)exec->scratch_size_bytes();
 
@@ -337,8 +351,10 @@ inline ApexModelFb LoadModel(const std::string& path) {
 
     // Compute total_output_size_bytes (sum of PageAlignUp of each output layer)
     model.total_output_size_bytes = 0;
-    for (const auto& layer : model.output_layers)
+    for (const auto& layer : model.output_layers) {
         model.total_output_size_bytes += PageAlignUp(layer.size_bytes);
+    }
+        
     std::cout << "[LoadModel] total_output_size_bytes: " << model.total_output_size_bytes << std::endl;
 
     // 14. Parse executable[1] (PARAMETER_CACHING) if present
@@ -553,7 +569,24 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
 // Patch exe1 (PARAMETER_CACHING) bitstream: write param_va into BASE_ADDRESS_PARAMETER fields.
 inline void PatchParamBitstreamVAs(ApexModelFb& model, uint64_t param_va) {
     using namespace platforms::darwinn;
+
+    fprintf(stderr,
+        "[PATCHER] enter: this_model=%p &param_patches=%p size=%zu "
+        "&param_bitstream=%p data=%p bs_size=%zu param_va=0x%llx\n",
+        (void*)&model, (void*)&model.param_patches,
+        model.param_patches.size(),
+        (void*)&model.param_bitstream,
+        (void*)model.param_bitstream.data(),
+        model.param_bitstream.size(),
+        (unsigned long long)param_va);
+
+    int idx = 0;
     for (const auto& p : model.param_patches) {
+        fprintf(stderr,
+            "[PATCHER]  [%d] desc=%d pos=%d offset_bit=%d (=byte %d) name='%s'\n",
+            idx++, (int)p.desc, (int)p.position, p.offset_bit,
+            p.offset_bit / 8, p.name.c_str());
+
         uint64_t va = 0;
         switch (p.desc) {
         case Description_BASE_ADDRESS_PARAMETER: va = param_va; break;
@@ -575,6 +608,12 @@ inline void PatchParamBitstreamVAs(ApexModelFb& model, uint64_t param_va) {
         std::memcpy(&cur, model.param_bitstream.data() + off, 8); //기존 8바이트 읽기 
         cur = (cur & ~shifted_mask) | (shifted_val & shifted_mask); // 패치 영역만 교체 
         std::memcpy(model.param_bitstream.data() + off, &cur, 8); // 다시 쓰기
+
+        fprintf(stderr,
+            "[PATCHER]    wrote @byte %zu : after = %02x %02x %02x %02x\n",
+            off,
+            model.param_bitstream[off + 0], model.param_bitstream[off + 1],
+            model.param_bitstream[off + 2], model.param_bitstream[off + 3]);
 
         //std::memcpy(model.param_bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
     }
@@ -630,6 +669,49 @@ inline void DumpParamPatchedVAs(const ApexModelFb& model) {
     std::cout << "  [param exe] PARAMETER VA: 0x" << std::setw(16) << va64(param_hi, param_lo) << std::dec << std::endl;
     std::cout << "  [param exe] bitstream: " << model.param_bitstream.size()
               << " bytes, parameters: " << model.parameters.size() << " bytes" << std::endl;
+}
+
+// chip-visible memory(driver-allocated contiguous slot)에 patch된 bitstream이 제대로 들어갔는지 확인.
+// 첫 nBytes 헥스 덤프 + 각 patch 위치의 32-bit 값을 함께 출력.
+inline void DumpChipVisibleBitstream(const char* tag,
+                                     const void* chip_visible,
+                                     const std::vector<FieldPatch>& patches,
+                                     size_t nBytes = 0x80) {
+    using namespace platforms::darwinn;
+    const uint8_t* p = (const uint8_t*)chip_visible;
+    std::cout << "[chip-visible] " << tag << " first 0x" << std::hex << nBytes << " bytes:" << std::dec << std::endl;
+    for (size_t i = 0; i < nBytes; i++) {
+        if (i % 16 == 0) std::cout << "  [0x" << std::hex << std::setw(3) << std::setfill('0') << i << "] ";
+        std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)p[i] << " ";
+        if (i % 16 == 15) std::cout << std::endl;
+    }
+    std::cout << std::dec << std::setfill(' ');
+
+    for (size_t pi = 0; pi < patches.size(); pi++) {
+        const auto& fp = patches[pi];
+        uint32_t shift = fp.offset_bit % 8;
+        size_t off = fp.offset_bit / 8;
+        uint64_t raw = 0;
+        std::memcpy(&raw, p + off, 8);
+        uint32_t val = (uint32_t)((raw >> shift) & 0xFFFFFFFF);
+
+        const char* desc_name = "?";
+        switch (fp.desc) {
+        case Description_BASE_ADDRESS_INPUT_ACTIVATION:  desc_name = "INPUT";   break;
+        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: desc_name = "OUTPUT";  break;
+        case Description_BASE_ADDRESS_PARAMETER:         desc_name = "PARAM";   break;
+        case Description_BASE_ADDRESS_SCRATCH:           desc_name = "SCRATCH"; break;
+        default: break;
+        }
+        const char* pos_name =
+            (fp.position == Position_LOWER_32BIT) ? "LO32" :
+            (fp.position == Position_UPPER_32BIT) ? "HI32" : "?";
+        std::cout << "  [chip-visible " << tag << "] patch[" << pi << "] " << desc_name << "." << pos_name
+                  << " name='" << fp.name << "'"
+                  << " off=0x" << std::hex << off
+                  << " value=0x" << std::setw(8) << std::setfill('0') << val
+                  << std::dec << std::setfill(' ') << std::endl;
+    }
 }
 
 } // namespace apex_fb
