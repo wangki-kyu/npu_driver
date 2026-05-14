@@ -186,6 +186,13 @@ VOID npudriverEvtIoDeviceControl(
 				inputKva[8], inputKva[9], inputKva[10], inputKva[11],
 				inputKva[12], inputKva[13], inputKva[14], inputKva[15]);
 		}
+		
+		// param data va check 
+		PUCHAR pParam = (PUCHAR)pDc->IOSlots[IO_SLOT_PARAM_DATA].Kva;
+		DbgPrint("[INFER NEW] | PARAM DATA Check\n");
+		size_t pIdx;
+		for (pIdx = 0; pIdx < 32; ++pIdx) DbgPrint(" %02x", pParam[pIdx]);
+		DbgPrint("\n");
 
 		// [1] retrieve
 		if (InputBufferLength < sizeof(IOCTL_INFER_INFO)) {
@@ -391,6 +398,80 @@ VOID npudriverEvtIoDeviceControl(
 			DbgPrint("[before-EXE1] hib_error_mask=0x%llx\n",
 
 				apex_read_register(bar2, 0x486f8));
+
+			// === Phase-1 진단 #2: PTE coverage 검증 ===
+			// 6.14MB exe1 param 영역 (VA_EXE1_PARAM_DATA = 0x200000) 의 모든 PTE 가
+			// valid 한지, 그리고 chip 이 보는 PA 가 host 가 박은 slot 의 PA 와 일치하는지.
+			//
+			// 모든 IOSlot 의 PTE 범위를 일괄 검사한다.
+			{
+				ULONG slotIdx;
+				for (slotIdx = 0; slotIdx < IO_SLOT_COUNT; slotIdx++) {
+					ALLOC_IO_SLOT* slot = &pDc->IOSlots[slotIdx];
+					if (slot->Kva == NULL || slot->Size == 0) continue;
+					UINT64 va = slot->DeviceVa;
+					SIZE_T sz = slot->Size;
+					ULONG pageStart = (ULONG)(va >> 12);
+					ULONG pageCount = (ULONG)((sz + 0xFFF) >> 12);
+					ULONG invalid = 0;
+					UINT64 firstInvalidPte = 0;
+					ULONG firstInvalidIdx = 0;
+					ULONG pageIdx;
+					for (pageIdx = 0; pageIdx < pageCount; pageIdx++) {
+						UINT64 pte = apex_read_register(bar2,
+							APEX_REG_PAGE_TABLE + (pageStart + pageIdx) * 8);
+						if ((pte & 1) == 0) {
+							if (invalid == 0) {
+								firstInvalidPte = pte;
+								firstInvalidIdx = pageStart + pageIdx;
+							}
+							invalid++;
+						}
+					}
+					DbgPrint("[PTE-CHECK] slot[%u] VA=0x%llx size=0x%llx "
+						"PTE[%u..%u] (%u pages)  invalid=%u/%u%s\n",
+						slotIdx, va, (UINT64)sz,
+						pageStart, pageStart + pageCount - 1, pageCount,
+						invalid, pageCount,
+						(invalid > 0) ? "  *** !!! ***" : "");
+					if (invalid > 0) {
+						DbgPrint("[PTE-CHECK]   first invalid: PTE[%u] = 0x%llx\n",
+							firstInvalidIdx, firstInvalidPte);
+					}
+				}
+			}
+
+			// VA_EXE1_PARAM_DATA = 0x200000 부근 PTE 의 PA 가 실제 slot KVA 의 PA 와
+			// 일치하는지 spot check (head / mid / tail 3 지점).
+			{
+				ALLOC_IO_SLOT* pSlot = &pDc->IOSlots[IO_SLOT_PARAM_DATA];
+				if (pSlot->Kva != NULL && pSlot->Size >= 0x1000) {
+					ULONG pageStart = (ULONG)(pSlot->DeviceVa >> 12);
+					ULONG pageCount = (ULONG)((pSlot->Size + 0xFFF) >> 12);
+					ULONG checkIdx[3] = {
+						0,
+						pageCount / 2,
+						(pageCount > 0) ? (pageCount - 1) : 0
+					};
+					const char* label[3] = { "HEAD", "MID", "TAIL" };
+					ULONG checkK;
+					for (checkK = 0; checkK < 3; checkK++) {
+						ULONG pageIdx = checkIdx[checkK];
+						UINT64 pte = apex_read_register(bar2,
+							APEX_REG_PAGE_TABLE + (pageStart + pageIdx) * 8);
+						UINT64 chipPa = pte & ~0xFFFULL; // strip flags (PFN 인코딩 시 다를 수 있음)
+						PHYSICAL_ADDRESS hostPa =
+							MmGetPhysicalAddress((PUCHAR)pSlot->Kva + pageIdx * 0x1000);
+						BOOLEAN match = (chipPa == (UINT64)hostPa.QuadPart);
+						DbgPrint("[PTE-PA-CHECK] PARAM slot %s page[%u] (PTE[%u]): "
+							"chipPA=0x%llx hostPA=0x%llx %s\n",
+							label[checkK], pageIdx, pageStart + pageIdx,
+							chipPa, (UINT64)hostPa.QuadPart,
+							match ? "MATCH" : "MISMATCH!!!");
+					}
+				}
+			}
+
 			typedef struct {
 				UINT64 address;
 				UINT32 size_in_bytes;
@@ -429,6 +510,99 @@ VOID npudriverEvtIoDeviceControl(
 					status = STATUS_DEVICE_HARDWARE_ERROR;
 					break;
 				}
+
+				// ============================================================
+				// [EXE1-DONE] Phase 1 #3: exe1 가 *진짜로* 완료됐는지 확인
+				// IRQ 가 떨어진 시점에:
+				//   1) InstructionQueue 의 tail 과 completed_head 가 일치하는가
+				//   2) PARAMETER_POP / AVDATA_POP / OUTFEED 등 모든 엔진이
+				//      kHalted (status=0) 상태인가
+				//   3) SC_HOST_INT_COUNT 가 우리 기대대로 증가했는가
+				// 만약 (1) 이 INCOMPLETE 면 → IRQ 가 일찍 fire,
+				// 본인 코드가 exe1 완전 종료 전에 exe0 시작 → 부분적 weight
+				// load → score_head 가 0 weights 로 컨볼루션 → 균일 출력.
+				// ============================================================
+				{
+					UINT64 iq_tail      = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_TAIL);
+					UINT64 iq_fetched   = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
+					UINT64 iq_completed = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+					UINT32 sc_stat      = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+					UINT32 pp_stat      = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
+					UINT32 av_stat      = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
+					UINT32 in_stat      = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
+					UINT32 out_stat     = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+					UINT32 to_stat      = apex_read_register_32(bar2, APEX_REG_TILE_OP_RUN_STATUS);
+					UINT64 sc_cnt       = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
+					UINT64 hib_first    = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
+					UINT64 pf_addr      = apex_read_register(bar2, 0x48738);
+					UINT64 infeed_pf    = apex_read_register(bar2, APEX_REG_INFEED_PAGE_FAULT_ADDR);
+
+					BOOLEAN drained =
+						(iq_completed == iq_tail) && (iq_fetched == iq_tail);
+					BOOLEAN halted  =
+						(sc_stat == 0 && pp_stat == 0 && av_stat == 0 &&
+						 in_stat == 0 && out_stat == 0 && to_stat == 0);
+
+					DbgPrint("[EXE1-DONE] IQ tail=%llu fetched=%llu completed=%llu  %s\n",
+						iq_tail, iq_fetched, iq_completed,
+						drained ? "DRAINED" : "*** INCOMPLETE ***");
+					DbgPrint("[EXE1-DONE] engines: SC=%u PP=%u AV=%u IN=%u OUT=%u TO=%u  %s\n",
+						sc_stat, pp_stat, av_stat, in_stat, out_stat, to_stat,
+						halted ? "ALL_HALTED" : "*** STILL_RUNNING ***");
+					DbgPrint("[EXE1-DONE] SC_HOST_INT_COUNT=0x%llx (pre=0x%llx, delta=%lld)\n",
+						sc_cnt, pDc->LastScHostIntCount,
+						(LONGLONG)(sc_cnt - pDc->LastScHostIntCount));
+					DbgPrint("[EXE1-DONE] HIB_FIRST_ERR=0x%llx page_fault_addr=0x%llx infeed_pf=0x%llx\n",
+						hib_first, pf_addr, infeed_pf);
+
+					// 안 끝났으면 100ms 추가 폴링 — IRQ 가 일찍 fire 한 거라면
+					// 곧 catch-up 할 거고, 그 catch-up 시간이 "얼마나 일찍" 의 척도.
+					if (!drained) {
+						DbgPrint("[EXE1-DONE] queue not drained at IRQ time — polling 100ms for catch-up\n");
+						int extra_ms;
+						for (extra_ms = 0; extra_ms < 100; extra_ms++) {
+							LARGE_INTEGER d; d.QuadPart = -10000LL;  // 1ms
+							KeDelayExecutionThread(KernelMode, FALSE, &d);
+							iq_completed = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
+							iq_fetched   = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
+							if (iq_completed == iq_tail && iq_fetched == iq_tail) {
+								DbgPrint("[EXE1-DONE] queue caught up after +%d ms — IRQ was %d ms early!\n",
+									extra_ms + 1, extra_ms + 1);
+								break;
+							}
+						}
+						if (iq_completed != iq_tail || iq_fetched != iq_tail) {
+							DbgPrint("[EXE1-DONE] queue STILL not drained after +100ms: "
+								"tail=%llu fetched=%llu completed=%llu  *** HANG / WEDGED ***\n",
+								iq_tail, iq_fetched, iq_completed);
+						}
+					}
+
+					// 엔진이 아직 running 이면 50ms 추가 폴링
+					if (!halted) {
+						DbgPrint("[EXE1-DONE] engines not halted at IRQ time — polling 50ms\n");
+						int extra_ms;
+						UINT32 final_pp = pp_stat, final_av = av_stat;
+						for (extra_ms = 0; extra_ms < 50; extra_ms++) {
+							LARGE_INTEGER d; d.QuadPart = -10000LL;  // 1ms
+							KeDelayExecutionThread(KernelMode, FALSE, &d);
+							final_pp = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
+							final_av = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
+							UINT32 final_sc  = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
+							UINT32 final_out = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
+							if (final_pp == 0 && final_av == 0 && final_sc == 0 && final_out == 0) {
+								DbgPrint("[EXE1-DONE] engines all halted after +%d ms — IRQ was early\n",
+									extra_ms + 1);
+								break;
+							}
+						}
+						if (final_pp != 0 || final_av != 0) {
+							DbgPrint("[EXE1-DONE] PP/AV STILL running after +50ms: PP=%u AV=%u\n",
+								final_pp, final_av);
+						}
+					}
+				}
+				// ============================================================
 
 				// ★ exe1 끝났으니 다음 phase 위해 reset
 				KeClearEvent(&pDc->InferCompleteEvent);

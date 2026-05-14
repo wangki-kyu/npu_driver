@@ -7,6 +7,7 @@
 #include <string>
 #include <algorithm>
 #include <cmath>
+#include <nmmintrin.h>   // _mm_crc32_u64 (SSE4.2 hardware CRC32)
 
 #define NOMINMAX
 #include <Windows.h>
@@ -39,7 +40,52 @@ inline void DumpHex(const char* tag, const void* base,
     }
 }
 
-// JPEG 로드 → resize → 24bpp RGB 로 변환해 outBuf 에 채움. (npu_test_console.cpp 와 동일)
+// Save raw output layer bytes to txt file (pycoral OUT-DUMP 와 byte 비교용)
+// 형식: 한 줄당 16 byte hex + offset. Python 측 dump 와 diff 가능.
+// 파일명에는 자동으로 timestamp 가 붙음: foo.txt → foo_YYYYMMDD_HHMMSS.txt
+inline void SaveLayerToFile(const std::string& filename,
+                            const void* base, size_t offset, size_t len)
+{
+    // timestamp 삽입
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char ts[32];
+    sprintf_s(ts, sizeof(ts), "_%04d%02d%02d_%02d%02d%02d",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    std::string stamped;
+    auto dot = filename.rfind('.');
+    if (dot == std::string::npos) stamped = filename + ts;
+    else                          stamped = filename.substr(0, dot) + ts + filename.substr(dot);
+
+    FILE* f = nullptr;
+    fopen_s(&f, stamped.c_str(), "w");
+    if (!f) {
+        printf("[save] FAIL: cannot open %s\n", stamped.c_str());
+        return;
+    }
+    const uint8_t* p = (const uint8_t*)base + offset;
+    fprintf(f, "=== %s size=%zu ===\n", stamped.c_str(), len);
+    for (size_t i = 0; i < len; i += 16) {
+        fprintf(f, "[0x%05zx]", i);
+        size_t row = (len - i >= 16) ? 16 : (len - i);
+        for (size_t k = 0; k < row; ++k) fprintf(f, " %02x", p[i + k]);
+        fprintf(f, "\n");
+    }
+    fclose(f);
+    printf("[save] wrote %s (%zu bytes)\n", stamped.c_str(), len);
+}
+
+// JPEG 로드 → aspect-preserving letterbox resize → 24bpp RGB 로 변환해 outBuf 에 채움.
+//
+// pycoral 의 common.set_resized_input 과 동일한 전처리:
+//   1) scale = min(width/srcW, height/srcH)      ← 비율 유지 위해 작은 쪽
+//   2) (newW, newH) = (srcW*scale, srcH*scale)   ← 비율 유지한 resize 대상
+//   3) outBuf (width x height x 3) 를 0 으로 채우고
+//   4) 좌상단 (0,0) 부터 newW x newH 영역에 resized image 배치
+//   5) 우측 / 하단 padding 은 0 그대로
+//
+// 보간은 WICBitmapInterpolationModeFant — WIC 의 high-quality bilinear-like
+// 알고리즘, PIL.Image.BILINEAR 와 byte 단위로 가장 유사한 결과를 냄.
 static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT height)
 {
     HRESULT hr = S_OK;
@@ -48,6 +94,9 @@ static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT he
     IWICBitmapFrameDecode* pFrame     = nullptr;
     IWICBitmapScaler*      pScaler    = nullptr;
     IWICFormatConverter*   pConverter = nullptr;
+
+    // 1) 출력 버퍼 전체를 0 으로 (letterbox padding).
+    memset(outBuf, 0, (size_t)width * height * 3);
 
     hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
                           IID_IWICImagingFactory, (void**)&pFactory);
@@ -61,10 +110,33 @@ static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT he
     hr = pDecoder->GetFrame(0, &pFrame);
     if (FAILED(hr)) { pDecoder->Release(); pFactory->Release(); return false; }
 
+    // 2) 원본 해상도 읽어서 aspect-preserving 새 크기 계산.
+    UINT srcW = 0, srcH = 0;
+    hr = pFrame->GetSize(&srcW, &srcH);
+    if (FAILED(hr) || srcW == 0 || srcH == 0) {
+        std::cerr << "GetSize failed or zero size" << std::endl;
+        pFrame->Release(); pDecoder->Release(); pFactory->Release();
+        return false;
+    }
+    double sx = (double)width  / (double)srcW;
+    double sy = (double)height / (double)srcH;
+    double scale = (sx < sy) ? sx : sy;
+    UINT newW = (UINT)(srcW * scale);
+    UINT newH = (UINT)(srcH * scale);
+    if (newW == 0) newW = 1;
+    if (newH == 0) newH = 1;
+    if (newW > width)  newW = width;
+    if (newH > height) newH = height;
+    std::cout << "[image] source " << srcW << "x" << srcH
+              << " -> letterbox " << newW << "x" << newH
+              << " in " << width << "x" << height
+              << " (scale=" << scale << ")" << std::endl;
+
     hr = pFactory->CreateBitmapScaler(&pScaler);
     if (FAILED(hr)) { pFrame->Release(); pDecoder->Release(); pFactory->Release(); return false; }
 
-    hr = pScaler->Initialize(pFrame, width, height, WICBitmapInterpolationModeCubic);
+    // Fant = WIC 의 PIL.BILINEAR-equivalent.
+    hr = pScaler->Initialize(pFrame, newW, newH, WICBitmapInterpolationModeFant);
     if (FAILED(hr)) { pScaler->Release(); pFrame->Release(); pDecoder->Release(); pFactory->Release(); return false; }
 
     hr = pFactory->CreateFormatConverter(&pConverter);
@@ -76,15 +148,29 @@ static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT he
     if (FAILED(hr)) { pConverter->Release(); pScaler->Release(); pFrame->Release();
                       pDecoder->Release(); pFactory->Release(); return false; }
 
-    UINT stride     = width * 3;        // 24bpp = 3 bytes/pixel
-    UINT bufferSize = stride * height;
-    hr = pConverter->CopyPixels(nullptr, stride, bufferSize, (BYTE*)outBuf);
+    // 3) resized image 를 임시 버퍼에 받고 → 좌상단에 letterbox 배치.
+    UINT srcStride = newW * 3;
+    UINT tempSize  = srcStride * newH;
+    std::vector<BYTE> tempBuf(tempSize);
+    hr = pConverter->CopyPixels(nullptr, srcStride, tempSize, tempBuf.data());
 
     pConverter->Release(); pScaler->Release(); pFrame->Release();
     pDecoder->Release();   pFactory->Release();
 
     if (FAILED(hr)) { std::cerr << "CopyPixels failed: 0x" << std::hex << hr << std::endl; return false; }
-    std::cout << "[image] loaded " << width << "x" << height << " (24bppRGB)" << std::endl;
+
+    // 4) outBuf 의 좌상단에 newW x newH 복사. 우측/하단 padding 은 0 그대로.
+    UINT dstStride = width * 3;
+    BYTE* dst = (BYTE*)outBuf;
+    for (UINT r = 0; r < newH; r++) {
+        memcpy(dst + r * dstStride, tempBuf.data() + r * srcStride, srcStride);
+        // 같은 행의 (newW..width-1) 픽셀 = 0 (memset 으로 이미 채워둠).
+    }
+    // 행 (newH..height-1) = 0 (memset 으로 이미 채워둠).
+
+    std::cout << "[image] loaded " << srcW << "x" << srcH
+              << " -> " << newW << "x" << newH << " letterbox (Fant) in "
+              << width << "x" << height << "x3 RGB" << std::endl;
     return true;
 }
 
@@ -99,6 +185,56 @@ static bool LoadJpegToRGB(const wchar_t* path, void* outBuf, UINT width, UINT he
 //     PARAM_BITSTREAM = 9808B → 3 pages
 //     INFER_BITSTREAM = 199776B → 49 pages
 //   여유 있게 1MB 단위로 슬롯 배치:
+// ============================================================================
+// [PARAM-DUMP] libedgetpu 와 동일 형식의 standard CRC32 dump 함수.
+// libedgetpu/driver/package_registry.cc::ExecutableReference 생성자에 박힌
+// dump 와 1:1 비교용. 같은 polynomial (0xEDB88320), 같은 init/finalize.
+// ============================================================================
+static uint32_t crc32_standard(const void* data, size_t n) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= p[i];
+        for (int k = 0; k < 8; k++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & -(int32_t)(crc & 1));
+        }
+    }
+    return ~crc;
+}
+
+static std::string hex32_line(const uint8_t* b, size_t cnt) {
+    std::string s;
+    char tmp[8];
+    for (size_t i = 0; i < cnt; i++) {
+        std::snprintf(tmp, sizeof(tmp), "%02x ", b[i]);
+        s += tmp;
+    }
+    return s;
+}
+
+static void dump_buffer(const char* prefix, const char* label,
+                        const void* data, size_t n) {
+    if (data == nullptr || n == 0) {
+        printf("[%s] user '%s' (empty)\n", prefix, label);
+        return;
+    }
+    uint32_t crc = crc32_standard(data, n);
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    printf("[%s] user label='%s' size=%zu CRC32=0x%08x\n", prefix, label, n, crc);
+    printf("[%s]   HEAD: %s\n", prefix, hex32_line(p, 32).c_str());
+    if (n >= 64) {
+        printf("[%s]   MID:  %s\n", prefix, hex32_line(p + n / 2, 32).c_str());
+    }
+    if (n >= 32) {
+        printf("[%s]   TAIL: %s\n", prefix, hex32_line(p + n - 32, 32).c_str());
+    }
+}
+
+// 기존 호출자 (param dump) 호환 유지
+static void dump_param(const char* label, const void* data, size_t n) {
+    dump_buffer("PARAM-DUMP", label, data, n);
+}
+
 static const uint64_t VA_INPUT = 0x001000ULL;  // PTE[1..75]      input           ★ 0 금지
 static const uint64_t VA_OUTPUT = 0x100000ULL;  // PTE[256..]     output          INPUT 너머
 static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch         OUTPUT 너머
@@ -144,6 +280,16 @@ int main(int argc, char** argv)
         std::cout << "[main] FAIL: model has no input or output layers" << std::endl;
         return 1;
     }
+
+    // ========================================================================
+    // [PARAM-DUMP] LoadModel 직후, memcpy 이전 — libedgetpu 와 직접 비교용.
+    // libedgetpu/driver/package_registry.cc::ExecutableReference 생성자가
+    // exe0/exe1 각각에 대해 같은 형식 dump 를 stderr 로 찍는다. 두 출력의
+    // size + CRC32 가 일치하면 본인 apex_model_fb.hpp::LoadModel 의 schema
+    // 파싱이 libedgetpu 와 byte-perfect 호환.
+    // ========================================================================
+    dump_param("exe0_main_parameters",     model.exe0_parameters.data(), model.exe0_parameters.size());
+    dump_param("exe1_param_caching_data", model.parameters.data(),      model.parameters.size());
 
     DWORD bytesReturned;
     bool isExistParam = !model.param_bitstream.empty() && !model.parameters.empty();
@@ -228,6 +374,124 @@ int main(int argc, char** argv)
 
         memcpy(pParamData, model.parameters.data(), model.parameters.size());               // <-- exe1 param
         memcpy(pExe0ParamData, model.exe0_parameters.data(), model.exe0_parameters.size()); // <-- exezhem 0 param
+
+        // memcpy 검증: src(model.parameters) 와 dst(UserVA → 결국 chip 이 DMA 로 읽을 PA) 가 같은지.
+        // driver 쪽에서 같은 시점에 KVA 기준으로 dump 해서 3-way 비교하면 매핑 깨짐 즉시 보임.
+        //
+        // === Phase-1 진단: 6.14MB memcpy integrity 전체 검증 ===
+        // 첫 32바이트만 비교하면 head 만 일치하고 tail 이 잘려도 못 잡음.
+        // head + mid + tail 3 지점 + 전체 CRC32 로 완전 검증.
+        auto crc32_buf = [](const void* p, size_t n) -> uint64_t {
+            const uint8_t* b = (const uint8_t*)p;
+            uint64_t crc = ~0ULL;
+            // 8-byte chunk 빠르게
+            size_t n8 = n / 8;
+            for (size_t i = 0; i < n8; i++) {
+                uint64_t v;
+                std::memcpy(&v, b + i * 8, 8);
+                crc = _mm_crc32_u64(crc, v);
+            }
+            // tail 1-byte
+            for (size_t i = n8 * 8; i < n; i++) {
+                crc = _mm_crc32_u8((uint32_t)crc, b[i]);
+            }
+            return ~crc;
+        };
+
+        // ---------- exe1 parameters (6.14MB) ----------
+        std::cout << "\n[param-verify] exe1 parameters (size=" << model.parameters.size() << ")" << std::endl;
+        {
+            size_t sz = model.parameters.size();
+            const uint8_t* src = model.parameters.data();
+            const uint8_t* dst = (const uint8_t*)pParamData;
+
+            DumpHex("  src HEAD",  src, 0,           32);
+            DumpHex("  dst HEAD",  dst, 0,           32);
+            DumpHex("  src MID",   src, sz / 2,      32);
+            DumpHex("  dst MID",   dst, sz / 2,      32);
+            DumpHex("  src TAIL",  src, sz - 32,     32);
+            DumpHex("  dst TAIL",  dst, sz - 32,     32);
+
+            uint64_t crc_src = crc32_buf(src, sz);
+            uint64_t crc_dst = crc32_buf(dst, sz);
+            int head_eq = (std::memcmp(src, dst, 32) == 0);
+            int mid_eq  = (std::memcmp(src + sz / 2, dst + sz / 2, 32) == 0);
+            int tail_eq = (std::memcmp(src + sz - 32, dst + sz - 32, 32) == 0);
+            int crc_eq  = (crc_src == crc_dst);
+            printf("[param-verify] exe1: HEAD=%s MID=%s TAIL=%s  CRC32 src=0x%016llx dst=0x%016llx %s\n",
+                head_eq ? "OK" : "DIFF",
+                mid_eq  ? "OK" : "DIFF",
+                tail_eq ? "OK" : "DIFF",
+                (unsigned long long)crc_src,
+                (unsigned long long)crc_dst,
+                crc_eq ? "MATCH" : "MISMATCH!!!");
+            if (!crc_eq) {
+                // 첫 불일치 byte offset 찾기 (이진 탐색 비슷하게)
+                size_t first_diff = (size_t)-1;
+                for (size_t i = 0; i < sz; i++) {
+                    if (src[i] != dst[i]) { first_diff = i; break; }
+                }
+                printf("[param-verify] exe1: first byte diff at offset 0x%zx / 0x%zx "
+                       "(%.2f%% into buffer)  src=0x%02x dst=0x%02x\n",
+                       first_diff, sz, 100.0 * first_diff / sz,
+                       src[first_diff], dst[first_diff]);
+            }
+        }
+
+        // ---------- exe0 parameters (192KB) ----------
+        std::cout << "[param-verify] exe0 parameters (size=" << model.exe0_parameters.size() << ")" << std::endl;
+        {
+            size_t sz = model.exe0_parameters.size();
+            const uint8_t* src = model.exe0_parameters.data();
+            const uint8_t* dst = (const uint8_t*)pExe0ParamData;
+
+            DumpHex("  src HEAD",  src, 0,           32);
+            DumpHex("  dst HEAD",  dst, 0,           32);
+            DumpHex("  src TAIL",  src, sz - 32,     32);
+            DumpHex("  dst TAIL",  dst, sz - 32,     32);
+
+            uint64_t crc_src = crc32_buf(src, sz);
+            uint64_t crc_dst = crc32_buf(dst, sz);
+            int head_eq = (std::memcmp(src, dst, 32) == 0);
+            int tail_eq = (std::memcmp(src + sz - 32, dst + sz - 32, 32) == 0);
+            int crc_eq  = (crc_src == crc_dst);
+            printf("[param-verify] exe0: HEAD=%s TAIL=%s  CRC32 src=0x%016llx dst=0x%016llx %s\n",
+                head_eq ? "OK" : "DIFF",
+                tail_eq ? "OK" : "DIFF",
+                (unsigned long long)crc_src,
+                (unsigned long long)crc_dst,
+                crc_eq ? "MATCH" : "MISMATCH!!!");
+            if (!crc_eq) {
+                size_t first_diff = (size_t)-1;
+                for (size_t i = 0; i < sz; i++) {
+                    if (src[i] != dst[i]) { first_diff = i; break; }
+                }
+                printf("[param-verify] exe0: first byte diff at offset 0x%zx / 0x%zx "
+                       "(%.2f%% into buffer)  src=0x%02x dst=0x%02x\n",
+                       first_diff, sz, 100.0 * first_diff / sz,
+                       src[first_diff], dst[first_diff]);
+            }
+        }
+
+        //size_t sz = model.parameters.size();        // 6.14MB
+        //size_t q = sz / 4;
+        // 4번 빌드/실행, 한 번에 한 줄만 활성화:
+        //memset((char*)pParamData + 0 * q, 0x00, q);   // 1st quarter
+        //memset((char*)pParamData + 1 * q, 0x00, q);   // 2nd quarter
+        //memset((char*)pParamData + 2 * q, 0x00, q);   // 3rd quarter
+        //memset((char*)pParamData + 3 * q, 0x00, q);   // 4th quarter (last)
+
+        size_t sz0 = model.exe0_parameters.size();   // 196KB
+        size_t q0 = sz0 / 4;
+        //memset((char*)pExe0ParamData + 0 * q0, 0x00, q0);  // 1st quarter of exe0 보조
+         //memset((char*)pExe0ParamData + 1*q0, 0x00, q0);  // 2번: 2nd quarter
+         //memset((char*)pExe0ParamData + 2*q0, 0x00, q0);  // 3번: 3rd quarter
+         //memset((char*)pExe0ParamData + 3*q0, 0x00, q0);  // 4번: 4th quarter
+
+        // === DIAGNOSTIC ===
+        //memset(pParamData, 0x00, model.parameters.size());          // weight 를 전부 0 으로
+        //memset(pExe0ParamData, 0x00, model.exe0_parameters.size()); // exe0 보조도 0
+        // ==================
     }
 
     // -------------------------------------------------------------------------
@@ -303,9 +567,19 @@ int main(int argc, char** argv)
     DumpHex("after-PC slot0 0xe000", (const void*)allocOut.InputUserVA, 0xe000, 0x200);
     DumpHex("after-PC slot0 0xf000", (const void*)allocOut.InputUserVA, 0xf000, 0x100);
 
-    // output slot 0 으로 — chip 이 outfeed 한 데이터인지 판별 가능하게
-    memset(pOutputBuf, 0, OUTPUT_SIZE);
-    if (pScratchBuf) memset(pScratchBuf, 0, SCRATCH_SIZE);
+    // ========================================================================
+    // [INPUT-DUMP] pycoral run_infer.py 의 [INPUT-DUMP] 와 byte-by-byte 비교용.
+    // 동일 형식 (CRC32 + HEAD + MID + TAIL). 양쪽 같으면 preprocessing 일치,
+    // 다르면 보간 알고리즘 (Cubic vs BILINEAR) 차이가 단독 원인.
+    // INPUT_SIZE = 320 * 320 * 3 = 307200 bytes (24bpp RGB)
+    // ========================================================================
+    dump_buffer("INPUT-DUMP", "normalized_input_image_tensor",
+                (const void*)allocOut.InputUserVA, INPUT_SIZE);
+
+    // output/scratch 를 sentinel 로 채움 — chip 이 실제로 덮은 byte 와 안 덮은 byte 구분.
+    // 0xCC/0xAA 는 chip outfeed 결과로 자연스럽게 나오기 어려운 값. 잔존 시 "chip 안 씀" 신호.
+    memset(pOutputBuf, 0xCC, OUTPUT_SIZE);
+    if (pScratchBuf) memset(pScratchBuf, 0xAA, SCRATCH_SIZE);
 
     // -------------------------------------------------------------------------
     // infer new
@@ -333,89 +607,87 @@ int main(int argc, char** argv)
             std::cout << "[main] INFER failed: " << GetLastError()
                 << " -- output dump still printed below for debugging" << std::endl;
         }
+
+        PUCHAR p = (PUCHAR)pOutputBuf + 0x2000;
+        size_t same_count = 0, n_anchor = 8136 / 4;  // 2034
+        for (size_t i = 0; i < n_anchor; i++) {
+            if (p[i * 4] == 0xff && p[i * 4 + 1] == 0x00 && p[i * 4 + 2] == 0x80 && p[i * 4 + 3] == 0x80) same_count++;
+        }
+        printf("[uniform] convert_scores: %zu / %zu anchors match 'ff 00 80 80'\n",
+            same_count, n_anchor);
+
+        // === diff-anchor: ff 00 80 80 와 다른 anchor 의 byte 패턴 보기 ===
+        {
+            size_t shown = 0;
+            for (size_t i = 0; i < n_anchor && shown < 20; i++) {
+                if (!(p[i*4]==0xff && p[i*4+1]==0x00 && p[i*4+2]==0x80 && p[i*4+3]==0x80)) {
+                    printf("[diff-anchor] idx=%zu : %02x %02x %02x %02x\n",
+                           i, p[i*4], p[i*4+1], p[i*4+2], p[i*4+3]);
+                    shown++;
+                }
+            }
+            if (shown == 0) {
+                printf("[diff-anchor] (none — all 2034 anchors are 'ff 00 80 80')\n");
+            }
+        }
     }
 
+
+
+
+
     // -------------------------------------------------------------------------
-    // outfeed inspect
-    //   1) raw bytes (단순 chip outfeed 동작 확인용, add_int8 등에도 유용)
-    //   2) per-layer dump (output 이 multi-layer 인 경우 각 layer 의 첫 float 들)
-    //   3) SSD MobileNet detection 파싱 (layer 4개 [boxes/classes/scores/num] 가정)
+    // outfeed inspect — chip 이 OUTPUT 영역에 실제로 무엇을 썼는지 byte 단위 진단.
+    //   1) coverage  : sentinel(0xCC) 잔존 byte 카운트 + 영역별 written/untouched
+    //   2) per-layer : 각 output_layer 의 head/tail hex dump.
+    //                  Python pycoral 의 [OUT-DUMP] (raw TPU tensor) 와 byte 단위
+    //                  비교 가능한 포맷. (chip 출력은 quant uint8/int8 — float 해석 X)
     // -------------------------------------------------------------------------
     {
         PUCHAR output = (PUCHAR)pOutputBuf;
 
-        // (1) raw byte summary
-        size_t dumpN = std::min<size_t>(OUTPUT_SIZE, (size_t)16);
-        size_t nonZero = 0;
-        for (size_t i = 0; i < OUTPUT_SIZE; i++) if (output[i] != 0) nonZero++;
+        // (1) coverage summary
+        size_t still_cc = 0, nonZero = 0;
+        for (size_t i = 0; i < OUTPUT_SIZE; i++) {
+            if (output[i] == 0xCC) still_cc++;
+            if (output[i] != 0)    nonZero++;
+        }
         std::cout << "[outfeed] OUTPUT_SIZE=" << OUTPUT_SIZE
+                  << "  written~=" << (OUTPUT_SIZE - still_cc)
+                  << "  still-0xCC=" << still_cc
                   << "  non-zero=" << nonZero << std::endl;
-        std::cout << "[outfeed] first " << dumpN << " bytes:";
-        std::cout << std::hex << std::setfill('0');
-        for (size_t i = 0; i < dumpN; i++)
-            std::cout << " " << std::setw(2) << (int)output[i];
-        std::cout << std::dec << std::setfill(' ') << std::endl;
 
-        // (2) per-layer dump — host buffer 에서 각 layer 는 PageAlignUp(prev) offset 부터 시작.
-        // PatchVAs 의 Description_BASE_ADDRESS_OUTPUT_ACTIVATION 분기와 동일한 layout.
-        std::cout << "\n[outfeed] per-layer dump (assume float32):" << std::endl;
+        // (2) per-layer head + tail dump (Python pycoral [OUT-DUMP] 와 직접 비교)
         size_t off = 0;
         for (size_t li = 0; li < model.output_layers.size(); li++) {
             const auto& layer = model.output_layers[li];
-            const float* fp = (const float*)(output + off);
-            size_t nFloats = layer.size_bytes / sizeof(float);
-            size_t showN = std::min<size_t>(nFloats, (size_t)8);
-            std::cout << "  layer[" << li << "] '" << layer.name
-                      << "' off=0x" << std::hex << off << std::dec
-                      << " size=" << layer.size_bytes
-                      << " floats[0.." << showN << "):";
-            for (size_t i = 0; i < showN; i++)
-                std::cout << " " << fp[i];
-            std::cout << std::endl;
-            off += apex_fb::PageAlignUp(layer.size_bytes);
-        }
+            size_t aligned = apex_fb::PageAlignUp(layer.size_bytes);
 
-        // (3) SSD MobileNet face detection 파싱
-        // postprocess 가 fused 된 모델은 output 4개:
-        //   layer[0] = detection_boxes   [K,4]  (ymin, xmin, ymax, xmax) 정규화 [0,1]
-        //   layer[1] = detection_classes [K]
-        //   layer[2] = detection_scores  [K]
-        //   layer[3] = num_detections    [1]
-        if (model.output_layers.size() >= 4) {
-            size_t off0 = 0;
-            size_t off1 = off0 + apex_fb::PageAlignUp(model.output_layers[0].size_bytes);
-            size_t off2 = off1 + apex_fb::PageAlignUp(model.output_layers[1].size_bytes);
-            size_t off3 = off2 + apex_fb::PageAlignUp(model.output_layers[2].size_bytes);
+            // 영역별 sentinel 잔존 카운트 (chip 이 이 layer 까지 outfeed 했는지)
+            size_t layer_cc = 0;
+            for (size_t i = 0; i < aligned && off + i < OUTPUT_SIZE; i++)
+                if (output[off + i] == 0xCC) layer_cc++;
 
-            const float* boxes   = (const float*)(output + off0);
-            const float* classes = (const float*)(output + off1);
-            const float* scores  = (const float*)(output + off2);
-            const float* numF    = (const float*)(output + off3);
+            std::cout << "\n[outfeed] layer[" << li << "] '" << layer.name
+                      << "' off=0x" << std::hex << off
+                      << " logical=" << std::dec << layer.size_bytes
+                      << " aligned=0x" << std::hex << aligned << std::dec
+                      << " still-0xCC=" << layer_cc << "/" << aligned << std::endl;
 
-            int numDet = (int)numF[0];
-            int K      = (int)(model.output_layers[2].size_bytes / sizeof(float));
-            UINT imgSide = static_cast<UINT>(std::sqrt(static_cast<double>(INPUT_SIZE) / 3.0));
+            // head: 첫 256 byte (Python OUT-DUMP 와 동일 양)
+            size_t headN = (std::min<size_t>)(layer.size_bytes, (size_t)256);
+            DumpHex("  head", output, off, headN);
 
-            std::cout << "\n[SSD] num_detections=" << numDet << " (K=" << K << ")" << std::endl;
-            const float kThresh = 0.3f;
-            int kept = 0;
-            for (int i = 0; i < numDet && i < K; i++) {
-                float score = scores[i];
-                if (score < kThresh) continue;
-                float ymin = boxes[i*4 + 0];
-                float xmin = boxes[i*4 + 1];
-                float ymax = boxes[i*4 + 2];
-                float xmax = boxes[i*4 + 3];
-                int px1 = (int)(xmin * imgSide), py1 = (int)(ymin * imgSide);
-                int px2 = (int)(xmax * imgSide), py2 = (int)(ymax * imgSide);
-                std::cout << "  face[" << i << "] cls=" << (int)classes[i]
-                          << " score=" << std::fixed << std::setprecision(3) << score
-                          << " bbox(norm)=[" << ymin << "," << xmin << "," << ymax << "," << xmax << "]"
-                          << " bbox(px)=[" << px1 << "," << py1 << "," << px2 << "," << py2 << "]"
-                          << std::defaultfloat << std::endl;
-                kept++;
+            // tail: 마지막 64 byte — chip 이 layer 끝까지 outfeed 했는지 확인용
+            if (layer.size_bytes > 256) {
+                size_t tailOff = off + layer.size_bytes - 64;
+                DumpHex("  tail", output, tailOff, 64);
             }
-            std::cout << "[SSD] kept=" << kept << " (threshold=" << kThresh << ")" << std::endl;
+
+            // 전체 byte 를 txt 파일로 저장 — pycoral OUT-DUMP 와 diff 용
+            //SaveLayerToFile(layer.name + ".txt", output, off, layer.size_bytes);
+
+            off += aligned;
         }
     }
 
