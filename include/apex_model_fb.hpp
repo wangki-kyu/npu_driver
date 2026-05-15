@@ -671,6 +671,42 @@ inline void DumpParamPatchedVAs(const ApexModelFb& model) {
               << " bytes, parameters: " << model.parameters.size() << " bytes" << std::endl;
 }
 
+// libedgetpu 의 [PATCH-DUMP] 와 byte-by-byte 비교 가능한 한 줄 형식.
+// 각 patch site 의 desc/position/name/byte-offset/32-bit value 를 dump.
+// chip-visible (slot 의 memcpy 후) bitstream 을 source 로 사용해야 함.
+// libedgetpu 의 매칭 출력은 instruction_buffers.cc::LinkInstructionBuffers 에서.
+inline void DumpPatchValuesForDiff(const char* exe_tag,
+                                   const void* chip_visible,
+                                   const std::vector<FieldPatch>& patches) {
+    using namespace platforms::darwinn;
+    const uint8_t* p = (const uint8_t*)chip_visible;
+    for (size_t pi = 0; pi < patches.size(); pi++) {
+        const auto& fp = patches[pi];
+        uint32_t shift = (uint32_t)(fp.offset_bit % 8);
+        size_t   off   = (size_t)(fp.offset_bit / 8);
+        uint64_t raw = 0;
+        std::memcpy(&raw, p + off, 8);
+        uint32_t val = (uint32_t)((raw >> shift) & 0xFFFFFFFFu);
+
+        const char* desc_name =
+            (fp.desc == Description_BASE_ADDRESS_INPUT_ACTIVATION)  ? "INPUT"   :
+            (fp.desc == Description_BASE_ADDRESS_OUTPUT_ACTIVATION) ? "OUTPUT"  :
+            (fp.desc == Description_BASE_ADDRESS_PARAMETER)         ? "PARAM"   :
+            (fp.desc == Description_BASE_ADDRESS_SCRATCH)           ? "SCRATCH" : "?";
+        const char* pos_name =
+            (fp.position == Position_LOWER_32BIT) ? "LO32" :
+            (fp.position == Position_UPPER_32BIT) ? "HI32" : "?";
+
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+            "[PATCH-DUMP] user exe=%s patch[%02zu] desc=%s.%s name='%s' "
+            "off_byte=0x%04zx value=0x%08x",
+            exe_tag, pi, desc_name, pos_name,
+            fp.name.c_str(), off, val);
+        std::cout << buf << std::endl;
+    }
+}
+
 // chip-visible memory(driver-allocated contiguous slot)에 patch된 bitstream이 제대로 들어갔는지 확인.
 // 첫 nBytes 헥스 덤프 + 각 patch 위치의 32-bit 값을 함께 출력.
 inline void DumpChipVisibleBitstream(const char* tag,

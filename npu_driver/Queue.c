@@ -5,10 +5,44 @@
 
 #ifdef ALLOC_PRAGMA
 // IOCTL 핸들러는 spinlock을 잡거나 (PageTableLock) MMIO와 즉결 처리가 필요하므로
-// NONPAGED로 둔다. PAGED 로 두면 lock 안에서의 DbgPrint 등 정적 데이터 접근이 
-// DISPATCH_LEVEL 에서 page fault -> D3 BSOD 를 일으킨다. 
+// NONPAGED로 둔다. PAGED 로 두면 lock 안에서의 DbgPrint 등 정적 데이터 접근이
+// DISPATCH_LEVEL 에서 page fault -> D3 BSOD 를 일으킨다.
 //#pragma alloc_text(PAGE, npudriverEvtIoDeviceControl)
 #endif
+
+// === BAR2 CSR region dump helper ============================================
+// Mirrors libedgetpu's mmio_driver.cc dump_csrs format ([CSR@<tag>] off=... val=...)
+// for byte-by-byte diff against logs\edgetpu_*.log files.  Dumps the 4 core
+// MMIO regions used in libedgetpu's diagnostic snapshot.
+static VOID ApexDumpCsrRegions(PDEVICE_CONTEXT pDc, const char* tag) {
+    PVOID bar2 = pDc->Bar2BaseAddress;
+    static const struct {
+        UINT64 off;
+        UINT64 size;
+        const char* name;
+    } kRegions[] = {
+        { 0x40000, 0x0400,         "scalar_core"        },
+        { 0x44000, 0x0400,         "data_feed_control"  },
+        { 0x46000, 0x0100,         "hib_kernel"         },
+        { 0x48000, 0x0800,         "hib_user"           },
+    };
+    ULONG r, regionCount = sizeof(kRegions) / sizeof(kRegions[0]);
+
+    DbgPrint("[CSR-BEGIN@%s]\n", tag);
+    for (r = 0; r < regionCount; r++) {
+        UINT64 off = kRegions[r].off;
+        UINT64 size = kRegions[r].size;
+        UINT64 o;
+        DbgPrint("[CSR@%s] --- region %s 0x%05llx..0x%05llx ---\n",
+            tag, kRegions[r].name, off, off + size - 1);
+        for (o = 0; o < size; o += 8) {
+            UINT64 abs = off + o;
+            UINT64 val = apex_read_register(bar2, abs);
+            DbgPrint("[CSR@%s] off=0x%05llx val=0x%016llx\n", tag, abs, val);
+        }
+    }
+    DbgPrint("[CSR-END@%s]\n", tag);
+}
 
 VOID arm_tile_and_engiend(void* bar2, PDEVICE_CONTEXT pDc) {
 	apex_write_register(bar2, APEX_REG_TILE_CONFIG0, 0x7F);
@@ -400,10 +434,9 @@ VOID npudriverEvtIoDeviceControl(
 				apex_read_register(bar2, 0x486f8));
 
 			// === Phase-1 진단 #2: PTE coverage 검증 ===
-			// 6.14MB exe1 param 영역 (VA_EXE1_PARAM_DATA = 0x200000) 의 모든 PTE 가
-			// valid 한지, 그리고 chip 이 보는 PA 가 host 가 박은 slot 의 PA 와 일치하는지.
-			//
-			// 모든 IOSlot 의 PTE 범위를 일괄 검사한다.
+			// 모든 IOSlot 의 PTE 가 valid 한지 검사. simple VA 는 chip PTE 직접 읽고,
+			// extended VA 는 chip PTE[6144+L1_idx] (= L2 subtable PA) 가 유효한지
+			// + host 의 L2 entry (page PA) 가 유효한지 둘 다 확인.
 			{
 				ULONG slotIdx;
 				for (slotIdx = 0; slotIdx < IO_SLOT_COUNT; slotIdx++) {
@@ -411,63 +444,167 @@ VOID npudriverEvtIoDeviceControl(
 					if (slot->Kva == NULL || slot->Size == 0) continue;
 					UINT64 va = slot->DeviceVa;
 					SIZE_T sz = slot->Size;
-					ULONG pageStart = (ULONG)(va >> 12);
 					ULONG pageCount = (ULONG)((sz + 0xFFF) >> 12);
-					ULONG invalid = 0;
-					UINT64 firstInvalidPte = 0;
-					ULONG firstInvalidIdx = 0;
-					ULONG pageIdx;
-					for (pageIdx = 0; pageIdx < pageCount; pageIdx++) {
-						UINT64 pte = apex_read_register(bar2,
-							APEX_REG_PAGE_TABLE + (pageStart + pageIdx) * 8);
-						if ((pte & 1) == 0) {
-							if (invalid == 0) {
-								firstInvalidPte = pte;
-								firstInvalidIdx = pageStart + pageIdx;
+					BOOLEAN isExt = (va & (1ULL << 63)) != 0;
+
+					if (!isExt) {
+						ULONG pageStart = (ULONG)(va >> 12);
+						ULONG invalid = 0;
+						UINT64 firstInvalidPte = 0;
+						ULONG firstInvalidIdx = 0;
+						ULONG pageIdx;
+						for (pageIdx = 0; pageIdx < pageCount; pageIdx++) {
+							UINT64 pte = apex_read_register(bar2,
+								APEX_REG_PAGE_TABLE + (pageStart + pageIdx) * 8);
+							if ((pte & 1) == 0) {
+								if (invalid == 0) {
+									firstInvalidPte = pte;
+									firstInvalidIdx = pageStart + pageIdx;
+								}
+								invalid++;
 							}
-							invalid++;
+						}
+						DbgPrint("[PTE-CHECK] slot[%u] SIMPLE VA=0x%llx size=0x%llx "
+							"PTE[%u..%u] (%u pages)  invalid=%u/%u%s\n",
+							slotIdx, va, (UINT64)sz,
+							pageStart, pageStart + pageCount - 1, pageCount,
+							invalid, pageCount,
+							(invalid > 0) ? "  *** !!! ***" : "");
+						if (invalid > 0) {
+							DbgPrint("[PTE-CHECK]   first invalid: PTE[%u] = 0x%llx\n",
+								firstInvalidIdx, firstInvalidPte);
 						}
 					}
-					DbgPrint("[PTE-CHECK] slot[%u] VA=0x%llx size=0x%llx "
-						"PTE[%u..%u] (%u pages)  invalid=%u/%u%s\n",
-						slotIdx, va, (UINT64)sz,
-						pageStart, pageStart + pageCount - 1, pageCount,
-						invalid, pageCount,
-						(invalid > 0) ? "  *** !!! ***" : "");
-					if (invalid > 0) {
-						DbgPrint("[PTE-CHECK]   first invalid: PTE[%u] = 0x%llx\n",
-							firstInvalidIdx, firstInvalidPte);
+					else {
+						// Extended VA: walk 2-level PT.
+						ULONG invalid = 0;
+						ULONG pageIdx;
+						if (pDc->ExtPoolKva == NULL) {
+							DbgPrint("[PTE-CHECK] slot[%u] EXT VA=0x%llx ExtPool not init — skipped\n",
+								slotIdx, va);
+							continue;
+						}
+						for (pageIdx = 0; pageIdx < pageCount; pageIdx++) {
+							UINT64 curVa  = va + ((UINT64)pageIdx << PAGE_SHIFT);
+							UINT32 l1Idx  = (UINT32)((curVa >> 21) & 0x1FFF);
+							UINT32 l2Idx  = (UINT32)((curVa >> 12) & 0x1FF);
+							UINT64* l2Tab = (UINT64*)((PUCHAR)pDc->ExtPoolKva +
+								((SIZE_T)l1Idx << PAGE_SHIFT));
+							UINT64 entry  = l2Tab[l2Idx];
+							if ((entry & 1) == 0) invalid++;
+						}
+						// L1 entry 확인 — head/tail 만.
+						{
+							UINT32 l1Head = (UINT32)((va >> 21) & 0x1FFF);
+							UINT64 endVa  = va + ((UINT64)pageCount << PAGE_SHIFT) - 1;
+							UINT32 l1Tail = (UINT32)((endVa >> 21) & 0x1FFF);
+							UINT64 l1RegH = apex_read_register(bar2,
+								APEX_REG_PAGE_TABLE + ((6144u + l1Head) * 8));
+							UINT64 l1RegT = apex_read_register(bar2,
+								APEX_REG_PAGE_TABLE + ((6144u + l1Tail) * 8));
+							DbgPrint("[PTE-CHECK] slot[%u] EXT VA=0x%llx size=0x%llx "
+								"L1[%u..%u] head=0x%llx tail=0x%llx  L2-invalid=%u/%u%s\n",
+								slotIdx, va, (UINT64)sz, l1Head, l1Tail,
+								l1RegH, l1RegT, invalid, pageCount,
+								(invalid > 0) ? "  *** !!! ***" : "");
+						}
 					}
 				}
 			}
 
-			// VA_EXE1_PARAM_DATA = 0x200000 부근 PTE 의 PA 가 실제 slot KVA 의 PA 와
+			// VA_EXE1_PARAM_DATA / VA_EXE0_PARAM_DATA 부근 PTE 의 PA 가 실제 slot KVA 의 PA 와
 			// 일치하는지 spot check (head / mid / tail 3 지점).
+			//
+			// 두 slot 다 확인:
+			//   - IO_SLOT_PARAM_DATA   (6.14MB, VA=0x200000, exe1 caching 용)
+			//   - IO_SLOT_EXE0_PARAM   (192KB,  VA=0xA00000, exe0 inference 용)
+			// ADD 모델은 exe0_parameters 가 없어서 정상 동작했고 SSD 만 깨지는
+			// 증상으로 좁혀졌으므로, exe0 param slot 의 PTE 매핑 무결성이 핵심.
 			{
-				ALLOC_IO_SLOT* pSlot = &pDc->IOSlots[IO_SLOT_PARAM_DATA];
-				if (pSlot->Kva != NULL && pSlot->Size >= 0x1000) {
-					ULONG pageStart = (ULONG)(pSlot->DeviceVa >> 12);
+				static const struct {
+					IO_SLOT_INDEX idx;
+					const char*   tag;
+				} kParamSlots[] = {
+					{ IO_SLOT_PARAM_DATA, "PARAM(exe1)" },
+					{ IO_SLOT_EXE0_PARAM, "PARAM(exe0)" },
+				};
+				ULONG slotK;
+				for (slotK = 0; slotK < sizeof(kParamSlots) / sizeof(kParamSlots[0]); slotK++) {
+					ALLOC_IO_SLOT* pSlot = &pDc->IOSlots[kParamSlots[slotK].idx];
+					const char*    tag   = kParamSlots[slotK].tag;
+					if (pSlot->Kva == NULL || pSlot->Size < 0x1000) {
+						DbgPrint("[PTE-PA-CHECK] %s slot empty or too small "
+							"(Kva=%p Size=0x%llx) — skipped\n",
+							tag, pSlot->Kva, (UINT64)pSlot->Size);
+						continue;
+					}
 					ULONG pageCount = (ULONG)((pSlot->Size + 0xFFF) >> 12);
+					BOOLEAN isExt = (pSlot->DeviceVa & (1ULL << 63)) != 0;
 					ULONG checkIdx[3] = {
 						0,
 						pageCount / 2,
 						(pageCount > 0) ? (pageCount - 1) : 0
 					};
 					const char* label[3] = { "HEAD", "MID", "TAIL" };
-					ULONG checkK;
-					for (checkK = 0; checkK < 3; checkK++) {
-						ULONG pageIdx = checkIdx[checkK];
-						UINT64 pte = apex_read_register(bar2,
-							APEX_REG_PAGE_TABLE + (pageStart + pageIdx) * 8);
-						UINT64 chipPa = pte & ~0xFFFULL; // strip flags (PFN 인코딩 시 다를 수 있음)
-						PHYSICAL_ADDRESS hostPa =
-							MmGetPhysicalAddress((PUCHAR)pSlot->Kva + pageIdx * 0x1000);
-						BOOLEAN match = (chipPa == (UINT64)hostPa.QuadPart);
-						DbgPrint("[PTE-PA-CHECK] PARAM slot %s page[%u] (PTE[%u]): "
-							"chipPA=0x%llx hostPA=0x%llx %s\n",
-							label[checkK], pageIdx, pageStart + pageIdx,
-							chipPa, (UINT64)hostPa.QuadPart,
-							match ? "MATCH" : "MISMATCH!!!");
+
+					if (!isExt) {
+						ULONG pageStart = (ULONG)(pSlot->DeviceVa >> 12);
+						DbgPrint("[PTE-PA-CHECK] %s SIMPLE slot VA=0x%llx size=0x%llx "
+							"PTE[%u..%u] (%u pages)\n",
+							tag, pSlot->DeviceVa, (UINT64)pSlot->Size,
+							pageStart, pageStart + pageCount - 1, pageCount);
+						ULONG checkK;
+						for (checkK = 0; checkK < 3; checkK++) {
+							ULONG pageIdx = checkIdx[checkK];
+							UINT64 pte = apex_read_register(bar2,
+								APEX_REG_PAGE_TABLE + (pageStart + pageIdx) * 8);
+							UINT64 chipPa = pte & ~0xFFFULL;
+							PHYSICAL_ADDRESS hostPa =
+								MmGetPhysicalAddress((PUCHAR)pSlot->Kva + pageIdx * 0x1000);
+							BOOLEAN match = (chipPa == (UINT64)hostPa.QuadPart);
+							DbgPrint("[PTE-PA-CHECK] %s %s page[%u] (PTE[%u]): "
+								"chipPA=0x%llx hostPA=0x%llx %s\n",
+								tag, label[checkK], pageIdx, pageStart + pageIdx,
+								chipPa, (UINT64)hostPa.QuadPart,
+								match ? "MATCH" : "MISMATCH!!!");
+						}
+					}
+					else {
+						// Extended: chip PTE[6144+L1_idx] = L2-subtable PA (host RAM).
+						// L2-subtable[L2_idx] = page PA.  Verify both layers.
+						if (pDc->ExtPoolKva == NULL) {
+							DbgPrint("[PTE-PA-CHECK] %s EXT VA=0x%llx ExtPool not init — skipped\n",
+								tag, pSlot->DeviceVa);
+							continue;
+						}
+						DbgPrint("[PTE-PA-CHECK] %s EXT slot VA=0x%llx size=0x%llx (%u pages)\n",
+							tag, pSlot->DeviceVa, (UINT64)pSlot->Size, pageCount);
+						ULONG checkK;
+						for (checkK = 0; checkK < 3; checkK++) {
+							ULONG pageIdx = checkIdx[checkK];
+							UINT64 curVa  = pSlot->DeviceVa + ((UINT64)pageIdx << PAGE_SHIFT);
+							UINT32 l1Idx  = (UINT32)((curVa >> 21) & 0x1FFF);
+							UINT32 l2Idx  = (UINT32)((curVa >> 12) & 0x1FF);
+							UINT64 chipL1 = apex_read_register(bar2,
+								APEX_REG_PAGE_TABLE + ((6144u + l1Idx) * 8));
+							UINT64 l1Pa   = chipL1 & ~0xFFFULL;
+							UINT64 expectedL1Pa = pDc->ExtPoolPa +
+								((UINT64)l1Idx << PAGE_SHIFT);
+							UINT64* l2Tab = (UINT64*)((PUCHAR)pDc->ExtPoolKva +
+								((SIZE_T)l1Idx << PAGE_SHIFT));
+							UINT64 l2Entry = l2Tab[l2Idx];
+							UINT64 chipPa  = l2Entry & ~0xFFFULL;
+							PHYSICAL_ADDRESS hostPa =
+								MmGetPhysicalAddress((PUCHAR)pSlot->Kva + pageIdx * 0x1000);
+							BOOLEAN l1Match = (l1Pa == expectedL1Pa);
+							BOOLEAN dataMatch = (chipPa == (UINT64)hostPa.QuadPart);
+							DbgPrint("[PTE-PA-CHECK] %s %s page[%u] L1[%u]=0x%llx (exp 0x%llx %s) "
+								"L2[%u]=0x%llx -> chipPA=0x%llx hostPA=0x%llx %s\n",
+								tag, label[checkK], pageIdx, l1Idx, chipL1, expectedL1Pa,
+								l1Match ? "OK" : "MISMATCH",
+								l2Idx, l2Entry, chipPa, (UINT64)hostPa.QuadPart,
+								dataMatch ? "MATCH" : "MISMATCH!!!");
+						}
 					}
 				}
 			}
@@ -483,6 +620,7 @@ VOID npudriverEvtIoDeviceControl(
 
 			ALLOC_IO_SLOT* exe1Slot = &pDc->IOSlots[IO_SLOT_EXE1_BS];
 			if (exe1Slot->Kva != NULL && exe1Slot->Size > 0) {
+				//ApexDumpCsrRegions(pDc, "BeforeSubmit");
 				UINT32 slot1 = pDc->DescRingTail % 256;
 				ring[slot1].address = exe1Slot->DeviceVa;
 				ring[slot1].size_in_bytes = (UINT32)exe1Slot->ActualSize;
@@ -511,116 +649,64 @@ VOID npudriverEvtIoDeviceControl(
 					break;
 				}
 
-				// ============================================================
-				// [EXE1-DONE] Phase 1 #3: exe1 가 *진짜로* 완료됐는지 확인
-				// IRQ 가 떨어진 시점에:
-				//   1) InstructionQueue 의 tail 과 completed_head 가 일치하는가
-				//   2) PARAMETER_POP / AVDATA_POP / OUTFEED 등 모든 엔진이
-				//      kHalted (status=0) 상태인가
-				//   3) SC_HOST_INT_COUNT 가 우리 기대대로 증가했는가
-				// 만약 (1) 이 INCOMPLETE 면 → IRQ 가 일찍 fire,
-				// 본인 코드가 exe1 완전 종료 전에 exe0 시작 → 부분적 weight
-				// load → score_head 가 0 weights 로 컨볼루션 → 균일 출력.
-				// ============================================================
-				{
-					UINT64 iq_tail      = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_TAIL);
-					UINT64 iq_fetched   = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
-					UINT64 iq_completed = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-					UINT32 sc_stat      = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
-					UINT32 pp_stat      = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-					UINT32 av_stat      = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
-					UINT32 in_stat      = apex_read_register_32(bar2, APEX_REG_INFEED_RUN_STATUS);
-					UINT32 out_stat     = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
-					UINT32 to_stat      = apex_read_register_32(bar2, APEX_REG_TILE_OP_RUN_STATUS);
-					UINT64 sc_cnt       = apex_read_register(bar2, APEX_REG_SC_HOST_INT_COUNT);
-					UINT64 hib_first    = apex_read_register(bar2, APEX_REG_USER_HIB_FIRST_ERROR);
-					UINT64 pf_addr      = apex_read_register(bar2, 0x48738);
-					UINT64 infeed_pf    = apex_read_register(bar2, APEX_REG_INFEED_PAGE_FAULT_ADDR);
+				//ApexDumpCsrRegions(pDc, "AfterIssueDmas");
 
-					BOOLEAN drained =
-						(iq_completed == iq_tail) && (iq_fetched == iq_tail);
-					BOOLEAN halted  =
-						(sc_stat == 0 && pp_stat == 0 && av_stat == 0 &&
-						 in_stat == 0 && out_stat == 0 && to_stat == 0);
+				// === [SENTINEL] exe1 캐싱 후 host PARAM 영역 wipe ===
+				// 가설 검증: 칩이 PARAMETER_CACHING 으로 weight 를 자기 SRAM 으로 copy 했다면,
+				// 여기서 host param 을 망가뜨려도 exe0 결과는 동일해야 함.
+				// 반대로 칩이 매 inference 마다 host param 을 다시 read 한다면 output 깨짐.
+				//{
+				//	ALLOC_IO_SLOT* paramSlot = &pDc->IOSlots[IO_SLOT_PARAM_DATA];
+				//	if (paramSlot->Kva != NULL && paramSlot->Size > 0) {
+				//		PUCHAR p = (PUCHAR)paramSlot->Kva;
+				//		DbgPrint("[SENTINEL] exe1 param BEFORE wipe (first 16B): "
+				//			"%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				//			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+				//			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
 
-					DbgPrint("[EXE1-DONE] IQ tail=%llu fetched=%llu completed=%llu  %s\n",
-						iq_tail, iq_fetched, iq_completed,
-						drained ? "DRAINED" : "*** INCOMPLETE ***");
-					DbgPrint("[EXE1-DONE] engines: SC=%u PP=%u AV=%u IN=%u OUT=%u TO=%u  %s\n",
-						sc_stat, pp_stat, av_stat, in_stat, out_stat, to_stat,
-						halted ? "ALL_HALTED" : "*** STILL_RUNNING ***");
-					DbgPrint("[EXE1-DONE] SC_HOST_INT_COUNT=0x%llx (pre=0x%llx, delta=%lld)\n",
-						sc_cnt, pDc->LastScHostIntCount,
-						(LONGLONG)(sc_cnt - pDc->LastScHostIntCount));
-					DbgPrint("[EXE1-DONE] HIB_FIRST_ERR=0x%llx page_fault_addr=0x%llx infeed_pf=0x%llx\n",
-						hib_first, pf_addr, infeed_pf);
+				//		// 0xCC pattern (OUTFEED sentinel 과 동일) — 0x00 보다 눈에 잘 띔
+				//		//RtlFillMemory(paramSlot->Kva, paramSlot->Size, 0xCC);
 
-					// 안 끝났으면 100ms 추가 폴링 — IRQ 가 일찍 fire 한 거라면
-					// 곧 catch-up 할 거고, 그 catch-up 시간이 "얼마나 일찍" 의 척도.
-					if (!drained) {
-						DbgPrint("[EXE1-DONE] queue not drained at IRQ time — polling 100ms for catch-up\n");
-						int extra_ms;
-						for (extra_ms = 0; extra_ms < 100; extra_ms++) {
-							LARGE_INTEGER d; d.QuadPart = -10000LL;  // 1ms
-							KeDelayExecutionThread(KernelMode, FALSE, &d);
-							iq_completed = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_COMPLETED_HEAD);
-							iq_fetched   = apex_read_register(bar2, APEX_REG_INSTR_QUEUE_FETCHED_HEAD);
-							if (iq_completed == iq_tail && iq_fetched == iq_tail) {
-								DbgPrint("[EXE1-DONE] queue caught up after +%d ms — IRQ was %d ms early!\n",
-									extra_ms + 1, extra_ms + 1);
-								break;
-							}
-						}
-						if (iq_completed != iq_tail || iq_fetched != iq_tail) {
-							DbgPrint("[EXE1-DONE] queue STILL not drained after +100ms: "
-								"tail=%llu fetched=%llu completed=%llu  *** HANG / WEDGED ***\n",
-								iq_tail, iq_fetched, iq_completed);
-						}
-					}
+				//		DbgPrint("[SENTINEL] exe1 param AFTER wipe (first 16B): "
+				//			"%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				//			p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+				//			p[8], p[9], p[10], p[11], p[12], p[13], p[14], p[15]);
+				//		DbgPrint("[SENTINEL] exe1 param wiped: %llu bytes filled with 0xCC at KVA=%p\n",
+				//			(UINT64)paramSlot->Size, paramSlot->Kva);
+				//	}
+				//}
 
-					// 엔진이 아직 running 이면 50ms 추가 폴링
-					if (!halted) {
-						DbgPrint("[EXE1-DONE] engines not halted at IRQ time — polling 50ms\n");
-						int extra_ms;
-						UINT32 final_pp = pp_stat, final_av = av_stat;
-						for (extra_ms = 0; extra_ms < 50; extra_ms++) {
-							LARGE_INTEGER d; d.QuadPart = -10000LL;  // 1ms
-							KeDelayExecutionThread(KernelMode, FALSE, &d);
-							final_pp = apex_read_register_32(bar2, APEX_REG_PARAMETER_POP_RUN_STATUS);
-							final_av = apex_read_register_32(bar2, APEX_REG_AVDATA_POP_RUN_STATUS);
-							UINT32 final_sc  = apex_read_register_32(bar2, APEX_REG_SCALAR_RUN_STATUS);
-							UINT32 final_out = apex_read_register_32(bar2, APEX_REG_OUTFEED_RUN_STATUS);
-							if (final_pp == 0 && final_av == 0 && final_sc == 0 && final_out == 0) {
-								DbgPrint("[EXE1-DONE] engines all halted after +%d ms — IRQ was early\n",
-									extra_ms + 1);
-								break;
-							}
-						}
-						if (final_pp != 0 || final_av != 0) {
-							DbgPrint("[EXE1-DONE] PP/AV STILL running after +50ms: PP=%u AV=%u\n",
-								final_pp, final_av);
-						}
-					}
-				}
-				// ============================================================
+				//{
+				//	ALLOC_IO_SLOT* exe0ParamSlot = &pDc->IOSlots[IO_SLOT_EXE0_PARAM];
+				//	if (exe0ParamSlot->Kva != NULL && exe0ParamSlot->Size > 0) {
+				//		RtlFillMemory(exe0ParamSlot->Kva, exe0ParamSlot->Size, 0xDD);
+				//		DbgPrint("[SENTINEL] exe0 param wiped (%llu B with 0xDD)\n",
+				//			(UINT64)exe0ParamSlot->Size);
+				//	}
+				//}
 
-				// ★ exe1 끝났으니 다음 phase 위해 reset
-				KeClearEvent(&pDc->InferCompleteEvent);
-				pDc->IsrSeenPendingBits = 0;
+				// (계속) exe0 enqueue 코드가 여기 아래
 
-				// exe1 완료 직후, exe0 enqueue 전에 박을 진단:
-				DbgPrint("[POST-EXE1] page_table_size=0x%llx extended=0x%llx translation_en=0x%llx\n",
-					apex_read_register(bar2, APEX_REG_PAGE_TABLE_SIZE),
-					apex_read_register(bar2, APEX_REG_EXTENDED_TABLE),
-					apex_read_register(bar2, 0x46010));
+				
+			
 
-				// PTE[15] 직접 read (slot 0 input의 fault VA 위치)
-				DbgPrint("[POST-EXE1] PTE[15] = 0x%llx (should be PA|0x1)\n",
-					apex_read_register(bar2, APEX_REG_PAGE_TABLE + 15 * 8));   // 정확한 register 매크로 확인 필요
+				//// ★ exe1 끝났으니 다음 phase 위해 reset
+				//KeClearEvent(&pDc->InferCompleteEvent);
+				//pDc->IsrSeenPendingBits = 0;
 
-				// HIB_ERROR_MASK 도 확인 (어떤 에러를 활성화하는지 바뀌었는지)
-				DbgPrint("[POST-EXE1] hib_error_mask=0x%llx\n",
-					apex_read_register(bar2, 0x486f8));
+				//// exe1 완료 직후, exe0 enqueue 전에 박을 진단:
+				//DbgPrint("[POST-EXE1] page_table_size=0x%llx extended=0x%llx translation_en=0x%llx\n",
+				//	apex_read_register(bar2, APEX_REG_PAGE_TABLE_SIZE),
+				//	apex_read_register(bar2, APEX_REG_EXTENDED_TABLE),
+				//	apex_read_register(bar2, 0x46010));
+
+				//// PTE[15] 직접 read (slot 0 input의 fault VA 위치)
+				//DbgPrint("[POST-EXE1] PTE[15] = 0x%llx (should be PA|0x1)\n",
+				//	apex_read_register(bar2, APEX_REG_PAGE_TABLE + 15 * 8));   // 정확한 register 매크로 확인 필요
+
+				//// HIB_ERROR_MASK 도 확인 (어떤 에러를 활성화하는지 바뀌었는지)
+				//DbgPrint("[POST-EXE1] hib_error_mask=0x%llx\n",
+				//	apex_read_register(bar2, 0x486f8));
 
 				//arm_tile_and_engiend(bar2, pDc);
 
@@ -634,6 +720,24 @@ VOID npudriverEvtIoDeviceControl(
 				//	}
 				//}
 			}
+
+			/*{
+				ALLOC_IO_SLOT* exe0ParamSlot = &pDc->IOSlots[IO_SLOT_PARAM_DATA];
+				if (exe0ParamSlot->Kva != NULL && exe0ParamSlot->Size > 0) {
+					RtlFillMemory(exe0ParamSlot->Kva, exe0ParamSlot->Size, 0xDD);
+					DbgPrint("[SENTINEL] exe0 param wiped (%llu B with 0xDD)\n",
+						(UINT64)exe0ParamSlot->Size);
+				}
+			}
+
+			{
+				ALLOC_IO_SLOT* exe0ParamSlot = &pDc->IOSlots[IO_SLOT_EXE0_PARAM];
+				if (exe0ParamSlot->Kva != NULL && exe0ParamSlot->Size > 0) {
+					RtlFillMemory(exe0ParamSlot->Kva, exe0ParamSlot->Size, 0xDD);
+					DbgPrint("[SENTINEL] exe0 param wiped (%llu B with 0xDD)\n",
+						(UINT64)exe0ParamSlot->Size);
+				}
+			}*/
 
 			UINT32 slot0 = pDc->DescRingTail % 256;
 
@@ -803,8 +907,9 @@ VOID npudriverEvtIoDeviceControl(
 				base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
 		}
 
-		// 정상 - dpc 가 (allIdle && scHostSeen) 게이트 통과해서 깨운 경우 
+		// 정상 - dpc 가 (allIdle && scHostSeen) 게이트 통과해서 깨운 경우
 		DbgPrint("[INFER_NEW] inference complete via IRQ (ISR fires=%d)\n", pDc->IsrCallCount);
+		//ApexDumpCsrRegions(pDc, "AfterExecution");
 		break;
 	}
 	case IOCTL_INFER:
@@ -2350,9 +2455,10 @@ VOID npudriverEvtIoDeviceControl(
 		DbgPrint("[PARAM_CACHE] Done, status=0x%x\n", status);
 		break;
 	}
-	case IOCTL_ALLOC_IO_BUFFERS: 
+	case IOCTL_ALLOC_IO_BUFFERS:
 	{
 		DbgPrint("IOCTL_ALLOC_IO_BUFFERS Start!\n");
+		//ApexDumpCsrRegions(DeviceGetContext(device), "AfterOpen");
 		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
 		WDFMEMORY inMem, outMem;
 		IOCTL_ALLOC_IO_BUFFERS_IN* pIn = NULL;
@@ -2465,41 +2571,80 @@ VOID npudriverEvtIoDeviceControl(
 					goto alloc_io_fail;
 				}
 
-				UINT32 startPte = (UINT32)(baseDevVa >> PAGE_SHIFT);
-				if (startPte + pageCount > pDC->PageTableSize) {
-					WdfSpinLockRelease(pDC->PageTableLock);
-					DbgPrint("[ALLOC_IO] slot %d simple-VA out of range: PTE[%u..%u] > %u\n",
-						i, startPte, startPte + pageCount - 1, pDC->PageTableSize);
-					MmUnmapLockedPages(slot->UserVa, slot->Mdl);
-					IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-					MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
-					slot->UserVa = NULL;
-					status = STATUS_INVALID_PARAMETER;
-					goto alloc_io_fail;
-				}
-
-				WdfSpinLockAcquire(pDC->PageTableLock);
-
 				if (!isExtended) {
-					// -- simpe VA
-					
+					// -- simple VA: write each chip PTE register directly.
+					UINT32 startPte = (UINT32)(baseDevVa >> PAGE_SHIFT);
+					if (startPte + pageCount > pDC->PageTableSize) {
+						DbgPrint("[ALLOC_IO] slot %d simple-VA out of range: PTE[%u..%u] > %u\n",
+							i, startPte, startPte + pageCount - 1, pDC->PageTableSize);
+						MmUnmapLockedPages(slot->UserVa, slot->Mdl);
+						IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+						MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+						slot->UserVa = NULL;
+						status = STATUS_INVALID_PARAMETER;
+						goto alloc_io_fail;
+					}
+
+					WdfSpinLockAcquire(pDC->PageTableLock);
 					for (j = 0; j < pageCount; j++) {
-						UINT64 pagePa = basePa + ((UINT64)j << PAGE_SHIFT);	// 4096을 j 인덱스에 곱해서 basePa에 4096만큼 더해준다 
+						UINT64 pagePa = basePa + ((UINT64)j << PAGE_SHIFT);
 						apex_write_register(
 							pDC->Bar2BaseAddress,
 							APEX_REG_PAGE_TABLE + ((startPte + j) * 8),
 							pagePa | 0x1ULL
 						);
 					}
+					WdfSpinLockRelease(pDC->PageTableLock);
+					DbgPrint("[ALLOC_IO] slot %d simple PTE[%u..%u] = (PA 0x%llx + i*4K) | 1\n",
+						i, startPte, startPte + pageCount - 1, basePa);
 				}
 				else {
-					// not yet
+					// -- extended VA: write L2 PT entries directly into ExtPool.
+					//    L1 entries (chip PTE[6144..8191]) were pre-filled at
+					//    ApexPageTableInit pointing at the ExtPool sub-regions.
+					//    Slot buffer is contiguous so PFN[j] = (basePa>>12) + j.
+					//    Buffer may span multiple 2MB L1 regions (e.g. exe1
+					//    PARAM_DATA = 6.14MB ≈ 4 regions) — iterate page-by-page
+					//    and dispatch each into its own L1 sub-table.
+					if (pDC->ExtPoolKva == NULL) {
+						DbgPrint("[ALLOC_IO] slot %d EXT VA=0x%llx ExtPool not init\n",
+							i, baseDevVa);
+						MmUnmapLockedPages(slot->UserVa, slot->Mdl);
+						IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+						MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+						slot->UserVa = NULL;
+						status = STATUS_DEVICE_NOT_READY;
+						goto alloc_io_fail;
+					}
+
+					{
+						UINT32 firstL1 = (UINT32)((baseDevVa >> 21) & 0x1FFF);
+						UINT32 lastL1  = (UINT32)(((baseDevVa +
+							((UINT64)(pageCount - 1) << PAGE_SHIFT)) >> 21) & 0x1FFF);
+						if (lastL1 >= 2048u) {
+							DbgPrint("[ALLOC_IO] slot %d EXT VA=0x%llx spans L1[%u..%u] beyond pool (max 2047)\n",
+								i, baseDevVa, firstL1, lastL1);
+							MmUnmapLockedPages(slot->UserVa, slot->Mdl);
+							IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
+							MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+							slot->UserVa = NULL;
+							status = STATUS_INVALID_PARAMETER;
+							goto alloc_io_fail;
+						}
+
+						for (j = 0; j < pageCount; j++) {
+							UINT64 curVa  = baseDevVa + ((UINT64)j << PAGE_SHIFT);
+							UINT32 l1Idx  = (UINT32)((curVa >> 21) & 0x1FFF);
+							UINT32 l2Idx  = (UINT32)((curVa >> 12) & 0x1FF);
+							UINT64 pagePa = basePa + ((UINT64)j << PAGE_SHIFT);
+							UINT64* l2Tab = (UINT64*)((PUCHAR)pDC->ExtPoolKva +
+								((SIZE_T)l1Idx << PAGE_SHIFT));
+							l2Tab[l2Idx] = pagePa | 0x1ULL;
+						}
+						DbgPrint("[ALLOC_IO] slot %d EXT VA=0x%llx pages=%u basePA=0x%llx L1[%u..%u] populated\n",
+							i, baseDevVa, pageCount, basePa, firstL1, lastL1);
+					}
 				}
-
-				WdfSpinLockRelease(pDC->PageTableLock);
-
-				DbgPrint("[ALLOC_IO] slot %d simple PTE[%u..%u] = (PA 0x%llx + i*4K) | 1\n",
-					i, startPte, startPte + pageCount - 1, basePa);
 
 				slot->DeviceVa = baseDevVa;
 			}

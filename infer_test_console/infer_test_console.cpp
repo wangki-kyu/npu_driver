@@ -238,8 +238,15 @@ static void dump_param(const char* label, const void* data, size_t n) {
 static const uint64_t VA_INPUT = 0x001000ULL;  // PTE[1..75]      input           ★ 0 금지
 static const uint64_t VA_OUTPUT = 0x100000ULL;  // PTE[256..]     output          INPUT 너머
 static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch         OUTPUT 너머
-static const uint64_t VA_EXE1_PARAM_DATA = 0x200000ULL;  // PTE[512..2011] parameters  SCRATCH 너머
-static const uint64_t VA_EXE0_PARAM_DATA = 0xA00000ULL;  // 192kb exe0 보조 
+// PARAM VA — libedgetpu (driver/driver.cc:249 "Mapped params") 와 byte-identical
+// 매칭. 가설: 칩 내부 SRAM 캐싱이 VA bits hash 로 bank addressing 한다면 같은
+// 데이터라도 다른 VA 면 다른 bank 에 캐싱 → 모델이 expect 하는 위치와 mismatch.
+//   exe1 PARAM_DATA (6144000B, 1500 pages): libedgetpu = 0x8000000000000000
+//     → L1_idx=0..2 차지 (3개 region, L2 sub-table 시작이 ExtPool[0])
+//   exe0 PARAM      (197440B,    49 pages): libedgetpu = 0x8000000000800000
+//     → L1_idx=4 단일 region (exe1 과 충돌 없음)
+static const uint64_t VA_EXE1_PARAM_DATA = 0x8000000000000000ULL;  // ext L1_idx=0..3
+static const uint64_t VA_EXE0_PARAM_DATA = 0x8000000000800000ULL;  // ext L1_idx=4
 static const uint64_t VA_PARAM_BITSTREAM = 0x840000ULL;  // PTE[2112..2114] exe1 bitstream
 static const uint64_t VA_INFER_BITSTREAM = 0x900000ULL;  // PTE[2304..2352] exe0 bitstream
 static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern
@@ -247,6 +254,7 @@ static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pat
 
 int main(int argc, char** argv)
 {
+    printf("[BUILD] %s %s\n", __DATE__, __TIME__);
     // WIC 사용 위해 COM 초기화
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
@@ -375,6 +383,10 @@ int main(int argc, char** argv)
         memcpy(pParamData, model.parameters.data(), model.parameters.size());               // <-- exe1 param
         memcpy(pExe0ParamData, model.exe0_parameters.data(), model.exe0_parameters.size()); // <-- exezhem 0 param
 
+        // 이게 뭐하는건지 정확히 모르겠음. 
+        /*MemoryBarrier();
+        _mm_sfence();*/
+
         // memcpy 검증: src(model.parameters) 와 dst(UserVA → 결국 chip 이 DMA 로 읽을 PA) 가 같은지.
         // driver 쪽에서 같은 시점에 KVA 기준으로 dump 해서 3-way 비교하면 매핑 깨짐 즉시 보임.
         //
@@ -481,8 +493,8 @@ int main(int argc, char** argv)
         //memset((char*)pParamData + 2 * q, 0x00, q);   // 3rd quarter
         //memset((char*)pParamData + 3 * q, 0x00, q);   // 4th quarter (last)
 
-        size_t sz0 = model.exe0_parameters.size();   // 196KB
-        size_t q0 = sz0 / 4;
+        //size_t sz0 = model.exe0_parameters.size();   // 196KB
+        //size_t q0 = sz0 / 4;
         //memset((char*)pExe0ParamData + 0 * q0, 0x00, q0);  // 1st quarter of exe0 보조
          //memset((char*)pExe0ParamData + 1*q0, 0x00, q0);  // 2번: 2nd quarter
          //memset((char*)pExe0ParamData + 2*q0, 0x00, q0);  // 3번: 3rd quarter
@@ -546,21 +558,65 @@ int main(int argc, char** argv)
     if (isExistParam)
         apex_fb::DumpChipVisibleBitstream("exe1", pParamBitstream, model.param_patches);
 
+    // ========================================================================
+    // [PATCH-DUMP] libedgetpu 와 비교용 한 줄 형식.
+    // libedgetpu 측 매칭 출력은 instruction_buffers.cc::LinkInstructionBuffers.
+    // 각 patch site 의 (desc, position, name, byte-offset, 32-bit value) 를
+    // 한 줄씩 dump → grep 으로 양쪽 line 추출해서 diff 하면 patch encoding
+    // 차이가 정확히 어떤 자리에서 발생하는지 보임.
+    // ========================================================================
+    if (isExistParam) {
+        apex_fb::DumpPatchValuesForDiff("exe1", pParamBitstream, model.param_patches);
+    }
+    apex_fb::DumpPatchValuesForDiff("exe0", pInferBitstream, model.patches);
+
     // -------------------------------------------------------------------------
     // input image 로드 → input slot 으로 직접 채움.
     // INPUT_SIZE = side*side*3 (24bpp RGB) 가정. square 모델만 지원.
+    //
+    // USE_LIBEDGETPU_INPUT toggle:
+    //   1 = libedgetpu 가 dump 한 finalized host_input 을 verbatim 로드
+    //       (preprocessing 우회 — input divergence 격리 테스트용).
+    //       libedgetpu/driver/single_tpu_request.cc 의 [INPUT-CRC] 블록이
+    //       inference 직전 C:\temp\libe_input_raw.bin 으로 307200B dump.
+    //   0 = 기존 JPG 로드 + Fant resize + letterbox.
     // -------------------------------------------------------------------------
+    #define USE_LIBEDGETPU_INPUT 1
     {
         UINT imgSide = static_cast<UINT>(std::sqrt(static_cast<double>(INPUT_SIZE) / 3.0));
         if (imgSide * imgSide * 3 != INPUT_SIZE) {
             std::cout << "[main] WARNING: input size " << INPUT_SIZE
                       << " is not square*3 — falling back to imgSide=" << imgSide << std::endl;
         }
+
+#if USE_LIBEDGETPU_INPUT
+        {
+            const char* libe_input_path = "C:\\temp\\libe_input_raw.bin";
+            FILE* f = nullptr;
+            fopen_s(&f, libe_input_path, "rb");
+            if (f) {
+                size_t r = fread(pInputBuf, 1, INPUT_SIZE, f);
+                fclose(f);
+                std::cout << "[main] USE_LIBEDGETPU_INPUT=1 — loaded " << r << "/"
+                          << INPUT_SIZE << " bytes from " << libe_input_path << std::endl;
+                if (r != INPUT_SIZE) {
+                    std::cout << "[main] FAIL: libe input file size mismatch — expected "
+                              << INPUT_SIZE << " B" << std::endl;
+                    goto cleanup;
+                }
+            } else {
+                std::cout << "[main] FAIL: " << libe_input_path
+                          << " not found — run libedgetpu first to generate it" << std::endl;
+                goto cleanup;
+            }
+        }
+#else
         std::cout << "[main] loading image (target " << imgSide << "x" << imgSide << ")" << std::endl;
         if (!LoadJpegToRGB(L".\\assets\\karina.jpg", pInputBuf, imgSide, imgSide)) {
             std::cout << "[main] FAIL: image load" << std::endl;
             goto cleanup;
         }
+#endif
     }
 
     DumpHex("after-PC slot0 head", (const void*)allocOut.InputUserVA, 0x0000, 0x100);

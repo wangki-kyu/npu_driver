@@ -255,127 +255,145 @@ npudriverEvtDevicePrepareHardware(
 			c0, c1, c2, c3);
 	}
 
-	// Reset and quit-reset sequence to enable GCB (Global Clock Block)
-	// This is required for the scalar core to be operational
-	DbgPrint("[%s] Starting GCB reset sequence (libedgetpu-style: no RAM shutdown force)\n", __FUNCTION__);
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x1, 2, 2);  // Enable GCB reset
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x1, 2, 18); // Enable clock gate
-	// EXPERIMENT: do NOT force SCU_3 bit14 (RAM shutdown). libedgetpu's EnableReset
-	// only writes rg_force_sleep=0x3 (SCU_3 bits[22:23]) and polls cur_pwr_state==0x2.
-	// Forcing RAM shutdown wipes chip-internal SRAM state (suspected to wipe OUTFEED
-	// engine's internal buffers/state, killing outbound DMA after RunControl=1).
+	// =====================================================================
+	// GCB reset sequence — gasket-driver/src/apex_driver.c canonical match.
+	//
+	// Source of truth: apex_enter_reset()  (apex_driver.c:321-372)
+	//                  apex_quit_reset()   (apex_driver.c:376-457)
+	//
+	// 이전 버전은 다음 experiment 들로 인해 chip 의 management MCU 가
+	// gasket 표준과 다른 state 로 진입 → BAR2 [0x8000..0x12000] 의
+	// MCU working RAM 이 libedgetpu (= coral.sys 기준 init) 와 byte-단위로
+	// 달라지는 증상 발생. 이게 read DMA path 비대칭의 원인 의심:
+	//   - SCU_3 bit14 (RAM shutdown force) skip
+	//   - SCU_3 bit 6 poll (RAM enable wait) skip
+	//   - SCU_3 bit 4 poll (reset release wait) skip
+	//   - SCU_2[18:19] = 0 step skip (canonical: 0 before exit reset, then leave)
+	//   - GCBB_CREDIT0 pulse (gasket 에 없음)
+	//   - AXI_QUIESCE toggle dance (libedgetpu 의 그 함수는 PCIe 에서 no-op)
+	// 위 우회들을 제거하고 gasket canonical 그대로 사용.
+	// 만약 이전에 우회했던 버그 (OUTFEED kHalted, INFEED stuck 등) 가 다시
+	// 나오면 그건 증상이 아니라 다른 root cause. 거기서부터 따로 분석.
+	// =====================================================================
+	DbgPrint("[%s] Starting GCB enter_reset (gasket canonical)\n", __FUNCTION__);
+
+	// gasket apex_enter_reset step 4: Enable GCB reset (rg_rst_gcb)
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x1, 2, 2);
+
+	// gasket step 5: Enable GCB clock gate (rg_gated_gcb)
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x1, 2, 18);
+
+	// gasket step 6: Enable GCB memory shut down (rg_force_ram_sd = 0x3)
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x3, 2, 14);
+
+	// gasket step 7: Wait for RAM shutdown — SCU_3 bit 6 == 1
 	{
-		UINT32 scu3Before = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
-		DbgPrint("[%s] SCU_3 before sleep-mode entry: 0x%08x (skipping force RAM shutdown)\n",
-			__FUNCTION__, scu3Before);
+		int retry;
+		for (retry = 0; retry < 1000; retry++) {
+			UINT32 scu3 = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+			if (scu3 & (1u << 6)) {
+				DbgPrint("[%s] enter_reset: RAM shutdown confirmed (SCU_3 bit6=1, %d polls, val=0x%08x)\n",
+					__FUNCTION__, retry, scu3);
+				break;
+			}
+			KeStallExecutionProcessor(100);  // 100us
+		}
+		if (retry >= 1000) {
+			DbgPrint("[%s] WARNING: enter_reset RAM shutdown timeout (SCU_3 bit6 stayed 0)\n",
+				__FUNCTION__);
+		}
 	}
 
-	// EnableReset step 5 (libedgetpu beagle_top_level_handler.cc:221-223):
-	// Clear BULK credit by pulsing LSBs of gcbb_credit0 register.
-	// Without this pulse, the AXI bridge between host and GCB keeps stale BULK credits
-	// from the previous device session — scalar core's first DMA push to INFEED then
-	// hangs internally, and INFEED auto-halts to kHalted=0x4. This is the prime suspect
-	// for "INFEED stuck at kHalted after PARAM_CACHE" symptom we've been chasing.
-	DbgPrint("[%s] Pulsing gcbb_credit0 to clear stale BULK credit\n", __FUNCTION__);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_GCBB_CREDIT0, 0xF);
-	apex_write_register_32(deviceContext->Bar2BaseAddress, APEX_REG_GCBB_CREDIT0, 0x0);
+	// ---------------------------------------------------------------------
+	// EXPERIMENTS REMOVED (gasket 에 없음). 필요 시 selective 재활성화:
+	//   - GCBB_CREDIT0 pulse (was: clear stale BULK credit)
+	//     apex_write_register_32(bar2, APEX_REG_GCBB_CREDIT0, 0xF);
+	//     apex_write_register_32(bar2, APEX_REG_GCBB_CREDIT0, 0x0);
+	// ---------------------------------------------------------------------
 
-	DbgPrint("[%s] Starting GCB quit-reset sequence (no RAM enable polling)\n", __FUNCTION__);
-	// rg_gated_gcb (SCU_2 bits[19:18]) — libedgetpu values:
-	//   0x0 = deprecated, 0x1 = hardware clock gated, 0x2 = no clock gating (force on)
-	// 0x0 (deprecated) puts GCB in undefined gating state — large bitstreams (INFER)
-	// stall mid-execution. 0x2 (force on) matches DisableHardwareClockGate().
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 18); // rg_gated_gcb = no clock gating
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 2);  // Exit reset
-	// EXPERIMENT: skip RAM enable polling (bit6) — we never forced RAM shutdown,
-	// so there's nothing to wait for here. libedgetpu's QuitReset polls cur_pwr_state==0x0
-	// instead, which is checked separately in the SCALAR_RUN_CONTROL polling below.
+	DbgPrint("[%s] Starting GCB quit_reset (gasket canonical)\n", __FUNCTION__);
+
+	// gasket apex_quit_reset step 1: Disable GCB memory shut down (rg_force_ram_sd = 0x0)
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x0, 2, 14);
+
+	// gasket step 2: Disable software clock gate (rg_gated_gcb = 0x0)
+	// ★ 핵심 차이: 이전 버전은 0x2 (force on) 으로 곧장 갔는데, gasket 은 0x0
+	// (no gating, HW-controlled) 으로 먼저 들어감. 이 시점은 chip 이 reset 중이라
+	// 0x2 (force on) 이 비정상 — exit reset 후 chip 이 자체 HW 로 gating 관리.
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x0, 2, 18);
+
+	// gasket step 3: Force Disable GCB reset (rg_rst_gcb = 0x2) — exit reset
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_2, 0x2, 2, 2);
+
+	// gasket step 4: Wait for RAM enable — SCU_3 bit 6 == 0
+	{
+		int retry;
+		for (retry = 0; retry < 1000; retry++) {
+			UINT32 scu3 = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+			if ((scu3 & (1u << 6)) == 0) {
+				DbgPrint("[%s] quit_reset: RAM enable confirmed (SCU_3 bit6=0, %d polls, val=0x%08x)\n",
+					__FUNCTION__, retry, scu3);
+				break;
+			}
+			KeStallExecutionProcessor(100);
+		}
+		if (retry >= 1000) {
+			DbgPrint("[%s] WARNING: quit_reset RAM enable timeout (SCU_3 bit6 stayed 1)\n",
+				__FUNCTION__);
+		}
+	}
+
+	// gasket step 5: Wait for Reset complete — SCU_3 bit 4 (SCU3_CUR_RST_GCB_BIT_MASK = 0x10) == 0
+	{
+		int retry;
+		for (retry = 0; retry < 1000; retry++) {
+			UINT32 scu3 = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+			if ((scu3 & 0x10) == 0) {
+				DbgPrint("[%s] quit_reset: GCB reset released (SCU_3 bit4=0, %d polls, val=0x%08x)\n",
+					__FUNCTION__, retry, scu3);
+				break;
+			}
+			KeStallExecutionProcessor(100);
+		}
+		if (retry >= 1000) {
+			DbgPrint("[%s] WARNING: quit_reset GCB reset release timeout (SCU_3 bit4 stayed 1)\n",
+				__FUNCTION__);
+		}
+	}
+
+	// gasket step 6: rg_pwr_state_ovr SCU_3[27:26] = 0x3
+	// (gasket: 0x3 if !allow_hw_clock_gating, 0x2 if allowed. dev 환경은 0x3 이 안전).
+	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x3, 2, 26);
 	{
 		UINT32 scu3After = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
-		DbgPrint("[%s] SCU_3 after quit-reset: 0x%08x\n", __FUNCTION__, scu3After);
+		DbgPrint("[%s] quit_reset: SCU_3 after pwr_state_ovr=0x3: 0x%08x\n",
+			__FUNCTION__, scu3After);
 	}
 
-	// Critical: Confirm reset is completely released by polling SCALAR_RUN_CONTROL
-	// This register should read as 0 after reset is released, confirming the chip
-	// has exited reset state and CSR accesses are valid.
+	// 추가 sanity (gasket 에 없지만 user 가 기존에 했던 verification — 유지):
+	// reset 이 정말 release 됐는지 SCALAR_RUN_CONTROL == 0 으로 한 번 더 확인.
 	{
 		int retry;
 		for (retry = 0; retry < 100; retry++) {
 			UINT64 scRunCtrl = apex_read_register(deviceContext->Bar2BaseAddress, APEX_REG_SCALAR_RUN_CONTROL);
 			if (scRunCtrl == 0) {
-				DbgPrint("[%s] Reset confirmed - SCALAR_RUN_CONTROL = 0x0\n", __FUNCTION__);
+				DbgPrint("[%s] quit_reset: SCALAR_RUN_CONTROL=0 confirmed\n", __FUNCTION__);
 				break;
 			}
-			KeStallExecutionProcessor(100); // 100 microseconds
+			KeStallExecutionProcessor(100);
 		}
 		if (retry >= 100) {
-			DbgPrint("[%s] WARNING: Reset confirmation timeout - SCALAR_RUN_CONTROL != 0\n", __FUNCTION__);
+			DbgPrint("[%s] WARNING: SCALAR_RUN_CONTROL != 0 after quit_reset\n", __FUNCTION__);
 		}
 	}
 
-	// rg_pwr_state_ovr SCU_3[27:26] — 0x3 = all low-power modes disabled (max active).
-	// libedgetpu uses 0x2 if hw_clock_gating allowed, 0x3 if not. We set 0x3 so chip
-	// can never drop into Inactive or Sleep mode regardless of external triggers —
-	// keeps RUN_CONTROL writes effective and AXI bus alive.
-	apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3, 0x3, 2, 26);
-	{
-		UINT32 scu3After = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
-		DbgPrint("[%s] SCU_3 after power-state override (0x3=all-modes-off): 0x%08x\n",
-			__FUNCTION__, scu3After);
-	}
-
-	// Clear AXI quiesce — libedgetpu's two-step DisableSoftwareClockGate +
-	// DisableHardwareClockGate sequence (mmio_driver.cc DoOpen lines 4 & 5).
-	//
-	// Step A (DisableSoftwareClockGate):
-	//   SCU_2 bits[19:18] = 0  (rg_gated_gcb = no gating, normal mode)
-	//   AXI_QUIESCE bit 16   = 0
-	// Step B (DisableHardwareClockGate, after Step A):
-	//   SCU_2 bits[19:18] = 2  (rg_gated_gcb = force clock on, override gating)
-	//
-	// Going straight to bits=2 (as we did before) skips the "no gating" intermediate
-	// state and the chip's AXI logic doesn't release bit 21 (axi_quiesced status).
-	{
-		PVOID bar2 = deviceContext->Bar2BaseAddress;
-		UINT32 aq0 = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE before clear: 0x%08x (bit21=%u bit16=%u)\n",
-			__FUNCTION__, aq0, (aq0 >> 21) & 1, (aq0 >> 16) & 1);
-
-		// Step A1: SCU_2 bits[19:18] = 0 (DisableSoftwareClockGate)
-		apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x0, 2, 18);
-		KeStallExecutionProcessor(100);
-
-		// Step A2: AXI_QUIESCE bit 16 = 0 (clear quiesce request)
-		apex_rmw_register_32(bar2, APEX_REG_AXI_QUIESCE, 0x0, 1, 16);
-		KeStallExecutionProcessor(100);
-
-		UINT32 aqA = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE after Step A (gate=0, bit16=0): 0x%08x (bit21=%u)\n",
-			__FUNCTION__, aqA, (aqA >> 21) & 1);
-
-		// Step B: SCU_2 bits[19:18] = 2 (DisableHardwareClockGate, force on)
-		apex_rmw_register_32(bar2, APEX_REG_SCU_2, 0x2, 2, 18);
-		KeStallExecutionProcessor(100);
-
-		// Poll bit 21 to clear (axi_quiesced status follows axi_quiesce_request after
-		// clock gating is fully disabled).
-		{
-			int t;
-			for (t = 0; t < 1000; t++) {
-				UINT32 aq = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-				if ((aq & (1u << 21)) == 0) {
-					DbgPrint("[%s] AXI_QUIESCE bit 21 cleared after %d polls (val=0x%08x)\n",
-						__FUNCTION__, t, aq);
-					break;
-				}
-				KeStallExecutionProcessor(10);
-			}
-		}
-
-		UINT32 aqB = apex_read_register_32(bar2, APEX_REG_AXI_QUIESCE);
-		DbgPrint("[%s] AXI_QUIESCE after Step B (gate=2, force on): 0x%08x (bit21=%u)\n",
-			__FUNCTION__, aqB, (aqB >> 21) & 1);
-	}
+	// ---------------------------------------------------------------------
+	// EXPERIMENTS REMOVED (gasket 에 없음). 필요 시 selective 재활성화:
+	//   - AXI_QUIESCE toggle dance (was: DisableSoftwareClockGate + DisableHardwareClockGate)
+	//     libedgetpu 의 그 두 함수는 PCIe mode 에서 no-op 임을 verbose log 로 확인.
+	//     coral.sys 가 PnP attach 시 처리한다고 가정하는 layer 인데, gasket 의
+	//     apex_quit_reset 이 이미 SCU_2[18:19]=0 으로 처리 완료.
+	// ---------------------------------------------------------------------
 
 	// Unpause DMA engines — the pause written before reset must be explicitly cleared.
 	// GCB reset may or may not clear this register; write 0 unconditionally.
@@ -694,11 +712,15 @@ npudriverEvtDevicePrepareHardware(
 			__FUNCTION__);
 
 		// Working trace order (verbatim):
-		//   Scalar-side RUN_CONTROL writes → TILE_CONFIG0 + readback → Tile-side
-		//   RUN_CONTROL writes → STATUS_BLOCK_UPDATE=0 → SC_HOST_INT_CONTROL=0xF
+		//   Scalar-side RUN_CONTROL writes → TILE_CONFIG0 + readback → TILE_DEEP_SLEEP
+		//   → Tile-side RUN_CONTROL writes → STATUS_BLOCK_UPDATE=0 → SC_HOST_INT_CONTROL=0xF
 		//   → INSTR_QUEUE_INT_CONTROL=1 → FATAL_ERR_INT_CONTROL=1
 		//
-		// TILE_DEEP_SLEEP write removed — working trace never touches it (left at POR).
+		// TILE_DEEP_SLEEP: libedgetpu beagle_top_level_handler.cc:223-232 QuitReset
+		// 마지막 step.  POR default = 0x501 (to_sleep_delay=1, to_wake_delay=5).
+		// wake_delay=5 cycle 는 너무 짧아 SRAM 이 stable 해지기 전에 read 됨 → tile
+		// memory wake-up glitch → score branch quantized weight 가 saturate.
+		// libedgetpu 값 = 0x1e02 (to_sleep_delay=2, to_wake_delay=30).
 
 		// Phase 1: scalar-side run controls (working trace order, NOT alphabetical).
 		//   0x44018 = SCALAR
@@ -725,6 +747,13 @@ npudriverEvtDevicePrepareHardware(
 			}
 			DbgPrint("[%s] TILE_CONFIG0=0x7F confirmed after %d polls\n", __FUNCTION__, tci);
 		}
+
+		// Phase 2.5: TILE_DEEP_SLEEP (matches libedgetpu QuitReset order — after
+		// tileconfig0 broadcast confirmed, before tile-side RUN_CONTROL writes).
+		// to_sleep_delay=2 (bits[7:0]=0x02), to_wake_delay=30 (bits[15:8]=0x1e) → 0x1e02.
+		apex_write_register(bar2, APEX_REG_TILE_DEEP_SLEEP, 0x1e02);
+		DbgPrint("[%s] TILE_DEEP_SLEEP = 0x1e02 (to_sleep_delay=2, to_wake_delay=30)\n",
+			__FUNCTION__);
 
 		// Phase 3: tile-side run controls (working trace order):
 		//   0x400c0 = TILE_OP
