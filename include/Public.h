@@ -94,12 +94,25 @@ typedef struct IOCTL_INFER_INFO {
     UINT64 ScratchDeviceVA;   // device VA for scratch PTE registration
 } IOCTL_INFER_INFO;
 
+// DMA direction for IOCTL_MAP_BUFFER / IOCTL_ALLOC_IO_BUFFERS.
+// Mirrors libedgetpu's dma_data_direction (common_gasket_ioctl.inc:58-63)
+// so wire-level semantics match coral.sys.
+typedef enum _APEX_DMA_DIRECTION {
+    APEX_DMA_BIDIRECTIONAL = 0,  // host ↔ device
+    APEX_DMA_TO_DEVICE     = 1,  // input  (device reads host mem)
+    APEX_DMA_FROM_DEVICE   = 2,  // output (device writes host mem)
+    APEX_DMA_NONE          = 3
+} APEX_DMA_DIRECTION;
+
 // IOCTL input/output structures
 typedef struct {
     UINT64 UserAddress;     // User buffer virtual address
     UINT64 Size;            // Size in bytes
     UINT64 DeviceAddress;   // Requested device VA (must be page-aligned). Driver writes
                             // PTE[DeviceAddress>>12 .. ] for the user pages.
+    UINT32 Direction;       // APEX_DMA_DIRECTION — coral.sys 와 동일하게 page lock
+                            // mode 결정 (IoReadAccess/IoWriteAccess/IoModifyAccess)
+    UINT32 Reserved;        // align to 8B
 } MAP_BUFFER_INPUT;
 
 typedef struct {

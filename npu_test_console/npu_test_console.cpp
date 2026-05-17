@@ -280,6 +280,7 @@ int main()
         mapP1.UserAddress = (UINT64)pParamBitstreamBuf;
         mapP1.Size = model.param_bitstream.size();
         mapP1.DeviceAddress = EXT_VA_BIT | 0x840000ULL;
+        mapP1.Direction = APEX_DMA_TO_DEVICE;  // chip reads bitstream
         bool p1Ok = DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapP1, sizeof(MAP_BUFFER_INPUT),
                                     nullptr, 0, &bytesReturned, nullptr) != 0;
         if (!p1Ok) {
@@ -320,6 +321,7 @@ int main()
                 mapExe0P1.UserAddress = (UINT64)pExe0BitstreamPhase1;
                 mapExe0P1.Size = model.bitstream.size();
                 mapExe0P1.DeviceAddress = EXT_VA_BIT | 0x800000ULL;  // working trace value
+                mapExe0P1.Direction = APEX_DMA_TO_DEVICE;  // chip reads exe0 bitstream
                 bool exe0P1Ok = DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapExe0P1, sizeof(MAP_BUFFER_INPUT),
                                                 nullptr, 0, &bytesReturned, nullptr) != 0;
                 if (!exe0P1Ok) {
@@ -405,6 +407,7 @@ int main()
     mapInput.UserAddress = (UINT64)pModelBuffer;
     mapInput.Size = model.bitstream.size();
     mapInput.DeviceAddress = bitstream_va;
+    mapInput.Direction = APEX_DMA_TO_DEVICE;  // chip reads patched bitstream
 
     std::cout << "Mapping model buffer..." << std::endl;
     BOOL result = DeviceIoControl(

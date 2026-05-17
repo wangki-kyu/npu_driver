@@ -9,7 +9,8 @@ NTSTATUS ApexPageTableMap(
     _In_ WDFDEVICE Device,
     _In_ PVOID UserBuffer,
     _In_ SIZE_T Size,
-    _Inout_ UINT64 *DeviceAddress  // in: requested device VA (page-aligned); 0 = legacy "VA 0"
+    _Inout_ UINT64 *DeviceAddress, // in: requested device VA (page-aligned); 0 = legacy "VA 0"
+    _In_ UINT32 Direction           // APEX_DMA_DIRECTION — coral.sys 와 동일하게 page lock 모드 결정
 );
 
 NTSTATUS ApexPageTableUnmap(

@@ -103,18 +103,24 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
     // 2-level PT page rather than a chip PTE register that reads 0 — which
     // closes the door on speculative MMU walks landing on invalid registers.
     {
-        PHYSICAL_ADDRESS lowAddr, highAddr, noBoundary;
+        PHYSICAL_ADDRESS maxAddr;
         PHYSICAL_ADDRESS poolPa;
         UINT32 i;
 
-        lowAddr.QuadPart    = 0;
-        highAddr.QuadPart   = 0xFFFFFFFFLL;     // < 4 GB
-        noBoundary.QuadPart = 0;
+        maxAddr.QuadPart = 0xFFFFFFFFLL;     // < 4 GB (chip MMU 32-bit PA 제약)
 
-        pDevContext->ExtPoolKva = MmAllocateContiguousMemorySpecifyCache(
-            APEX_EXT_POOL_BYTES, lowAddr, highAddr, noBoundary, MmNonCached);
+        // coral.sys (sub_140003B9C) 와 동일: WDM AllocateCommonBufferEx.
+        // CacheEnabled=FALSE → uncached/coherent. 8MB 한방 alloc.
+        pDevContext->ExtPoolKva =
+            pDevContext->DmaAdapter->DmaOperations->AllocateCommonBufferEx(
+                pDevContext->DmaAdapter,
+                &maxAddr,
+                APEX_EXT_POOL_BYTES,
+                &pDevContext->ExtPoolLogicalAddress,
+                FALSE,
+                MM_ANY_NODE_OK);
         if (pDevContext->ExtPoolKva == NULL) {
-            DbgPrint("[%s] Failed to allocate %u-byte extended PT pool < 4 GB\n",
+            DbgPrint("[%s] Failed to allocate %u-byte extended PT pool (CommonBufferEx)\n",
                 __FUNCTION__, APEX_EXT_POOL_BYTES);
             ExFreePoolWithTag(pDevContext->PageTableBase, 'PTBL');
             pDevContext->PageTableBase = NULL;
@@ -122,6 +128,8 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
         }
         RtlZeroMemory(pDevContext->ExtPoolKva, APEX_EXT_POOL_BYTES);
 
+        // coral.sys 도 LogicalAddress 와 별개로 MmGetPhysicalAddress 직접 호출 (line 4147).
+        // IOMMU 가 없으면 두 값이 같지만, 안전하게 명시적으로 다시 계산.
         poolPa = MmGetPhysicalAddress(pDevContext->ExtPoolKva);
         pDevContext->ExtPoolPa   = (UINT64)poolPa.QuadPart;
         pDevContext->ExtPoolSize = APEX_EXT_POOL_BYTES;
@@ -150,7 +158,10 @@ NTSTATUS ApexPageTableInit(_In_ WDFDEVICE Device)
     if (!NT_SUCCESS(status)) {
         DbgPrint("[%s] WdfSpinLockCreate failed: 0x%x\n", __FUNCTION__, status);
         if (pDevContext->ExtPoolKva != NULL) {
-            MmFreeContiguousMemory(pDevContext->ExtPoolKva);
+            pDevContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+                pDevContext->DmaAdapter, APEX_EXT_POOL_BYTES,
+                pDevContext->ExtPoolLogicalAddress,
+                pDevContext->ExtPoolKva, FALSE);
             pDevContext->ExtPoolKva = NULL;
         }
         ExFreePoolWithTag(pDevContext->PageTableBase, 'PTBL');
@@ -173,7 +184,8 @@ NTSTATUS ApexPageTableMap(
     _In_ WDFDEVICE Device,
     _In_ PVOID UserBuffer,
     _In_ SIZE_T Size,
-    _Inout_ UINT64 *DeviceAddress)
+    _Inout_ UINT64 *DeviceAddress,
+    _In_ UINT32 Direction)
 {
     PDEVICE_CONTEXT pDevContext;
     PMDL mdl = NULL;
@@ -184,6 +196,7 @@ NTSTATUS ApexPageTableMap(
     APEX_PTE *pte;
     PHYSICAL_ADDRESS physAddr;
     BOOLEAN isExtended;
+    LOCK_OPERATION lockOp;
 
     PAGED_CODE();
 
@@ -209,6 +222,20 @@ NTSTATUS ApexPageTableMap(
 
     pageCount = (UINT32)((Size + PAGE_SIZE - 1) / PAGE_SIZE);
 
+    // coral.sys (sub_140002580 lines 2068-2087) 와 동일한 direction → LOCK_OPERATION 매핑.
+    //   APEX_DMA_TO_DEVICE(1)    → IoReadAccess(0)    : host writes, device reads
+    //   APEX_DMA_FROM_DEVICE(2)  → IoWriteAccess(1)   : device writes, host reads
+    //   APEX_DMA_BIDIRECTIONAL(0)→ IoModifyAccess(2)
+    //   APEX_DMA_NONE(3)         → reject
+    switch (Direction) {
+        case APEX_DMA_TO_DEVICE:    lockOp = IoReadAccess;   break;
+        case APEX_DMA_FROM_DEVICE:  lockOp = IoWriteAccess;  break;
+        case APEX_DMA_BIDIRECTIONAL: lockOp = IoModifyAccess; break;
+        default:
+            DbgPrint("[%s] Invalid Direction=%u\n", __FUNCTION__, Direction);
+            return STATUS_INVALID_PARAMETER;
+    }
+
     // Allocate MDL and lock user pages (common path for both simple/extended).
     mdl = IoAllocateMdl(UserBuffer, (ULONG)Size, FALSE, FALSE, NULL);
     if (mdl == NULL) {
@@ -216,9 +243,10 @@ NTSTATUS ApexPageTableMap(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
     __try {
-        MmProbeAndLockPages(mdl, UserMode, IoWriteAccess);
+        MmProbeAndLockPages(mdl, UserMode, lockOp);
     } __except(EXCEPTION_EXECUTE_HANDLER) {
-        DbgPrint("[%s] MmProbeAndLockPages failed\n", __FUNCTION__);
+        DbgPrint("[%s] MmProbeAndLockPages failed (dir=%u op=%d)\n",
+            __FUNCTION__, Direction, lockOp);
         IoFreeMdl(mdl);
         return STATUS_INVALID_PARAMETER;
     }
@@ -465,7 +493,10 @@ VOID ApexPageTableCleanup(_In_ WDFDEVICE Device)
             pDevContext->ExtPoolKva,
             pDevContext->ExtPoolPa,
             (UINT64)pDevContext->ExtPoolSize);
-        MmFreeContiguousMemory(pDevContext->ExtPoolKva);
+        pDevContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+            pDevContext->DmaAdapter, (ULONG)pDevContext->ExtPoolSize,
+            pDevContext->ExtPoolLogicalAddress,
+            pDevContext->ExtPoolKva, FALSE);
         pDevContext->ExtPoolKva  = NULL;
         pDevContext->ExtPoolPa   = 0;
         pDevContext->ExtPoolSize = 0;
@@ -574,9 +605,6 @@ NTSTATUS ApexAllocOutputBounce(
     _Out_ UINT32     *NumPagesOut)
 {
     PDEVICE_CONTEXT pDevContext = DeviceGetContext(Device);
-    PHYSICAL_ADDRESS lowAddr;
-    PHYSICAL_ADDRESS highAddr;
-    PHYSICAL_ADDRESS noBoundary;
     PVOID bounceKva;
     PHYSICAL_ADDRESS bouncePa;
     SIZE_T alignedSize;
@@ -599,15 +627,21 @@ NTSTATUS ApexAllocOutputBounce(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // < 4 GB, contiguous, MmNonCached so chip writes are CPU-visible without
-    // explicit cache invalidate (we'll memcpy it into user space later).
-    lowAddr.QuadPart    = 0;
-    highAddr.QuadPart   = 0xFFFFFFFFLL;
-    noBoundary.QuadPart = 0;
-    bounceKva = MmAllocateContiguousMemorySpecifyCache(
-        alignedSize, lowAddr, highAddr, noBoundary, MmNonCached);
+    // coral.sys path: WDM AllocateCommonBufferEx, CacheEnabled=FALSE.
+    // chip 이 outbound DMA write 하는 영역 — uncached/coherent 보장.
+    {
+        PHYSICAL_ADDRESS maxAddr;
+        maxAddr.QuadPart = 0xFFFFFFFFLL;
+        bounceKva = pDevContext->DmaAdapter->DmaOperations->AllocateCommonBufferEx(
+            pDevContext->DmaAdapter,
+            &maxAddr,
+            (ULONG)alignedSize,
+            &pDevContext->OutputBounceLogicalAddress,
+            FALSE,
+            MM_ANY_NODE_OK);
+    }
     if (bounceKva == NULL) {
-        DbgPrint("[Bounce] Failed to allocate %llu bytes < 4 GB\n",
+        DbgPrint("[Bounce] Failed to allocate %llu bytes (CommonBufferEx)\n",
             (UINT64)alignedSize);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -642,7 +676,10 @@ VOID ApexFreeOutputBounce(_In_ WDFDEVICE Device)
         return;
     }
     if (pDevContext->OutputBounceKva != NULL) {
-        MmFreeContiguousMemory(pDevContext->OutputBounceKva);
+        pDevContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+            pDevContext->DmaAdapter, (ULONG)pDevContext->OutputBounceSize,
+            pDevContext->OutputBounceLogicalAddress,
+            pDevContext->OutputBounceKva, FALSE);
     }
     DbgPrint("[Bounce] freed kva=%p pa=0x%llx size=0x%llx\n",
         pDevContext->OutputBounceKva,

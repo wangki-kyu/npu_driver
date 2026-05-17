@@ -148,6 +148,44 @@ npudriverEvtDevicePrepareHardware(
 	PDEVICE_CONTEXT deviceContext = DeviceGetContext(Device);
 
 	// =============================================================
+	// DmaEnabler 생성 — coral.sys 의 sub_140003B9C 과 동일한 path.
+	//   1. WdfDmaEnablerCreate(profile=ScatterGather, max_len=8MB)
+	//   2. WdfDmaEnablerSetMaximumScatterGatherElements(0x100000)  ← coral.sys 와 동일
+	//   3. WdfDmaEnablerWdmGetDmaAdapter — 이후 alloc 은 WDM
+	//      adapter->AllocateCommonBufferEx 직접 호출 (coral.sys 와 일치)
+	// 이게 있어야 ExtPool / DescRing / StatusBlock / IO slot 의 alloc 이 가능.
+	// =============================================================
+	{
+		WDF_DMA_ENABLER_CONFIG dmaConfig;
+		WDF_DMA_ENABLER_CONFIG_INIT(&dmaConfig,
+			WdfDmaProfileScatterGather,
+			APEX_EXT_POOL_BYTES);
+
+		status = WdfDmaEnablerCreate(Device, &dmaConfig,
+			WDF_NO_OBJECT_ATTRIBUTES, &deviceContext->DmaEnabler);
+		if (!NT_SUCCESS(status)) {
+			DbgPrint("[%s] WdfDmaEnablerCreate failed: 0x%x\n", __FUNCTION__, status);
+			return status;
+		}
+
+		WdfDmaEnablerSetMaximumScatterGatherElements(
+			deviceContext->DmaEnabler, 0x100000);
+
+		deviceContext->DmaAdapter = WdfDmaEnablerWdmGetDmaAdapter(
+			deviceContext->DmaEnabler, WdfDmaDirectionReadFromDevice);
+		if (deviceContext->DmaAdapter == NULL) {
+			DbgPrint("[%s] WdfDmaEnablerWdmGetDmaAdapter returned NULL\n", __FUNCTION__);
+			return STATUS_DEVICE_NOT_READY;
+		}
+
+		DbgPrint("[%s] DmaEnabler=%p DmaAdapter=%p (ScatterGather, max=%u B, SG_max=0x100000)\n",
+			__FUNCTION__,
+			deviceContext->DmaEnabler,
+			deviceContext->DmaAdapter,
+			APEX_EXT_POOL_BYTES);
+	}
+
+	// =============================================================
 	// SAVE MSI-X table BEFORE any chip reset.
 	//
 	// Reason: GCB reset (RAM shutdown -> RAM enable) wipes chip's
@@ -588,19 +626,22 @@ npudriverEvtDevicePrepareHardware(
 
 	// Allocate descriptor ring (4KB = 256 slots * 16 bytes each)
 	// Maps to PTE slot 4096 (working trace), device VA = 4096 * 4KB = 0x1000000 (simple slot)
-	// 2026-05-18: NonPagedPoolNx (cacheable) → MmNonCached contiguous (DMA-coherent).
-	// libedgetpu/coral.sys 는 ring/status block 을 dma_alloc_coherent 등가 path 로 잡음.
-	// cacheable 일 때 chip 이 fetch 하는 16B descriptor 가 CPU cache 와 sync 안 될 위험.
+	// 2026-05-18: WDM AllocateCommonBufferEx — coral.sys 의 sub_140003B9C path 와 동일.
+	// MaximumAddress=0xFFFFFFFF (32-bit), CacheEnabled=FALSE (DMA-coherent uncached).
 	{
-		PHYSICAL_ADDRESS lo, hi, none;
-		lo.QuadPart = 0;
-		hi.QuadPart = 0xFFFFFFFFLL;   // < 4GB. chip MMU 32-bit PA 제약.
-		none.QuadPart = 0;
-		deviceContext->DescRingBase = MmAllocateContiguousMemorySpecifyCache(
-			PAGE_SIZE, lo, hi, none, MmNonCached);
+		PHYSICAL_ADDRESS maxAddr;
+		maxAddr.QuadPart = 0xFFFFFFFFLL;
+		deviceContext->DescRingBase =
+			deviceContext->DmaAdapter->DmaOperations->AllocateCommonBufferEx(
+				deviceContext->DmaAdapter,
+				&maxAddr,
+				PAGE_SIZE,
+				&deviceContext->DescRingLogicalAddress,
+				FALSE,                /* CacheEnabled = FALSE → uncached */
+				MM_ANY_NODE_OK);
 	}
 	if (deviceContext->DescRingBase == NULL) {
-		DbgPrint("[%s] Failed to allocate descriptor ring\n", __FUNCTION__);
+		DbgPrint("[%s] Failed to allocate descriptor ring (CommonBufferEx)\n", __FUNCTION__);
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
 	RtlZeroMemory(deviceContext->DescRingBase, PAGE_SIZE);
@@ -622,20 +663,27 @@ npudriverEvtDevicePrepareHardware(
 
 	// Allocate status block (4KB) — hardware DMA-writes completion info here
 	// Maps to PTE slot 4097 (working trace), device VA = 4097 * 4KB = 0x1001000 (simple slot)
-	// 2026-05-18: NonPagedPoolNx → MmNonCached contiguous. chip 이 여기에 DMA write 하는
-	// completion_head_pointer 를 CPU 가 cache 에서 stale 0 으로 읽으면 inference 완료
-	// 감지 못함 → output 미반영 / bias-only 출력 가능.
+	// 2026-05-18: WDM AllocateCommonBufferEx — coral.sys 와 동일.
+	// chip 이 여기에 DMA write 하는 completion_head_pointer 를 CPU 가 cache 에서
+	// stale 0 으로 읽지 않도록 반드시 uncached/coherent 메모리여야 함.
 	{
-		PHYSICAL_ADDRESS lo, hi, none;
-		lo.QuadPart = 0;
-		hi.QuadPart = 0xFFFFFFFFLL;
-		none.QuadPart = 0;
-		deviceContext->StatusBlockBase = MmAllocateContiguousMemorySpecifyCache(
-			PAGE_SIZE, lo, hi, none, MmNonCached);
+		PHYSICAL_ADDRESS maxAddr;
+		maxAddr.QuadPart = 0xFFFFFFFFLL;
+		deviceContext->StatusBlockBase =
+			deviceContext->DmaAdapter->DmaOperations->AllocateCommonBufferEx(
+				deviceContext->DmaAdapter,
+				&maxAddr,
+				PAGE_SIZE,
+				&deviceContext->StatusBlockLogicalAddress,
+				FALSE,                /* CacheEnabled = FALSE → uncached */
+				MM_ANY_NODE_OK);
 	}
 	if (deviceContext->StatusBlockBase == NULL) {
-		DbgPrint("[%s] Failed to allocate status block\n", __FUNCTION__);
-		MmFreeContiguousMemory(deviceContext->DescRingBase);
+		DbgPrint("[%s] Failed to allocate status block (CommonBufferEx)\n", __FUNCTION__);
+		deviceContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+			deviceContext->DmaAdapter, PAGE_SIZE,
+			deviceContext->DescRingLogicalAddress,
+			deviceContext->DescRingBase, FALSE);
 		deviceContext->DescRingBase = NULL;
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
@@ -1161,11 +1209,17 @@ npudriverEvtDeviceReleaseHardware(
 	ApexPageTableCleanup(Device);
 
 	if (deviceContext->DescRingBase != NULL) {
-		MmFreeContiguousMemory(deviceContext->DescRingBase);
+		deviceContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+			deviceContext->DmaAdapter, PAGE_SIZE,
+			deviceContext->DescRingLogicalAddress,
+			deviceContext->DescRingBase, FALSE);
 		deviceContext->DescRingBase = NULL;
 	}
 	if (deviceContext->StatusBlockBase != NULL) {
-		MmFreeContiguousMemory(deviceContext->StatusBlockBase);
+		deviceContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+			deviceContext->DmaAdapter, PAGE_SIZE,
+			deviceContext->StatusBlockLogicalAddress,
+			deviceContext->StatusBlockBase, FALSE);
 		deviceContext->StatusBlockBase = NULL;
 	}
 	if (deviceContext->Bar2BaseAddress != NULL) {
@@ -1300,7 +1354,9 @@ npudriverEvtFileCleanup(
 		if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
 		if (slot->Kva) {
 			ApexPageTableUnmap(device, slot->DeviceVa, slot->Size);
-			MmFreeContiguousMemory(slot->Kva);
+			deviceContext->DmaAdapter->DmaOperations->FreeCommonBuffer(
+				deviceContext->DmaAdapter, (ULONG)slot->Size,
+				slot->LogicalAddress, slot->Kva, FALSE);
 			slot->Kva = NULL; slot->Size = 0; slot->DeviceVa = 0;
 		}
 	}

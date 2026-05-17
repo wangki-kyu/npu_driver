@@ -10,12 +10,14 @@
 EXTERN_C_START
 
 typedef struct _ALLOC_IO_SLOT {
-	PVOID   Kva;          // MmAllocateContiguousMemorySpecifyCache 결과
-	PMDL    Mdl;          // user-map 용 MDL (IoAllocateMdl + MmBuildMdlForNonPagedPool)
-	PVOID   UserVa;       // MmMapLockedPagesSpecifyCache(UserMode) 결과
-	UINT64  DeviceVa;     // chip PTE 박은 위치
-	SIZE_T  Size;         // 4 KB 배수
-	SIZE_T ActualSize;		// 원본 요청 크기 
+	PVOID   Kva;             // AllocateCommonBufferEx 결과 (WDM, MmNonCached, DMA-coherent)
+	PHYSICAL_ADDRESS LogicalAddress;  // AllocateCommonBufferEx 의 LogicalAddress 출력값 (free 시 필수)
+	PMDL    Mdl;             // user-map 용 MDL
+	PVOID   UserVa;          // MmMapLockedPagesSpecifyCache(UserMode) 결과
+	UINT64  DeviceVa;        // chip PTE 박은 위치
+	SIZE_T  Size;            // 4 KB 배수
+	SIZE_T ActualSize;       // 원본 요청 크기
+	UINT32  Direction;       // APEX_DMA_DIRECTION (page lock 모드 결정용)
 } ALLOC_IO_SLOT;
 
 typedef enum _IO_SLOT_INDEX {
@@ -32,6 +34,17 @@ typedef enum _IO_SLOT_INDEX {
 
 typedef struct _DEVICE_CONTEXT
 {
+	// =====================================================================
+	// DMA enabler — coral.sys 와 동일한 path (sub_140003B9C, lines 4113-4179).
+	// PrepareHardware 에서 WdfDmaEnablerCreate(ScatterGather profile, max=8MB)
+	// + WdfDmaEnablerSetMaximumScatterGatherElements(0x100000)
+	// + WdfDmaEnablerWdmGetDmaAdapter 로 WDM adapter 추출.
+	// 모든 contiguous coherent buffer (DescRing/StatusBlock/ExtPool/OutputBounce
+	// /IO slot) 가 이 adapter 의 AllocateCommonBufferEx 를 통해 만들어짐.
+	// =====================================================================
+	WDFDMAENABLER DmaEnabler;
+	PDMA_ADAPTER  DmaAdapter;
+
 	// BAR2
 	PVOID Bar2BaseAddress;	// MmMapIoSpace
 	ULONG Bar2Length;		//
@@ -110,12 +123,16 @@ typedef struct _DEVICE_CONTEXT
 	KEVENT InferCompleteEvent;           // Event for inference completion
 
 	// Instruction queue descriptor ring (PTE slot 4096, deviceVA=0x1000000 — working trace)
-	PVOID   DescRingBase;        // kernel VA (MmNonCached contiguous, 4KB) — DMA-coherent
+	// AllocateCommonBufferEx 로 잡힌 DMA-coherent buffer
+	PVOID   DescRingBase;        // kernel VA
+	PHYSICAL_ADDRESS DescRingLogicalAddress;  // AllocateCommonBufferEx output (free 시 필수)
 	UINT64  DescRingDeviceVA;    // device virtual address seen by hardware
 	UINT32  DescRingTail;        // monotonic submitted descriptor count
 
 	// Status block (hardware DMA-writes completion info here, PTE slot 4097, deviceVA=0x1001000 — working trace)
-	PVOID   StatusBlockBase;     // kernel VA (MmNonCached contiguous, 4KB) — DMA-coherent
+	// AllocateCommonBufferEx 로 잡힌 DMA-coherent buffer
+	PVOID   StatusBlockBase;     // kernel VA
+	PHYSICAL_ADDRESS StatusBlockLogicalAddress;  // AllocateCommonBufferEx output (free 시 필수)
 	UINT64  StatusBlockDeviceVA; // device virtual address seen by hardware
 
 	// ISR diagnostic counter (incremented on every ISR call, including spurious)
@@ -176,6 +193,7 @@ typedef struct _DEVICE_CONTEXT
 	PVOID    ExtPoolKva;
 	UINT64   ExtPoolPa;
 	SIZE_T   ExtPoolSize;
+	PHYSICAL_ADDRESS ExtPoolLogicalAddress;  // AllocateCommonBufferEx output (free 시 필수)
 
 	// Output bounce buffer (extended-VA path only).
 	//
@@ -192,6 +210,7 @@ typedef struct _DEVICE_CONTEXT
 	UINT64   OutputBouncePa;        // base PA (saved for diagnostics)
 	SIZE_T   OutputBounceSize;      // page-aligned size used for chip mapping
 	BOOLEAN  OutputBounceActive;    // TRUE while bounce holds chip writes
+	PHYSICAL_ADDRESS OutputBounceLogicalAddress;  // AllocateCommonBufferEx output (free 시 필수)
 
 	// MSI-X table snapshot taken at PrepareHardware entry (before GCB reset wipes
 	// chip's internal SRAM that backs BAR2+0x46800). Restored just before the

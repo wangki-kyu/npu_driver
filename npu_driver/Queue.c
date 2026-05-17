@@ -266,8 +266,9 @@ VOID npudriverEvtIoDeviceControl(
 
 		pInput = (MAP_BUFFER_INPUT *)WdfMemoryGetBuffer(inputMemory, NULL);
 
-		DbgPrint("[%s] MAP_BUFFER: UserAddr=0x%llx Size=0x%llx ReqDeviceVA=0x%llx\n",
-			__FUNCTION__, pInput->UserAddress, pInput->Size, pInput->DeviceAddress);
+		DbgPrint("[%s] MAP_BUFFER: UserAddr=0x%llx Size=0x%llx ReqDeviceVA=0x%llx dir=%u\n",
+			__FUNCTION__, pInput->UserAddress, pInput->Size, pInput->DeviceAddress,
+			pInput->Direction);
 		{
 			PDEVICE_CONTEXT pDC = DeviceGetContext(device);
 			DbgPrint("[MAP] HIB_ERROR before map = 0x%llx\n",
@@ -275,8 +276,10 @@ VOID npudriverEvtIoDeviceControl(
 		}
 
 		// Caller-specified device VA — driver writes PTE[DeviceAddress>>12 ..]
+		// Direction 은 MmProbeAndLockPages 의 Operation 인자로 사용됨 (coral.sys 와 동일)
 		deviceAddr = pInput->DeviceAddress;
-		status = ApexPageTableMap(device, (PVOID)pInput->UserAddress, (SIZE_T)pInput->Size, &deviceAddr);
+		status = ApexPageTableMap(device, (PVOID)pInput->UserAddress,
+			(SIZE_T)pInput->Size, &deviceAddr, pInput->Direction);
 
 		if (NT_SUCCESS(status)) {
 			PDEVICE_CONTEXT pDC = DeviceGetContext(device);
@@ -2674,8 +2677,13 @@ VOID npudriverEvtIoDeviceControl(
 		for (i = 0; i < IO_SLOT_COUNT; i++) {
 			ALLOC_IO_SLOT* slot = &pDC->IOSlots[i];
 			SIZE_T size4k;
-			PHYSICAL_ADDRESS lo, hi, none;
+			PHYSICAL_ADDRESS maxAddr;
 			PHYSICAL_ADDRESS pa;
+			// buffer 종류 → DMA direction 자동 추론 (coral.sys 가 IOCTL flags 로 받는 것과 동치)
+			UINT32 slotDirection =
+				(i == IO_SLOT_OUTPUT)  ? APEX_DMA_FROM_DEVICE :
+				(i == IO_SLOT_SCRATCH) ? APEX_DMA_BIDIRECTIONAL :
+				                         APEX_DMA_TO_DEVICE;   /* input, bitstream, param */
 
 			if (req[i].size == 0) continue;
 			if (slot->Kva != NULL) {
@@ -2686,11 +2694,12 @@ VOID npudriverEvtIoDeviceControl(
 			}
 
 			size4k = (SIZE_T)((req[i].size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
-			lo.QuadPart = 0;
-			hi.QuadPart = 0xFFFFFFFFLL; // < 4GB. chip MMU 가 32-bit PA만 받으면 필수.
-			none.QuadPart = 0;
+			maxAddr.QuadPart = 0xFFFFFFFFLL;  // < 4GB. chip MMU 32-bit PA 제약.
 
-			slot->Kva = MmAllocateContiguousMemorySpecifyCache(size4k, lo, hi, none, MmNonCached);
+			// coral.sys path: AllocateCommonBufferEx (DMA-coherent, uncached).
+			slot->Kva = pDC->DmaAdapter->DmaOperations->AllocateCommonBufferEx(
+				pDC->DmaAdapter, &maxAddr, (ULONG)size4k,
+				&slot->LogicalAddress, FALSE, MM_ANY_NODE_OK);
 			if (slot->Kva == NULL) {
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				goto alloc_io_fail;
@@ -2699,13 +2708,14 @@ VOID npudriverEvtIoDeviceControl(
 			slot->Size = size4k;
 			slot->DeviceVa = req[i].devVa;
 			slot->ActualSize = req[i].size;
+			slot->Direction = slotDirection;
 
 			pa = MmGetPhysicalAddress(slot->Kva);
 
 			// user-mode 매핑 - calling process 컨텍스트에서만 호출되면 안전
 			slot->Mdl = IoAllocateMdl(slot->Kva, (ULONG)size4k, FALSE, FALSE, NULL);
 			if (slot->Mdl == NULL) {
-				MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+				pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(pDC->DmaAdapter, (ULONG)slot->Size, slot->LogicalAddress, slot->Kva, FALSE); slot->Kva = NULL;
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				goto alloc_io_fail;
 			}
@@ -2727,7 +2737,7 @@ VOID npudriverEvtIoDeviceControl(
 
 			if (slot->UserVa == NULL) {
 				IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-				MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+				pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(pDC->DmaAdapter, (ULONG)slot->Size, slot->LogicalAddress, slot->Kva, FALSE); slot->Kva = NULL;
 				status = STATUS_INSUFFICIENT_RESOURCES;
 				goto alloc_io_fail;
 			}
@@ -2744,7 +2754,7 @@ VOID npudriverEvtIoDeviceControl(
 					DbgPrint("[ALLOC_IO] slot %d DeviceVa=0x%llx not page-aligned\n", i, baseDevVa);
 					MmUnmapLockedPages(slot->UserVa, slot->Mdl);
 					IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-					MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+					pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(pDC->DmaAdapter, (ULONG)slot->Size, slot->LogicalAddress, slot->Kva, FALSE); slot->Kva = NULL;
 					slot->UserVa = NULL;
 					status = STATUS_INVALID_PARAMETER;
 					goto alloc_io_fail;
@@ -2758,7 +2768,7 @@ VOID npudriverEvtIoDeviceControl(
 							i, startPte, startPte + pageCount - 1, pDC->PageTableSize);
 						MmUnmapLockedPages(slot->UserVa, slot->Mdl);
 						IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-						MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+						pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(pDC->DmaAdapter, (ULONG)slot->Size, slot->LogicalAddress, slot->Kva, FALSE); slot->Kva = NULL;
 						slot->UserVa = NULL;
 						status = STATUS_INVALID_PARAMETER;
 						goto alloc_io_fail;
@@ -2790,7 +2800,7 @@ VOID npudriverEvtIoDeviceControl(
 							i, baseDevVa);
 						MmUnmapLockedPages(slot->UserVa, slot->Mdl);
 						IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-						MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+						pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(pDC->DmaAdapter, (ULONG)slot->Size, slot->LogicalAddress, slot->Kva, FALSE); slot->Kva = NULL;
 						slot->UserVa = NULL;
 						status = STATUS_DEVICE_NOT_READY;
 						goto alloc_io_fail;
@@ -2805,7 +2815,7 @@ VOID npudriverEvtIoDeviceControl(
 								i, baseDevVa, firstL1, lastL1);
 							MmUnmapLockedPages(slot->UserVa, slot->Mdl);
 							IoFreeMdl(slot->Mdl); slot->Mdl = NULL;
-							MmFreeContiguousMemory(slot->Kva); slot->Kva = NULL;
+							pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(pDC->DmaAdapter, (ULONG)slot->Size, slot->LogicalAddress, slot->Kva, FALSE); slot->Kva = NULL;
 							slot->UserVa = NULL;
 							status = STATUS_INVALID_PARAMETER;
 							goto alloc_io_fail;
@@ -2847,7 +2857,9 @@ VOID npudriverEvtIoDeviceControl(
 			if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
 			if (slot->Kva) {
 				ApexPageTableUnmap(device, slot->DeviceVa, slot->Size);
-				MmFreeContiguousMemory(slot->Kva);
+				pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(
+					pDC->DmaAdapter, (ULONG)slot->Size,
+					slot->LogicalAddress, slot->Kva, FALSE);
 				slot->Kva = NULL; slot->Size = 0; slot->DeviceVa = 0;
 			}
 		}
@@ -2865,7 +2877,9 @@ VOID npudriverEvtIoDeviceControl(
 			if (slot->Mdl) { IoFreeMdl(slot->Mdl); slot->Mdl = NULL; }
 			if (slot->Kva) {
 				ApexPageTableUnmap(device, slot->DeviceVa, slot->Size);
-				MmFreeContiguousMemory(slot->Kva);
+				pDC->DmaAdapter->DmaOperations->FreeCommonBuffer(
+					pDC->DmaAdapter, (ULONG)slot->Size,
+					slot->LogicalAddress, slot->Kva, FALSE);
 				slot->Kva = NULL; slot->Size = 0; slot->DeviceVa = 0;
 			}
 		}

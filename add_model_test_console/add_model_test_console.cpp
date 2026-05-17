@@ -245,6 +245,7 @@ int main(int argc, char** argv)
         mapPb.UserAddress   = (UINT64)pParamBitstream;
         mapPb.Size          = model.param_bitstream.size();
         mapPb.DeviceAddress = VA_PARAM_BITSTREAM;
+        mapPb.Direction     = APEX_DMA_TO_DEVICE;  // chip reads param bitstream
         if (!DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapPb, sizeof(mapPb),
                              nullptr, 0, &bytesReturned, nullptr)) {
             std::cout << "[main] FAIL: IOCTL_MAP_BUFFER (param bitstream): " << GetLastError() << std::endl;
@@ -278,6 +279,7 @@ int main(int argc, char** argv)
         mapExe0p1.UserAddress   = (UINT64)pExe0Phase1Bs;
         mapExe0p1.Size          = model.bitstream.size();
         mapExe0p1.DeviceAddress = VA_EXE0_BITSTREAM_PHASE1;
+        mapExe0p1.Direction     = APEX_DMA_TO_DEVICE;  // chip reads exe0 bitstream
         if (!DeviceIoControl(handle, IOCTL_MAP_BUFFER, &mapExe0p1, sizeof(mapExe0p1),
                              nullptr, 0, &bytesReturned, nullptr)) {
             std::cout << "[main] WARNING: phase1 exe0 bitstream MAP failed (continuing): "
