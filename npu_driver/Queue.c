@@ -1,6 +1,7 @@
 #include "Driver.h"
 #include "Queue.h"
 #include "Memory.h"
+#include <ntstrsafe.h>  // RtlStringCbPrintfA/W for ApexDumpCsrRegions file output
 
 
 #ifdef ALLOC_PRAGMA
@@ -10,38 +11,175 @@
 //#pragma alloc_text(PAGE, npudriverEvtIoDeviceControl)
 #endif
 
-// === BAR2 CSR region dump helper ============================================
-// Mirrors libedgetpu's mmio_driver.cc dump_csrs format ([CSR@<tag>] off=... val=...)
-// for byte-by-byte diff against logs\edgetpu_*.log files.  Dumps the 4 core
-// MMIO regions used in libedgetpu's diagnostic snapshot.
+// === DIAGNOSTIC: file I/O isolation test (2026-05-16) =======================
+// Tests ZwCreateFile/ZwWriteFile only — NO MMIO. If this crashes, file I/O
+// is the BSOD culprit. If 3 files appear in C:\temp\test_<tag>.log, file I/O
+// works fine and the previous crash was elsewhere (MMIO loop most likely).
+// Phase markers via DbgPrint locate the exact failure phase.
+static VOID TestFileWrite(const char* tag) {
+    DbgPrint("[TEST@%s] P1: enter, IRQL=%u\n", tag, (unsigned)KeGetCurrentIrql());
+
+    WCHAR pathBuf[256];
+    NTSTATUS st = RtlStringCbPrintfW(pathBuf, sizeof(pathBuf),
+        L"\\??\\C:\\temp\\test_%hs.log", tag);
+    DbgPrint("[TEST@%s] P2: path build status=0x%08x\n", tag, st);
+
+    UNICODE_STRING fp;
+    RtlInitUnicodeString(&fp, pathBuf);
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &fp,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    DbgPrint("[TEST@%s] P3: about to ZwCreateFile\n", tag);
+
+    HANDLE hFile = NULL;
+    IO_STATUS_BLOCK iosb;
+    st = ZwCreateFile(&hFile, GENERIC_WRITE | SYNCHRONIZE,
+        &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ, FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL, 0);
+    DbgPrint("[TEST@%s] P4: ZwCreateFile returned 0x%08x (hFile=%p)\n",
+        tag, st, hFile);
+
+    if (NT_SUCCESS(st)) {
+        char msg[128];
+        size_t msgLen;
+        RtlStringCbPrintfA(msg, sizeof(msg),
+            "hello from npu_driver, tag=%s\r\n", tag);
+        RtlStringCbLengthA(msg, sizeof(msg), &msgLen);
+        DbgPrint("[TEST@%s] P5: about to ZwWriteFile (%zu bytes)\n", tag, msgLen);
+
+        st = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
+            msg, (ULONG)msgLen, NULL, NULL);
+        DbgPrint("[TEST@%s] P6: ZwWriteFile returned 0x%08x (info=%llu)\n",
+            tag, st, (UINT64)iosb.Information);
+
+        ZwClose(hFile);
+        DbgPrint("[TEST@%s] P7: ZwClose done\n", tag);
+    }
+    DbgPrint("[TEST@%s] P8: exit\n", tag);
+}
+
+// === BAR2 CSR region dump helper (writes to C:\temp\npu_csr_<tag>.log) =======
+// BISECTION VERSION 2026-05-16: restricted to 4 KNOWN-SAFE regions
+// (the original set libedgetpu has been reading for years without issue).
+// Previous full 0x00000-0x80000 sweep crashed system — narrowed scope here
+// to confirm file I/O + 4-region MMIO works. Once confirmed safe, add new
+// regions ONE AT A TIME via the kRegions table to find which one crashes.
+//
+// Writes to file instead of DbgPrint (DbgPrint is too slow for 65k lines).
+// File: \??\C:\temp\npu_csr_<tag>.log (overwrite-if-exists).
+// Format: matches libedgetpu `[CSR@<tag>] off=0x... val=0x...` for diff.
 static VOID ApexDumpCsrRegions(PDEVICE_CONTEXT pDc, const char* tag) {
     PVOID bar2 = pDc->Bar2BaseAddress;
+    if (bar2 == NULL || pDc->Bar2Length == 0) {
+        DbgPrint("[CSR@%s] SKIP: BAR2 not mapped\n", tag);
+        return;
+    }
+    if (KeGetCurrentIrql() > APC_LEVEL) {
+        DbgPrint("[CSR@%s] SKIP: IRQL=%u too high for file I/O\n",
+            tag, (unsigned)KeGetCurrentIrql());
+        return;
+    }
+
+    // Known-safe regions only. To bisect new regions, add an entry here one at a time and re-test.
     static const struct {
         UINT64 off;
         UINT64 size;
         const char* name;
     } kRegions[] = {
-        { 0x40000, 0x0400,         "scalar_core"        },
-        { 0x44000, 0x0400,         "data_feed_control"  },
-        { 0x46000, 0x0100,         "hib_kernel"         },
-        { 0x48000, 0x0800,         "hib_user"           },
+        { 0x40000, 0x0400, "scalar_core"        },  // 128 entries
+        { 0x42000, 0x2000, "tile_array"         },  // 1024 entries — NEW BISECTION CANDIDATE 2026-05-16
+        { 0x44000, 0x0400, "data_feed_control"  },  // 128 entries
+        { 0x46000, 0x0100, "hib_kernel"         },  //  32 entries
+        { 0x48000, 0x0800, "hib_user"           },  // 256 entries
+        { 0x1A000, 0x0340, "scu_omc"            },  // 104 entries — ADDED 2026-05-16 (5x throughput hunt)
+        // {0x50000, 0x10000, "page_table"      },  // candidate next
     };
-    ULONG r, regionCount = sizeof(kRegions) / sizeof(kRegions[0]);
+    const ULONG regionCount = sizeof(kRegions) / sizeof(kRegions[0]);
 
-    DbgPrint("[CSR-BEGIN@%s]\n", tag);
+    // 512KB buffer is plenty for the 4-region (~16KB) baseline.
+    const SIZE_T kBufSize = 512ULL * 1024;
+    PCHAR buf = (PCHAR)ExAllocatePoolWithTag(PagedPool, kBufSize, 'CSRD');
+    if (!buf) {
+        DbgPrint("[CSR@%s] SKIP: ExAllocatePoolWithTag(512KB) failed\n", tag);
+        return;
+    }
+
+    PCHAR pos = buf;
+    SIZE_T remaining = kBufSize;
+    size_t lineLen;
+
+    RtlStringCbPrintfA(pos, remaining,
+        "[CSR-BEGIN@%s] %lu regions (bisection baseline)\n", tag, regionCount);
+    lineLen = strlen(pos);
+    pos += lineLen; remaining -= lineLen;
+
+    ULONG r;
     for (r = 0; r < regionCount; r++) {
-        UINT64 off = kRegions[r].off;
+        UINT64 base = kRegions[r].off;
         UINT64 size = kRegions[r].size;
+        if (base + size > (UINT64)pDc->Bar2Length) {
+            RtlStringCbPrintfA(pos, remaining,
+                "[CSR@%s] --- region %s 0x%05llx..0x%05llx SKIPPED (past Bar2Length=0x%lx) ---\n",
+                tag, kRegions[r].name, base, base + size - 1, pDc->Bar2Length);
+            lineLen = strlen(pos);
+            pos += lineLen; remaining -= lineLen;
+            continue;
+        }
+        RtlStringCbPrintfA(pos, remaining,
+            "[CSR@%s] --- region %s 0x%05llx..0x%05llx ---\n",
+            tag, kRegions[r].name, base, base + size - 1);
+        lineLen = strlen(pos);
+        pos += lineLen; remaining -= lineLen;
+
         UINT64 o;
-        DbgPrint("[CSR@%s] --- region %s 0x%05llx..0x%05llx ---\n",
-            tag, kRegions[r].name, off, off + size - 1);
         for (o = 0; o < size; o += 8) {
-            UINT64 abs = off + o;
+            UINT64 abs = base + o;
             UINT64 val = apex_read_register(bar2, abs);
-            DbgPrint("[CSR@%s] off=0x%05llx val=0x%016llx\n", tag, abs, val);
+            RtlStringCbPrintfA(pos, remaining,
+                "[CSR@%s] off=0x%05llx val=0x%016llx\n", tag, abs, val);
+            lineLen = strlen(pos);
+            pos += lineLen; remaining -= lineLen;
         }
     }
-    DbgPrint("[CSR-END@%s]\n", tag);
+
+    RtlStringCbPrintfA(pos, remaining, "[CSR-END@%s]\n", tag);
+    lineLen = strlen(pos);
+    pos += lineLen; remaining -= lineLen;
+
+    SIZE_T totalLen = (SIZE_T)(pos - buf);
+
+    // Build file path: \??\C:\temp\npu_csr_<tag>.log
+    WCHAR pathBuf[256];
+    RtlStringCbPrintfW(pathBuf, sizeof(pathBuf),
+        L"\\??\\C:\\temp\\npu_csr_%hs.log", tag);
+    UNICODE_STRING filePath;
+    RtlInitUnicodeString(&filePath, pathBuf);
+
+    OBJECT_ATTRIBUTES oa;
+    InitializeObjectAttributes(&oa, &filePath,
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+    HANDLE hFile = NULL;
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS st = ZwCreateFile(&hFile, GENERIC_WRITE | SYNCHRONIZE,
+        &oa, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ, FILE_OVERWRITE_IF,
+        FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE,
+        NULL, 0);
+    if (NT_SUCCESS(st)) {
+        st = ZwWriteFile(hFile, NULL, NULL, NULL, &iosb,
+            buf, (ULONG)totalLen, NULL, NULL);
+        ZwClose(hFile);
+        DbgPrint("[CSR@%s] wrote %llu bytes to C:\\temp\\npu_csr_%s.log (status=0x%08x)\n",
+            tag, (UINT64)totalLen, tag, st);
+    } else {
+        DbgPrint("[CSR@%s] ZwCreateFile failed status=0x%08x — does C:\\temp exist?\n",
+            tag, st);
+    }
+
+    ExFreePoolWithTag(buf, 'CSRD');
 }
 
 VOID arm_tile_and_engiend(void* bar2, PDEVICE_CONTEXT pDc) {
@@ -379,10 +517,18 @@ VOID npudriverEvtIoDeviceControl(
 				apex_read_register(bar2, APEX_REG_TILE_CONFIG0));
 		}
 		
-		// 왜 한줄에 하나씩 전부 키는건가? 
-		// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로, 
-		// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다. 
-		//																		// 엔진 종류			
+		// === EXPERIMENT 2026-05-16: per-IOCTL engine re-arm 비활성화 ===
+		// libedgetpu는 DoOpen → DoRunControl(kMoveToRun) 에서 init 시 1회만 RUN_CONTROL=1.
+		// user는 매 IOCTL_INFER_NEW 마다 15개 재무장 → BeforeSubmit CSR diff에서
+		// scalar_core 엔진 status 블록 ~30개 offset divergence 유발 (0x400C8 saturated 등).
+		// 가설: 이 재무장이 score-branch tile 의 잘못된 state 를 만든다.
+		// 검증: 이 블록 비활성화 후 convert_scores 가 `ff 00 80 80` 에서 바뀌면 원인 확정.
+		// 되돌리려면 `#if 0` → `#if 1`. init 시 arm 은 Device.c:757-792 가 담당.
+#if 0
+		// 왜 한줄에 하나씩 전부 키는건가?
+		// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로,
+		// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다.
+		//																		// 엔진 종류
 		apex_write_register(bar2, APEX_REG_SCALAR_RUN_CONTROL, 1);			// Scalar Core, 제어 흐름 / 주소 계산 담당 스칼라 프로세서 기동
 		apex_write_register(bar2, APEX_REG_AVDATA_POP_RUN_CONTROL, 1);		// Activation	activation 데이터를 narrow memory -> 연산 유닛으로 push
 		apex_write_register(bar2, APEX_REG_PARAMETER_POP_RUN_CONTROL, 1);	// 가중치(Weights)를 parameter memory -> MAC array로 push
@@ -399,6 +545,9 @@ VOID npudriverEvtIoDeviceControl(
 		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);	// 호스트가 ring으로 보낸 명령 소비 엔진 #1
 		apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL, 1);	// 칩이 호스트로 완료/응답을 보내는 ring 송신 엔진
 		KeStallExecutionProcessor(1000); // 1ms settle
+#else
+		DbgPrint("[INFER_NEW] EXPERIMENT: per-IOCTL RUN_CONTROL re-arm SKIPPED (rely on init-time arm in Device.c)\n");
+#endif
 
 		if (pDc->StatusBlockBase != NULL) {
 			PUCHAR base = (PUCHAR)pDc->StatusBlockBase;
@@ -620,7 +769,8 @@ VOID npudriverEvtIoDeviceControl(
 
 			ALLOC_IO_SLOT* exe1Slot = &pDc->IOSlots[IO_SLOT_EXE1_BS];
 			if (exe1Slot->Kva != NULL && exe1Slot->Size > 0) {
-				//ApexDumpCsrRegions(pDc, "BeforeSubmit");
+				npudriverDumpPciAer(device, "BeforeSubmit");
+				ApexDumpCsrRegions(pDc, "BeforeSubmit");
 				UINT32 slot1 = pDc->DescRingTail % 256;
 				ring[slot1].address = exe1Slot->DeviceVa;
 				ring[slot1].size_in_bytes = (UINT32)exe1Slot->ActualSize;
@@ -649,7 +799,33 @@ VOID npudriverEvtIoDeviceControl(
 					break;
 				}
 
-				//ApexDumpCsrRegions(pDc, "AfterIssueDmas");
+				// === EXE1-POPCOUNT (2026-05-16) =================================
+				// CSR diff vs libedgetpu showed user does only ~3085 PARAMETER_POPs
+				// across exe1+exe0 vs libedgetpu's ~30444 (10× difference) — likely
+				// only bbox weights cached, score weights never popped.
+				// This dump isolates whether exe1 alone is short-popping, OR whether
+				// the shortfall is in exe0.
+				// Expected libedgetpu-equivalent value at this point: ~30444 (0x76ec)
+				// If we see ~3085 (0x0c0d) here → exe1 itself is early-stopping
+				// If we see ~30444 here → exe1 OK, problem is exe0 phase
+				{
+					UINT64 popParam   = apex_read_register(bar2, 0x44058);  // SyncCounter_PARAMETER_POP
+					UINT64 popAvdata  = apex_read_register(bar2, 0x44050);  // SyncCounter_AVDATA_POP
+					UINT64 infParam   = apex_read_register(bar2, 0x44068);  // SyncCounter_PARAMETER_INFEED
+					UINT64 infAvdata  = apex_read_register(bar2, 0x44060);  // SyncCounter_AVDATA_INFEED
+					UINT64 infScalar  = apex_read_register(bar2, 0x44070);  // SyncCounter_SCALAR_INFEED
+					UINT64 outRing    = apex_read_register(bar2, 0x44088);  // SyncCounter_RING_OUTFEED
+					UINT64 curPc      = apex_read_register(bar2, 0x44028);  // currentPc
+					UINT64 popStart   = apex_read_register(bar2, 0x441c0);  // parameterPopStartCycle
+					UINT64 popEnd     = apex_read_register(bar2, 0x441c8);  // parameterPopEndCycle
+					UINT64 popPc      = apex_read_register(bar2, 0x441d0);  // parameterPopProgramCounter
+					DbgPrint("[EXE1-POPCOUNT] PARAM_POP=0x%llx (%llu)  PARAM_INFEED=0x%llx  AVDATA_POP=0x%llx  AVDATA_INFEED=0x%llx  SCALAR_INFEED=0x%llx  RING_OUTFEED=0x%llx\n",
+						popParam, popParam, infParam, popAvdata, infAvdata, infScalar, outRing);
+					DbgPrint("[EXE1-POPCOUNT] currentPc=0x%llx  paramPop_Start=0x%llx  paramPop_End=0x%llx  paramPop_ProgCnt=0x%llx\n",
+						curPc, popStart, popEnd, popPc);
+				}
+
+				npudriverDumpPciAer(device, "AfterIssueDmas");
 
 				// === [SENTINEL] exe1 캐싱 후 host PARAM 영역 wipe ===
 				// 가설 검증: 칩이 PARAMETER_CACHING 으로 weight 를 자기 SRAM 으로 copy 했다면,
@@ -748,6 +924,7 @@ VOID npudriverEvtIoDeviceControl(
 			KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록'
 
 			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
+			ApexDumpCsrRegions(pDc, "AfterIssueDmas");
 		}
 
 		// sc_host_int_count 스냅샷 - 완료 판정 기준선
@@ -779,6 +956,8 @@ VOID npudriverEvtIoDeviceControl(
 			status = STATUS_IO_TIMEOUT;
 			break;   // 슬롯 unlock은 IOCTL_FREE_IO_BUFFERS / FileCleanup 책임
 		}
+
+		ApexDumpCsrRegions(pDc, "AfterExecution");
 
 		// post-wait 진단
 		// dpc는 터미널 상태 도달만 알리고, success / failure 판정은 ioctl 책임
@@ -909,7 +1088,7 @@ VOID npudriverEvtIoDeviceControl(
 
 		// 정상 - dpc 가 (allIdle && scHostSeen) 게이트 통과해서 깨운 경우
 		DbgPrint("[INFER_NEW] inference complete via IRQ (ISR fires=%d)\n", pDc->IsrCallCount);
-		//ApexDumpCsrRegions(pDc, "AfterExecution");
+		npudriverDumpPciAer(device, "AfterExecution");
 		break;
 	}
 	case IOCTL_INFER:
@@ -2458,7 +2637,7 @@ VOID npudriverEvtIoDeviceControl(
 	case IOCTL_ALLOC_IO_BUFFERS:
 	{
 		DbgPrint("IOCTL_ALLOC_IO_BUFFERS Start!\n");
-		//ApexDumpCsrRegions(DeviceGetContext(device), "AfterOpen");
+		npudriverDumpPciAer(device, "AfterOpen");
 		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
 		WDFMEMORY inMem, outMem;
 		IOCTL_ALLOC_IO_BUFFERS_IN* pIn = NULL;

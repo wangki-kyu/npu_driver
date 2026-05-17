@@ -235,6 +235,38 @@ static void dump_param(const char* label, const void* data, size_t n) {
     dump_buffer("PARAM-DUMP", label, data, n);
 }
 
+// libedgetpu /driver/instruction_buffers.cc::LinkInstructionBuffers (line 119-141)
+// 의 [LINKED-BS] 와 line-by-line diff 가능한 format 으로 patched bitstream
+// 전체를 파일에 dump. tag = "exe1" / "exe0".
+// 출력 경로: C:\temp\bitstream_full_<tag>.log (덮어쓰기).
+// 같은 chunk size 면 libedgetpu 의 [LINKED-BS chunk=0] 첫 dump (exe1) 와
+// 두 번째 dump (exe0) 를 grep 으로 추출해서 line-by-line diff 가능.
+static void DumpBitstreamFullToFile(const char* tag, const uint8_t* bs, size_t bs_size) {
+    char path[256];
+    snprintf(path, sizeof(path), "C:\\temp\\bitstream_full_%s.log", tag);
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) {
+        printf("[BITSTREAM-FULL] FAILED to open %s\n", path);
+        return;
+    }
+    fprintf(f, "[BITSTREAM-FULL] user chunk=%s size=%zu (bytes) -- full hex dump follows\n",
+            tag, bs_size);
+    for (size_t off = 0; off < bs_size; off += 16) {
+        char hex_part[3 * 16 + 2] = {0};
+        char asc_part[16 + 1] = {0};
+        size_t row_len = (bs_size - off >= 16) ? 16 : (bs_size - off);
+        for (size_t k = 0; k < row_len; ++k) {
+            uint8_t b = bs[off + k];
+            snprintf(hex_part + k * 3, 4, "%02x ", b);
+            asc_part[k] = (b >= 0x20 && b < 0x7f) ? (char)b : '.';
+        }
+        fprintf(f, "[BITSTREAM-FULL] user chunk=%s off=0x%04zx  %-48s |%s|\n",
+                tag, off, hex_part, asc_part);
+    }
+    fclose(f);
+    printf("[BITSTREAM-FULL] wrote %zu bytes hex to %s\n", bs_size, path);
+}
+
 static const uint64_t VA_INPUT = 0x001000ULL;  // PTE[1..75]      input           ★ 0 금지
 static const uint64_t VA_OUTPUT = 0x100000ULL;  // PTE[256..]     output          INPUT 너머
 static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch         OUTPUT 너머
@@ -245,8 +277,27 @@ static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch       
 //     → L1_idx=0..2 차지 (3개 region, L2 sub-table 시작이 ExtPool[0])
 //   exe0 PARAM      (197440B,    49 pages): libedgetpu = 0x8000000000800000
 //     → L1_idx=4 단일 region (exe1 과 충돌 없음)
-static const uint64_t VA_EXE1_PARAM_DATA = 0x8000000000000000ULL;  // ext L1_idx=0..3
-static const uint64_t VA_EXE0_PARAM_DATA = 0x8000000000800000ULL;  // ext L1_idx=4
+// 2026-05-17 EXPERIMENT: PARAM 도 simple VA 로 이전.
+// libedgetpu (simple-only force 빌드, edgetpu_20260517_232349.log) 에서
+// PARAM 도 simple PT 로 매핑했을 때 chip 정상 동작 확인됨 (score=0.9961).
+// 우리 driver 의 extended PT 구현 의심 → 같은 path 통일.
+//
+// Simple PTE 충돌 회피 (기존 사용 영역):
+//   PTE[1..75]      input          (VA 0x001000)
+//   PTE[256..259]   output         (VA 0x100000)
+//   PTE[384..432]   scratch        (VA 0x180000)
+//   PTE[2048]       exe0_bs_phase1 (VA 0x800000)
+//   PTE[2112..2114] param_bitstream(VA 0x840000)
+//   PTE[2304..2352] infer_bitstream(VA 0x900000)
+//
+// PARAM 배치 (충돌 없는 빈 영역):
+//   exe1 PARAM 1500 pages → PTE[512..2011]   = VA 0x00200000 ~ 0x007DC000
+//   exe0 PARAM   49 pages → PTE[2560..2608]  = VA 0x00A00000 ~ 0x00A31000
+//
+// Memory.c::ApexAllocateAndMapIoBuffer (line 202) 가 (VA & bit63) == 0 이면
+// 자동으로 simple PTE write path 로 분기하므로 driver 측 코드 변경 불필요.
+static const uint64_t VA_EXE1_PARAM_DATA = 0x00200000ULL;  // simple PTE[512..2011]
+static const uint64_t VA_EXE0_PARAM_DATA = 0x00A00000ULL;  // simple PTE[2560..2608]
 static const uint64_t VA_PARAM_BITSTREAM = 0x840000ULL;  // PTE[2112..2114] exe1 bitstream
 static const uint64_t VA_INFER_BITSTREAM = 0x900000ULL;  // PTE[2304..2352] exe0 bitstream
 static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern
@@ -557,6 +608,15 @@ int main(int argc, char** argv)
     apex_fb::DumpChipVisibleBitstream("exe0", pInferBitstream, model.patches);
     if (isExistParam)
         apex_fb::DumpChipVisibleBitstream("exe1", pParamBitstream, model.param_patches);
+
+    // 2026-05-17: post-patch + post-memcpy chip-bound bytes 전체 hex dump 를
+    // 파일로 저장. libedgetpu 의 [LINKED-BS] 와 line-by-line diff 가능.
+    if (isExistParam) {
+        DumpBitstreamFullToFile("exe1",
+            (const uint8_t*)pParamBitstream, model.param_bitstream.size());
+    }
+    DumpBitstreamFullToFile("exe0",
+        (const uint8_t*)pInferBitstream, model.bitstream.size());
 
     // ========================================================================
     // [PATCH-DUMP] libedgetpu 와 비교용 한 줄 형식.

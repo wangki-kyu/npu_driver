@@ -110,12 +110,12 @@ typedef struct _DEVICE_CONTEXT
 	KEVENT InferCompleteEvent;           // Event for inference completion
 
 	// Instruction queue descriptor ring (PTE slot 4096, deviceVA=0x1000000 — working trace)
-	PVOID   DescRingBase;        // kernel VA (NonPagedPoolNx, 4KB)
+	PVOID   DescRingBase;        // kernel VA (MmNonCached contiguous, 4KB) — DMA-coherent
 	UINT64  DescRingDeviceVA;    // device virtual address seen by hardware
 	UINT32  DescRingTail;        // monotonic submitted descriptor count
 
 	// Status block (hardware DMA-writes completion info here, PTE slot 4097, deviceVA=0x1001000 — working trace)
-	PVOID   StatusBlockBase;     // kernel VA (NonPagedPoolNx, 4KB)
+	PVOID   StatusBlockBase;     // kernel VA (MmNonCached contiguous, 4KB) — DMA-coherent
 	UINT64  StatusBlockDeviceVA; // device virtual address seen by hardware
 
 	// ISR diagnostic counter (incremented on every ISR call, including spurious)

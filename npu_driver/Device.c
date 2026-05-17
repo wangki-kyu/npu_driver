@@ -370,6 +370,25 @@ npudriverEvtDevicePrepareHardware(
 			__FUNCTION__, scu3After);
 	}
 
+	// 2026-05-16 FIX: gasket apex_set_performance_expectation (apex_driver.c:558-611)
+	// PerformanceExpectation_MAX spec for SCU_3 [31:28] (4-bit RMW):
+	//   rg_gcb_clk_div    = 0   (bits 28-29, GCB 500 MHz)
+	//   rg_axi_clk_fixed  = 0   (bit 30, AXI 250 MHz)  ← chip POR is 1 (125 MHz, HALF)
+	//   rg_8051_clk_fixed = 1   (bit 31, 8051 250 MHz, PCIe ignores)
+	//   field value = 0b1000 = 0x8
+	// libedgetpu 'DoOpen' calls APEX_IOCTL_PERFORMANCE_EXPECTATION which routes to
+	// gasket(Linux) / coral.sys(Windows). Both run this exact RMW. Our driver
+	// previously left chip POR (AXI 125MHz) intact → half AXI throughput between
+	// PARAM SRAM and MAC array → score-branch (weight-heavy) saturates.
+	{
+		UINT32 before = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+		apex_rmw_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3,
+			0x8, /*mask_width=*/4, /*mask_shift=*/28);
+		UINT32 readback = apex_read_register_32(deviceContext->Bar2BaseAddress, APEX_REG_SCU_3);
+		DbgPrint("[%s] quit_reset: SCU_3 PERF_MAX (gasket spec, AXI=250MHz) — before=0x%08x readback=0x%08x\n",
+			__FUNCTION__, before, readback);
+	}
+
 	// 추가 sanity (gasket 에 없지만 user 가 기존에 했던 verification — 유지):
 	// reset 이 정말 release 됐는지 SCALAR_RUN_CONTROL == 0 으로 한 번 더 확인.
 	{
@@ -569,10 +588,17 @@ npudriverEvtDevicePrepareHardware(
 
 	// Allocate descriptor ring (4KB = 256 slots * 16 bytes each)
 	// Maps to PTE slot 4096 (working trace), device VA = 4096 * 4KB = 0x1000000 (simple slot)
-	#pragma warning(push)
-	#pragma warning(disable:4996)
-	deviceContext->DescRingBase = ExAllocatePoolWithTag(NonPagedPoolNx, PAGE_SIZE, 'DRNG');
-	#pragma warning(pop)
+	// 2026-05-18: NonPagedPoolNx (cacheable) → MmNonCached contiguous (DMA-coherent).
+	// libedgetpu/coral.sys 는 ring/status block 을 dma_alloc_coherent 등가 path 로 잡음.
+	// cacheable 일 때 chip 이 fetch 하는 16B descriptor 가 CPU cache 와 sync 안 될 위험.
+	{
+		PHYSICAL_ADDRESS lo, hi, none;
+		lo.QuadPart = 0;
+		hi.QuadPart = 0xFFFFFFFFLL;   // < 4GB. chip MMU 32-bit PA 제약.
+		none.QuadPart = 0;
+		deviceContext->DescRingBase = MmAllocateContiguousMemorySpecifyCache(
+			PAGE_SIZE, lo, hi, none, MmNonCached);
+	}
 	if (deviceContext->DescRingBase == NULL) {
 		DbgPrint("[%s] Failed to allocate descriptor ring\n", __FUNCTION__);
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -596,13 +622,20 @@ npudriverEvtDevicePrepareHardware(
 
 	// Allocate status block (4KB) — hardware DMA-writes completion info here
 	// Maps to PTE slot 4097 (working trace), device VA = 4097 * 4KB = 0x1001000 (simple slot)
-	#pragma warning(push)
-	#pragma warning(disable:4996)
-	deviceContext->StatusBlockBase = ExAllocatePoolWithTag(NonPagedPoolNx, PAGE_SIZE, 'SBLK');
-	#pragma warning(pop)
+	// 2026-05-18: NonPagedPoolNx → MmNonCached contiguous. chip 이 여기에 DMA write 하는
+	// completion_head_pointer 를 CPU 가 cache 에서 stale 0 으로 읽으면 inference 완료
+	// 감지 못함 → output 미반영 / bias-only 출력 가능.
+	{
+		PHYSICAL_ADDRESS lo, hi, none;
+		lo.QuadPart = 0;
+		hi.QuadPart = 0xFFFFFFFFLL;
+		none.QuadPart = 0;
+		deviceContext->StatusBlockBase = MmAllocateContiguousMemorySpecifyCache(
+			PAGE_SIZE, lo, hi, none, MmNonCached);
+	}
 	if (deviceContext->StatusBlockBase == NULL) {
 		DbgPrint("[%s] Failed to allocate status block\n", __FUNCTION__);
-		ExFreePoolWithTag(deviceContext->DescRingBase, 'DRNG');
+		MmFreeContiguousMemory(deviceContext->DescRingBase);
 		deviceContext->DescRingBase = NULL;
 		return STATUS_INSUFFICIENT_RESOURCES;
 	}
@@ -635,12 +668,31 @@ npudriverEvtDevicePrepareHardware(
 		APEX_REG_INSTR_QUEUE_STATUS_BLOCK, deviceContext->StatusBlockDeviceVA);
 	apex_write_register(deviceContext->Bar2BaseAddress,
 		APEX_REG_INSTR_QUEUE_SIZE,         256);
-	apex_write_register(deviceContext->Bar2BaseAddress,
-		APEX_REG_INSTR_QUEUE_DESC_SIZE,    16);  // sizeof(HOST_QUEUE_DESC) = 8+4+4
-	apex_write_register(deviceContext->Bar2BaseAddress,
-		APEX_REG_INSTR_QUEUE_TAIL,         0);
-	deviceContext->DescRingTail = 0;  // sync sw counter with hw TAIL reset
-	DbgPrint("[%s] Instruction queue configured: BASE=0x%llx STATUS_BLOCK=0x%llx SIZE=256 DESC_SIZE=16 TAIL=0\n",
+	// 2026-05-16 EXPERIMENT: REMOVE INSTR_QUEUE_DESC_SIZE write.
+	// libedgetpu host_queue.h:286 READS this register (treats as chip-declared
+	// expected size) and verifies it equals sizeof(Element)=16, then proceeds.
+	// libedgetpu does NOT write it. Chip POR is 16 on Beagle, so write of 16
+	// looks like a no-op, but if the register is read-only or has side effects
+	// (e.g. resets the queue's HEAD/internal fetch pointer), we'd be putting
+	// chip into a different state than libedgetpu. Test by leaving it untouched.
+	{
+		UINT64 chipDescSize = apex_read_register(deviceContext->Bar2BaseAddress,
+			APEX_REG_INSTR_QUEUE_DESC_SIZE);
+		DbgPrint("[%s] INSTR_QUEUE_DESC_SIZE chip POR readback=0x%llx (write SKIPPED)\n",
+			__FUNCTION__, chipDescSize);
+	}
+	// 2026-05-16 EXPERIMENT: REMOVE INSTR_QUEUE_TAIL=0 reset.
+	// libedgetpu does not write TAIL during HostQueue::Open. Chip POR is 0 already,
+	// so this write is also a no-op, but if it resets chip-internal fetch state
+	// in a way that diverges from libedgetpu, that could matter.
+	{
+		UINT64 chipTail = apex_read_register(deviceContext->Bar2BaseAddress,
+			APEX_REG_INSTR_QUEUE_TAIL);
+		DbgPrint("[%s] INSTR_QUEUE_TAIL chip POR readback=0x%llx (write SKIPPED)\n",
+			__FUNCTION__, chipTail);
+		deviceContext->DescRingTail = (UINT32)chipTail;  // sync sw counter to chip
+	}
+	DbgPrint("[%s] Instruction queue configured: BASE=0x%llx STATUS_BLOCK=0x%llx SIZE=256 (DESC_SIZE/TAIL left at chip POR)\n",
 		__FUNCTION__, deviceContext->DescRingDeviceVA, deviceContext->StatusBlockDeviceVA);
 
 	// Verify both ring PTEs are valid before enabling queue
@@ -906,21 +958,19 @@ npudriverEvtDevicePrepareHardware(
 			c0, c1, c2, c3);
 	}
 
-	// EXPERIMENT: enable OUTPUT_ACTV queue.  Per-queue dump showed:
-	//   [Q@out_actv] control=0x0  ← only OUTPUT queue is disabled
-	//   [Q@in_actv]  control=0x3  (enable + sb_wr_enable, auto)
-	//   [Q@param]    control=0x3  (enable + sb_wr_enable, auto)
-	// Hypothesis: chip emits outbound writes for OUTFEED but they need an enabled
-	// OUTPUT_ACTV queue to reach host RAM.  Match input_actv/param queues' default
-	// 0x3 (enable bit0 + sb_wr_enable bit1).
+	// EXPERIMENT 2026-05-16: REMOVE OUTQ_CONTROL=0x3 write.
+	// libedgetpu init-phase dynamic write trace (edgetpu_20260516_144353.log line 1-139)
+	// shows ZERO writes to OUTQ_CONTROL — libedgetpu leaves chip POR (= disabled)
+	// throughout init, yet still receives outfeed results correctly.
+	// Hypothesis: forcing OUTQ_CONTROL=0x3 puts chip into a different outfeed
+	// routing mode that causes 1/5 throughput + score-branch saturation. Test by
+	// leaving register untouched (read-only diagnostic to confirm POR state).
 	{
 		PVOID b2 = deviceContext->Bar2BaseAddress;
 		UINT32 outqBefore = apex_read_register_32(b2, APEX_REG_OUTQ_CONTROL);
-		apex_write_register_32(b2, APEX_REG_OUTQ_CONTROL, 0x3);
-		UINT32 outqAfter = apex_read_register_32(b2, APEX_REG_OUTQ_CONTROL);
-		UINT32 outqStat  = apex_read_register_32(b2, APEX_REG_OUTQ_STATUS);
-		DbgPrint("[Q@out_actv] enabled: control before=0x%x wrote=0x3 after=0x%x status=0x%x\n",
-			outqBefore, outqAfter, outqStat);
+		UINT32 outqStat   = apex_read_register_32(b2, APEX_REG_OUTQ_STATUS);
+		DbgPrint("[Q@out_actv] OUTQ_CONTROL write SKIPPED — readback before=0x%x status=0x%x (POR)\n",
+			outqBefore, outqStat);
 	}
 
 	// === PER-QUEUE CSR DUMP — diagnose chip-expected descriptor sizes & queue states ===
@@ -1111,11 +1161,11 @@ npudriverEvtDeviceReleaseHardware(
 	ApexPageTableCleanup(Device);
 
 	if (deviceContext->DescRingBase != NULL) {
-		ExFreePoolWithTag(deviceContext->DescRingBase, 'DRNG');
+		MmFreeContiguousMemory(deviceContext->DescRingBase);
 		deviceContext->DescRingBase = NULL;
 	}
 	if (deviceContext->StatusBlockBase != NULL) {
-		ExFreePoolWithTag(deviceContext->StatusBlockBase, 'SBLK');
+		MmFreeContiguousMemory(deviceContext->StatusBlockBase);
 		deviceContext->StatusBlockBase = NULL;
 	}
 	if (deviceContext->Bar2BaseAddress != NULL) {
