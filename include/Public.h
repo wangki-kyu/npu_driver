@@ -39,8 +39,12 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
     UINT64 InputSize;       // bytes (0 = skip)
     UINT64 InputDeviceVA;       // chip device VA (4 KB align). extended VA 권장.
-    UINT64 OutputSize;
-    UINT64 OutputDeviceVA;
+    // ★ 2026-05-18: OUTPUT 을 두 별도 slot 으로 분리 — libedgetpu 처럼.
+    // bbox (Squeeze1) 와 score (convert_scores) 가 별도 PA range, 별도 base VA.
+    UINT64 OutputBboxSize;
+    UINT64 OutputBboxDeviceVA;
+    UINT64 OutputScoreSize;
+    UINT64 OutputScoreDeviceVA;
     UINT64 ScratchSize;
     UINT64 ScratchDeviceVA; // 0 + ScratchSize = 0 이면 skip
     UINT64 Exe0BitstreamSize;
@@ -56,14 +60,16 @@ typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
 
 typedef struct _IOCTL_ALLOC_IO_BUFFERS_OUT {
     UINT64 InputUserVA;      // 호출한 process 의 user-mode VA
-    UINT64 OutputUserVA;
+    UINT64 OutputBboxUserVA;
+    UINT64 OutputScoreUserVA;
     UINT64 ScratchUserVA;
     UINT64 Exe0BitStreamUserVA;
     UINT64 ParamDataUserVA;
     UINT64 Exe1BitstreamUserVA;
     UINT64 Exe0ParamUserVA;
     UINT64 InputPa;          // (디버그용) 첫 페이지 PA contiguous 라 한 개로 충분.
-    UINT64 OutputPa;
+    UINT64 OutputBboxPa;
+    UINT64 OutputScorePa;
     UINT64 ScratchPa;
     UINT64 Exe0BitstreamPa;
     UINT64 ParamDataPa;
@@ -83,10 +89,14 @@ typedef struct {
 typedef struct IOCTL_INFER_INFO {
     UINT64 InputImageAddr;    // userspace VA of input image
     UINT64 InputImageSize;    // size in bytes
-    UINT64 OutputBufferAddr;  // userspace VA of output buffer
-    UINT64 OutputBufferSize;  // size in bytes
-    UINT64 InputDeviceVA;     // device VA for PTE registration (PAGE_ALIGN_UP(bitstream_size))
-    UINT64 OutputDeviceVA;    // device VA for PTE registration (InputDeviceVA + PAGE_ALIGN_UP(InputImageSize))
+    // ★ 2026-05-18: OUTPUT 두 별도 — libedgetpu 처럼 bbox/score 별도 base VA + PA range.
+    UINT64 OutputBboxAddr;        // userspace VA of bbox (Squeeze1) output
+    UINT64 OutputBboxSize;
+    UINT64 OutputBboxDeviceVA;
+    UINT64 OutputScoreAddr;       // userspace VA of score (convert_scores) output
+    UINT64 OutputScoreSize;
+    UINT64 OutputScoreDeviceVA;
+    UINT64 InputDeviceVA;     // device VA for input PTE registration
     UINT64 BitstreamDeviceVA; // device VA of bitstream for Instr Queue descriptor (usually 0)
     UINT64 BitstreamSize;     // size of bitstream for Instr Queue descriptor
     UINT64 ScratchAddr;       // userspace VA of scratch buffer (0 if not needed)

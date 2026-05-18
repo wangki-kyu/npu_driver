@@ -347,7 +347,7 @@ VOID npudriverEvtIoDeviceControl(
 		PVOID bar2 = pDc->Bar2BaseAddress;
 		WDFMEMORY inMem;
 		IOCTL_INFER_INFO* pIn = NULL;
-		ALLOC_IO_SLOT* inSlot = NULL, * outSlot = NULL, * scSlot = NULL;
+		ALLOC_IO_SLOT* inSlot = NULL, * outSlotBbox = NULL, * outSlotScore = NULL, * scSlot = NULL;
 		UINT32 i;
 
 		// infeed가 바라보는 실제 값이 존재하는지 체크 
@@ -378,9 +378,10 @@ VOID npudriverEvtIoDeviceControl(
 		if (!NT_SUCCESS(status)) break;
 		pIn = (IOCTL_INFER_INFO*)WdfMemoryGetBuffer(inMem, NULL);
 
-		// simple VA 만 - extended bit 셋이면 즉시 거부 
-		if ((pIn->InputDeviceVA & (1ULL << 63)) ||	// 64 비트가 1이면 extended 영역이라서 그렇게 하는거 .. 
-			(pIn->OutputDeviceVA & (1ULL << 63)) ||
+		// simple VA 만 - extended bit 셋이면 즉시 거부
+		if ((pIn->InputDeviceVA & (1ULL << 63)) ||	// 64 비트가 1이면 extended 영역이라서 그렇게 하는거 ..
+			(pIn->OutputBboxDeviceVA & (1ULL << 63)) ||
+			(pIn->OutputScoreDeviceVA & (1ULL << 63)) ||
 			((pIn->ScratchSize > 0) && (pIn->ScratchDeviceVA & (1ULL << 63)))) {
 			DbgPrint("[INFER_NEW] extended VA not supported in this path\n");
 			status = STATUS_INVALID_PARAMETER;
@@ -395,13 +396,15 @@ VOID npudriverEvtIoDeviceControl(
 			ALLOC_IO_SLOT* s = &pDc->IOSlots[i];
 			if (s->Kva == NULL) continue;
 			if ((UINT64)s->UserVa == pIn->InputImageAddr && s->DeviceVa == pIn->InputDeviceVA) inSlot = s;
-			if ((UINT64)s->UserVa == pIn->OutputBufferAddr && s->DeviceVa == pIn->OutputDeviceVA) outSlot = s;
-			if (pIn->ScratchSize > 0 && 
+			if ((UINT64)s->UserVa == pIn->OutputBboxAddr  && s->DeviceVa == pIn->OutputBboxDeviceVA)  outSlotBbox  = s;
+			if ((UINT64)s->UserVa == pIn->OutputScoreAddr && s->DeviceVa == pIn->OutputScoreDeviceVA) outSlotScore = s;
+			if (pIn->ScratchSize > 0 &&
 				(UINT64)s->UserVa == pIn->ScratchAddr && s->DeviceVa == pIn->ScratchDeviceVA) scSlot = s;
 		}
-		if (!inSlot || !outSlot || (pIn->ScratchSize > 0 && !scSlot)) {
+		if (!inSlot || !outSlotBbox || !outSlotScore || (pIn->ScratchSize > 0 && !scSlot)) {
 			DbgPrint("[INFER_NEW] caller buffer not registered via IOCTL_ALLOC_IO_BUFFERS "
-				"(in=%p out=%p sc=%p)\n", inSlot, outSlot, scSlot);
+				"(in=%p out_bbox=%p out_score=%p sc=%p)\n",
+				inSlot, outSlotBbox, outSlotScore, scSlot);
 			status = STATUS_INVALID_DEVICE_STATE;
 			break;
 		}
@@ -1059,18 +1062,32 @@ VOID npudriverEvtIoDeviceControl(
 			}
 		}
 
-		// output kva로 확인하기 
-		PUCHAR kva = (PUCHAR)pDc->IOSlots[1].Kva;
-		SIZE_T size = pDc->IOSlots[1].Size;
-		if (kva != NULL && size > 0) {
-			DbgPrint("[DPC-OUT-NEW] kva=%p size=%zu first16: "
-				"%02x %02x %02x %02x %02x %02x %02x %02x  "
-				"%02x %02x %02x %02x %02x %02x %02x %02x\n",
-				kva, size,
-				kva[0], kva[1], kva[2], kva[3],
-				kva[4], kva[5], kva[6], kva[7],
-				kva[8], kva[9], kva[10], kva[11],
-				kva[12], kva[13], kva[14], kva[15]);
+		// output kva로 확인하기 — bbox + score 별도 dump (별도 IO slot)
+		{
+			PUCHAR kvaBbox  = (PUCHAR)pDc->IOSlots[IO_SLOT_OUTPUT_BBOX].Kva;
+			SIZE_T sizeBbox = pDc->IOSlots[IO_SLOT_OUTPUT_BBOX].Size;
+			PUCHAR kvaScore  = (PUCHAR)pDc->IOSlots[IO_SLOT_OUTPUT_SCORE].Kva;
+			SIZE_T sizeScore = pDc->IOSlots[IO_SLOT_OUTPUT_SCORE].Size;
+			if (kvaBbox != NULL && sizeBbox > 0) {
+				DbgPrint("[DPC-OUT-NEW] BBOX  kva=%p size=%zu first16: "
+					"%02x %02x %02x %02x %02x %02x %02x %02x  "
+					"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+					kvaBbox, sizeBbox,
+					kvaBbox[0], kvaBbox[1], kvaBbox[2], kvaBbox[3],
+					kvaBbox[4], kvaBbox[5], kvaBbox[6], kvaBbox[7],
+					kvaBbox[8], kvaBbox[9], kvaBbox[10], kvaBbox[11],
+					kvaBbox[12], kvaBbox[13], kvaBbox[14], kvaBbox[15]);
+			}
+			if (kvaScore != NULL && sizeScore > 0) {
+				DbgPrint("[DPC-OUT-NEW] SCORE kva=%p size=%zu first16: "
+					"%02x %02x %02x %02x %02x %02x %02x %02x  "
+					"%02x %02x %02x %02x %02x %02x %02x %02x\n",
+					kvaScore, sizeScore,
+					kvaScore[0], kvaScore[1], kvaScore[2], kvaScore[3],
+					kvaScore[4], kvaScore[5], kvaScore[6], kvaScore[7],
+					kvaScore[8], kvaScore[9], kvaScore[10], kvaScore[11],
+					kvaScore[12], kvaScore[13], kvaScore[14], kvaScore[15]);
+			}
 		}
 
 		// test debug
@@ -1089,6 +1106,25 @@ VOID npudriverEvtIoDeviceControl(
 				base[8], base[9], base[10], base[11], base[12], base[13], base[14], base[15]);
 		}
 
+		// === 검증 B 2026-05-18: PCIe ABM error status readback ===
+		// Phase 6 (TopLevelInterruptManager) 에서 slv/mst ABM 활성화. 만약 chip 의
+		// exe0 PARAM (chip→host master read) 이 silent fail 했다면 mst_rd_err_resp 에
+		// latched 상태. != 0 이면 score-branch bug 의 직접 원인 = DMA error.
+		// = 0 이면 PCIe 자체는 정상 → 다른 가설 (partial fetch / alignment / coherency) 필요.
+		{
+			UINT32 slv_wr = apex_read_register_32(bar2, APEX_REG_SLV_WR_ERR_RESP);
+			UINT32 slv_rd = apex_read_register_32(bar2, APEX_REG_SLV_RD_ERR_RESP);
+			UINT32 mst_wr = apex_read_register_32(bar2, APEX_REG_MST_WR_ERR_RESP);
+			UINT32 mst_rd = apex_read_register_32(bar2, APEX_REG_MST_RD_ERR_RESP);
+			DbgPrint("[PCIE-ABM] slv_wr=0x%08x slv_rd=0x%08x mst_wr=0x%08x mst_rd=0x%08x %s\n",
+				slv_wr, slv_rd, mst_wr, mst_rd,
+				(slv_wr | slv_rd | mst_wr | mst_rd) ? "*** DMA ABORT DETECTED ***" : "(all clean)");
+			if (mst_rd) {
+				DbgPrint("[PCIE-ABM] !!! mst_rd_err_resp=1 → chip→host READ aborted "
+					"(exe0 PARAM fetch silent fail 가설 적중)\n");
+			}
+		}
+
 		// 정상 - dpc 가 (allIdle && scHostSeen) 게이트 통과해서 깨운 경우
 		DbgPrint("[INFER_NEW] inference complete via IRQ (ISR fires=%d)\n", pDc->IsrCallCount);
 		npudriverDumpPciAer(device, "AfterExecution");
@@ -1096,6 +1132,13 @@ VOID npudriverEvtIoDeviceControl(
 	}
 	case IOCTL_INFER:
 	{
+		// ★ 2026-05-18: DEPRECATED — OUTPUT 단일 buffer 기반 legacy path.
+		// 새 path 는 IOCTL_INFER_NEW (OUTPUT bbox/score 두 별도 slot).
+		// 아래 #if 0 body 는 reference 용 (single-output struct field 가 제거됨).
+		DbgPrint("[IOCTL_INFER] DEPRECATED — use IOCTL_INFER_NEW\n");
+		status = STATUS_NOT_SUPPORTED;
+		break;
+#if 0
 		WDFMEMORY inputMemory;
 		IOCTL_INFER_INFO *pInput = NULL;
 		PMDL inputImageMdl = NULL, outputBufferMdl = NULL;
@@ -2465,8 +2508,9 @@ VOID npudriverEvtIoDeviceControl(
 		npudriverDumpPciAer(device, "post-infer");
 
 		break;
+#endif  /* legacy IOCTL_INFER body */
 	}
-	case IOCTL_PARAM_CACHE_NEW: 
+	case IOCTL_PARAM_CACHE_NEW:
 	{
 
 		break;
@@ -2665,7 +2709,8 @@ VOID npudriverEvtIoDeviceControl(
 
 		struct { UINT64 size, devVa; UINT64* outUserVa, * outPa; } req[IO_SLOT_COUNT] = {
 			{ in.InputSize,         in.InputDeviceVA,         &pOut->InputUserVA,         &pOut->InputPa },
-			{ in.OutputSize,        in.OutputDeviceVA,        &pOut->OutputUserVA,        &pOut->OutputPa },
+			{ in.OutputBboxSize,    in.OutputBboxDeviceVA,    &pOut->OutputBboxUserVA,    &pOut->OutputBboxPa },
+			{ in.OutputScoreSize,   in.OutputScoreDeviceVA,   &pOut->OutputScoreUserVA,   &pOut->OutputScorePa },
 			{ in.ScratchSize,       in.ScratchDeviceVA,       &pOut->ScratchUserVA,       &pOut->ScratchPa },
 			{ in.Exe0BitstreamSize, in.Exe0BitstreamDeviceVA, &pOut->Exe0BitStreamUserVA, &pOut->Exe0BitstreamPa },
 			{ in.ParamDataSize,     in.ParamDataDeviceVA,     &pOut->ParamDataUserVA,     &pOut->ParamDataPa },
@@ -2681,9 +2726,10 @@ VOID npudriverEvtIoDeviceControl(
 			PHYSICAL_ADDRESS pa;
 			// buffer 종류 → DMA direction 자동 추론 (coral.sys 가 IOCTL flags 로 받는 것과 동치)
 			UINT32 slotDirection =
-				(i == IO_SLOT_OUTPUT)  ? APEX_DMA_FROM_DEVICE :
-				(i == IO_SLOT_SCRATCH) ? APEX_DMA_BIDIRECTIONAL :
-				                         APEX_DMA_TO_DEVICE;   /* input, bitstream, param */
+				(i == IO_SLOT_OUTPUT_BBOX)  ? APEX_DMA_FROM_DEVICE :
+				(i == IO_SLOT_OUTPUT_SCORE) ? APEX_DMA_FROM_DEVICE :
+				(i == IO_SLOT_SCRATCH)      ? APEX_DMA_BIDIRECTIONAL :
+				                              APEX_DMA_TO_DEVICE;   /* input, bitstream, param */
 
 			if (req[i].size == 0) continue;
 			if (slot->Kva != NULL) {

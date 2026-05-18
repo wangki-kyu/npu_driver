@@ -297,6 +297,30 @@
 #define APEX_REG_SCU_3                      (APEX_REG_SCU_BASE + 0x18)
 #define APEX_REG_AXI_QUIESCE                (APEX_REG_SCU_BASE + 0x2C)
 
+// ========== Top-Level Interrupt Manager CSRs (2026-05-18) ==========
+// libedgetpu BeagleTopLevelInterruptManager::DoEnableInterrupts() 동등.
+// coral.sys 는 omc0_d4/d8 (thermal) 만 처리. 나머지 6개 CSR 은 libedgetpu user-mode 만
+// 처리 → 우리 KMDF 단독에서는 전부 빠짐. 가장 의심: MBIST mask (SRAM 자가검사 결과 무시)
+// 와 PCIe master ABM (chip→host DMA error detection).
+// See driver/beagle/beagle_top_level_interrupt_manager.cc::DoEnableInterrupts.
+#define APEX_REG_OMC0_D4                    0x1A0D4  // thm_warn_en at bit 31
+#define APEX_REG_OMC0_D8                    0x1A0D8  // sd_en at bit 31
+#define APEX_REG_OMC0_DC                    0x1A0DC  // thermal interrupt clear/status
+#define APEX_REG_SCU_CTR_7                  0x1A33C  // bits[19:18]=rg_boot_failure_mask, bit17=usb_sel_failure(W1C), bit16=pll_lock_failure(W1C)
+#define APEX_REG_SLV_ABM_EN                 0x1A500  // PCIe slave abort bus monitor enable
+#define APEX_REG_SLV_ERR_RESP_ISR_MASK      0x1A558  // slave error response ISR mask (0x3=unmask read+write)
+#define APEX_REG_MST_ABM_EN                 0x1A600  // PCIe master abort bus monitor enable (chip→host DMA)
+#define APEX_REG_MST_ERR_RESP_ISR_MASK      0x1A658  // master error response ISR mask (0x3=unmask read+write)
+#define APEX_REG_RAMBIST_CTRL_1             0x1A704  // bits[22:20]=rg_mbist_int_mask, bits[18:16]=rg_mbist_int_status(W1C)
+
+// PCIe error response status (read-only, latched when ABM detects abort)
+// HandlePcieErrorInterrupt 시 비교 — if != 0, DMA path 에 silent abort 발생 증거.
+// 우리 score-branch bug 가 exe0 PARAM (chip→host master DMA read) silent fail 가설 검증용.
+#define APEX_REG_SLV_WR_ERR_RESP            0x1A540  // slave write abort status (read-only)
+#define APEX_REG_SLV_RD_ERR_RESP            0x1A544  // slave read abort status (read-only)
+#define APEX_REG_MST_WR_ERR_RESP            0x1A640  // master (chip→host) write abort status
+#define APEX_REG_MST_RD_ERR_RESP            0x1A644  // master (chip→host) read abort status — exe0 PARAM fetch fail 확인용
+
 // ========== CB Bridge (AXI bridge between Coral host and GCB) ==========
 // libedgetpu beagle_csr_offsets.h: kBeagleCbBridgeCsrOffsets
 // EnableReset 끝에 BULK credit pulse (0xF then 0x0) 가 필요. 안 하면 stale credit

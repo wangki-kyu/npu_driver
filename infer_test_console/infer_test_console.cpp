@@ -16,6 +16,8 @@
 #include "../include/util.hpp"
 #include "../include/Public.h"
 #include "../include/apex_model_fb.hpp"
+#include "../include/apex_postprocess.hpp"
+#include "../include/apex_ssd_postprocess.hpp"
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "windowscodecs.lib")
@@ -267,9 +269,19 @@ static void DumpBitstreamFullToFile(const char* tag, const uint8_t* bs, size_t b
     printf("[BITSTREAM-FULL] wrote %zu bytes hex to %s\n", bs_size, path);
 }
 
-static const uint64_t VA_INPUT = 0x001000ULL;  // PTE[1..75]      input           ★ 0 금지
-static const uint64_t VA_OUTPUT = 0x100000ULL;  // PTE[256..]     output          INPUT 너머
-static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch         OUTPUT 너머
+// ★ 2026-05-18 (방향 A): libedgetpu force-simple log 의 VA 와 byte-identical 매칭.
+//   edgetpu_20260517_232349.log:336276 → INPUT VA = 0x0000000001080080
+//   우리는 page-aligned base (0x01080000) 사용 — chip 의 DMA 가 page+offset 처리.
+static const uint64_t VA_INPUT = 0x01080000ULL;  // PTE[4224..4298]   input (libedgetpu base)
+// ★ 2026-05-18: OUTPUT 두 별도 base — libedgetpu 처럼 bbox/score 가 별도 PA range.
+//   bbox  (Squeeze1)        2 pages → PTE[256..257]   VA 0x100000 ~ 0x101FFF
+//   score (convert_scores)  2 pages → PTE[272..273]   VA 0x110000 ~ 0x111FFF (16KB gap)
+// ★ 2026-05-18 (방향 A): VA_EXE1_PARAM_DATA=0 → PTE[0..1499] 차지하므로 OUTPUT/SCRATCH
+// 가 그 영역과 충돌. driver 가 ALLOC loop 순서대로 PTE 박을 때 PARAM 이 OUTPUT 의 PA 를
+// 덮어쓰면 INFERENCE phase 에서 OUTPUT 가 잘못된 PA 로 매핑됨. 충돌 회피로 이동.
+static const uint64_t VA_OUTPUT_BBOX  = 0x01100000ULL;  // PTE[4352..4353]  (충돌 회피)
+static const uint64_t VA_OUTPUT_SCORE = 0x01102000ULL;  // PTE[4354..4355]  (충돌 회피)
+static const uint64_t VA_SCRATCH      = 0x01200000ULL;  // PTE[4608..]      (충돌 회피, scratch_size > 0 일 때만)
 // PARAM VA — libedgetpu (driver/driver.cc:249 "Mapped params") 와 byte-identical
 // 매칭. 가설: 칩 내부 SRAM 캐싱이 VA bits hash 로 bank addressing 한다면 같은
 // 데이터라도 다른 VA 면 다른 bank 에 캐싱 → 모델이 expect 하는 위치와 mismatch.
@@ -296,8 +308,14 @@ static const uint64_t VA_SCRATCH = 0x180000ULL;  // PTE[384..]    scratch       
 //
 // Memory.c::ApexAllocateAndMapIoBuffer (line 202) 가 (VA & bit63) == 0 이면
 // 자동으로 simple PTE write path 로 분기하므로 driver 측 코드 변경 불필요.
-static const uint64_t VA_EXE1_PARAM_DATA = 0x00200000ULL;  // simple PTE[512..2011]
-static const uint64_t VA_EXE0_PARAM_DATA = 0x00A00000ULL;  // simple PTE[2560..2608]
+// ★ 2026-05-18 (방향 A): libedgetpu force-simple log 의 PARAM VA 와 byte-identical 매칭.
+//   edgetpu_20260517_232349.log:67239 → exe1 PARAM (6,142,720B) VA = 0x0000000000000000
+//   edgetpu_20260517_232349.log:67244 → exe0 PARAM (197,440B)   VA = 0x0000000001040000
+// 가설: chip 내부 SRAM caching 이 VA bits 로 bank addressing → 같은 데이터라도 다른 VA 면
+// 다른 bank 에 caching → score branch 의 weights 가 mismatched bank 에서 fetch.
+// PTE 충돌 회피: VA_INPUT 도 0x01080000 으로 이동해서 PTE[0..1499] 비움.
+static const uint64_t VA_EXE1_PARAM_DATA = 0x00000000ULL;  // simple PTE[0..1499]   (libedgetpu 일치)
+static const uint64_t VA_EXE0_PARAM_DATA = 0x01040000ULL;  // simple PTE[4160..4208] (libedgetpu 일치)
 static const uint64_t VA_PARAM_BITSTREAM = 0x840000ULL;  // PTE[2112..2114] exe1 bitstream
 static const uint64_t VA_INFER_BITSTREAM = 0x900000ULL;  // PTE[2304..2352] exe0 bitstream
 static const uint64_t VA_EXE0_BITSTREAM_PHASE1 = 0x800000ULL;  // libedgetpu pattern
@@ -385,15 +403,25 @@ int main(int argc, char** argv)
     void* pExe0Phase1Bs = nullptr; // exe0 bitstream copy mapped during Phase1
     void* pInferBitstream = nullptr; // exe0 bitstream (patched) for INFER mapping
     void* pInputBuf = nullptr;
-    void* pOutputBuf = nullptr;
+    void* pOutputBboxBuf = nullptr;
+    void* pOutputScoreBuf = nullptr;
     void* pScratchBuf = nullptr;
+
+    // ★ 2026-05-18 (방향 A): libedgetpu force-simple 의 OUTPUT size = raw 8136 (8KB 미만).
+    // PageAlignUp 제거 — driver 자체 page-align 하므로 alloc 영향 동일, IOCTL 의 size 가 일치.
+    const SIZE_T OUTPUT_BBOX_SIZE  = (model.output_layers.size() >= 1)
+        ? model.output_layers[0].size_bytes : 0x2000;
+    const SIZE_T OUTPUT_SCORE_SIZE = (model.output_layers.size() >= 2)
+        ? model.output_layers[1].size_bytes : 0x2000;
 
     IOCTL_ALLOC_IO_BUFFERS_IN allocIn = {};
     IOCTL_ALLOC_IO_BUFFERS_OUT allocOut = {};
     allocIn.InputSize = INPUT_SIZE;
     allocIn.InputDeviceVA = VA_INPUT;
-    allocIn.OutputSize = OUTPUT_SIZE;
-    allocIn.OutputDeviceVA = VA_OUTPUT;
+    allocIn.OutputBboxSize      = OUTPUT_BBOX_SIZE;
+    allocIn.OutputBboxDeviceVA  = VA_OUTPUT_BBOX;
+    allocIn.OutputScoreSize     = OUTPUT_SCORE_SIZE;
+    allocIn.OutputScoreDeviceVA = VA_OUTPUT_SCORE;
     allocIn.ScratchSize = SCRATCH_SIZE;
     allocIn.ScratchDeviceVA = (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0;
     allocIn.Exe0BitstreamSize = EX0_BITSTREAM_SIZE;
@@ -422,7 +450,8 @@ int main(int argc, char** argv)
     }
 
     pInputBuf = (void*)allocOut.InputUserVA;
-    pOutputBuf = (void*)allocOut.OutputUserVA;
+    pOutputBboxBuf  = (void*)allocOut.OutputBboxUserVA;
+    pOutputScoreBuf = (void*)allocOut.OutputScoreUserVA;
     pScratchBuf = (SCRATCH_SIZE > 0) ? (void*)allocOut.ScratchUserVA : nullptr;
     pInferBitstream = (void*)allocOut.Exe0BitStreamUserVA;
 
@@ -553,7 +582,7 @@ int main(int argc, char** argv)
 
         // === DIAGNOSTIC ===
         //memset(pParamData, 0x00, model.parameters.size());          // weight 를 전부 0 으로
-        //memset(pExe0ParamData, 0x00, model.exe0_parameters.size()); // exe0 보조도 0
+        //memset(pExe0ParamData, 0xcc, model.exe0_parameters.size()); // exe0 보조도 0
         // ==================
     }
 
@@ -590,7 +619,15 @@ int main(int argc, char** argv)
         dump("[CHIP after memcpy byte 0x40..0x5f]",
             (uint8_t*)allocOut.Exe1BitstreamUserVA + 0x40, 0x20);
 
-        apex_fb::PatchVAs(model, VA_INPUT, VA_OUTPUT, VA_EXE0_PARAM_DATA,
+        // ★ OUTPUT 두 별도 base VA (bbox + score) — libedgetpu 처럼.
+        std::map<std::string, uint64_t> output_vas_map;
+        if (model.output_layers.size() >= 1) {
+            output_vas_map[model.output_layers[0].name] = VA_OUTPUT_BBOX;   // Squeeze1
+        }
+        if (model.output_layers.size() >= 2) {
+            output_vas_map[model.output_layers[1].name] = VA_OUTPUT_SCORE;  // convert_scores
+        }
+        apex_fb::PatchVAs(model, VA_INPUT, output_vas_map, VA_EXE0_PARAM_DATA,
                           (SCRATCH_SIZE > 0) ? VA_SCRATCH : 0);
         apex_fb::DumpPatchedVAs(model);
         memcpy((void*)allocOut.Exe0BitStreamUserVA, model.bitstream.data(), model.bitstream.size());
@@ -694,7 +731,8 @@ int main(int argc, char** argv)
 
     // output/scratch 를 sentinel 로 채움 — chip 이 실제로 덮은 byte 와 안 덮은 byte 구분.
     // 0xCC/0xAA 는 chip outfeed 결과로 자연스럽게 나오기 어려운 값. 잔존 시 "chip 안 씀" 신호.
-    memset(pOutputBuf, 0xCC, OUTPUT_SIZE);
+    memset(pOutputBboxBuf,  0xCC, OUTPUT_BBOX_SIZE);
+    memset(pOutputScoreBuf, 0xCC, OUTPUT_SCORE_SIZE);
     if (pScratchBuf) memset(pScratchBuf, 0xAA, SCRATCH_SIZE);
 
     // -------------------------------------------------------------------------
@@ -704,10 +742,13 @@ int main(int argc, char** argv)
         IOCTL_INFER_INFO ii = {};
         ii.InputImageAddr = (UINT64)pInputBuf;
         ii.InputImageSize = INPUT_SIZE;
-        ii.OutputBufferAddr = (UINT64)pOutputBuf;
-        ii.OutputBufferSize = OUTPUT_SIZE;
+        ii.OutputBboxAddr      = (UINT64)pOutputBboxBuf;
+        ii.OutputBboxSize      = OUTPUT_BBOX_SIZE;
+        ii.OutputBboxDeviceVA  = VA_OUTPUT_BBOX;
+        ii.OutputScoreAddr     = (UINT64)pOutputScoreBuf;
+        ii.OutputScoreSize     = OUTPUT_SCORE_SIZE;
+        ii.OutputScoreDeviceVA = VA_OUTPUT_SCORE;
         ii.InputDeviceVA = VA_INPUT;
-        ii.OutputDeviceVA = VA_OUTPUT;
         ii.BitstreamDeviceVA = VA_INFER_BITSTREAM;
         ii.BitstreamSize = model.bitstream.size();
         ii.ScratchAddr = (UINT64)pScratchBuf;
@@ -724,7 +765,8 @@ int main(int argc, char** argv)
                 << " -- output dump still printed below for debugging" << std::endl;
         }
 
-        PUCHAR p = (PUCHAR)pOutputBuf + 0x2000;
+        // score 영역 — 이제 별도 buffer 시작점부터.
+        PUCHAR p = (PUCHAR)pOutputScoreBuf;
         size_t same_count = 0, n_anchor = 8136 / 4;  // 2034
         for (size_t i = 0; i < n_anchor; i++) {
             if (p[i * 4] == 0xff && p[i * 4 + 1] == 0x00 && p[i * 4 + 2] == 0x80 && p[i * 4 + 3] == 0x80) same_count++;
@@ -753,6 +795,202 @@ int main(int argc, char** argv)
 
 
     // -------------------------------------------------------------------------
+    // ★ 2026-05-18: raw outfeed binary dump (python 후처리 검증용)
+    // 우리 driver 가 받은 chip raw outfeed 를 그대로 binary file 로 저장.
+    // python 측 postprocess_test.py 가 read 해서:
+    //   1) pycoral 의 raw tensor 와 byte-level 비교 (우리 raw = chip raw 검증)
+    //   2) ssd_mobilenet 후처리 (dequant + bbox decode + NMS) 적용 → detection
+    // -------------------------------------------------------------------------
+    {
+        auto save_bin = [](const char* path, const void* data, size_t n) {
+            FILE* f = nullptr;
+            fopen_s(&f, path, "wb");
+            if (!f) { printf("[save-bin] FAIL: cannot open %s\n", path); return; }
+            size_t w = fwrite(data, 1, n, f);
+            fclose(f);
+            printf("[save-bin] wrote %s (%zu bytes)\n", path, w);
+        };
+        save_bin("C:\\temp\\our_squeeze1_raw.bin",
+                 pOutputBboxBuf, OUTPUT_BBOX_SIZE);
+        save_bin("C:\\temp\\our_convert_scores_raw.bin",
+                 pOutputScoreBuf, OUTPUT_SCORE_SIZE);
+    }
+
+    // -------------------------------------------------------------------------
+    // ★ 2026-05-18: apex_pp::Relayout + SignedDataType  (검증 step)
+    // chip OUTFEED (TYXZ tile-interleaved padded) → linear YXZ uint8.
+    // libedgetpu 의 C:\temp\libe_post_relayout_*.bin / libe_final_user_*.bin
+    // 과 byte-identical 확인됨 (2026-05-18). 이 단계 결과를 그대로 SSD
+    // postprocess 의 input 으로 넘긴다.
+    // -------------------------------------------------------------------------
+    // NOTE: 두 vector 와 그 뒤 SSD postprocess 블록을 outer scope 하나로 감쌈.
+    //       후방에 'goto cleanup' 이 있어서 std::vector 초기화 점프 문제(C2362) 방지.
+    {
+    std::vector<uint8_t> squeeze1_relayout;   // [num_anchors][4] uint8
+    std::vector<uint8_t> scores_relayout;     // [num_anchors][2] uint8
+    {
+        PUCHAR raw_bufs[2]   = { (PUCHAR)pOutputBboxBuf, (PUCHAR)pOutputScoreBuf };
+        const char* fname[2] = { "squeeze1", "convert_scores" };
+        std::vector<uint8_t>* out_vecs[2] = { &squeeze1_relayout, &scores_relayout };
+
+        for (size_t li = 0; li < model.output_layers.size() && li < 2; li++) {
+            const auto& layer = model.output_layers[li];
+            const size_t out_size = apex_pp::ActualSizeBytes(layer);
+            out_vecs[li]->resize(out_size);
+            const size_t written =
+                apex_pp::RelayoutAndSignedXform(out_vecs[li]->data(), raw_bufs[li], layer);
+
+            char path[256];
+            snprintf(path, sizeof(path),
+                     "C:\\temp\\our_post_relayout_%s.bin", fname[li]);
+            FILE* f = nullptr;
+            fopen_s(&f, path, "wb");
+            if (f) {
+                fwrite(out_vecs[li]->data(), 1, written, f);
+                fclose(f);
+                std::cout << "[post-relayout] saved " << path
+                          << " (" << written << " bytes)" << std::endl;
+            }
+
+            std::cout << "[post-relayout] '" << layer.name
+                      << "' has_layout=" << (layer.has_layout ? "yes" : "no")
+                      << " size=" << written << " HEAD:";
+            for (size_t k = 0; k < 32 && k < written; k++) {
+                printf(" %02x", (*out_vecs[li])[k]);
+            }
+            std::cout << std::endl;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // ★ 2026-05-18: SSD postprocess (Dequant + DecodeBoxes + NMS)
+    // pycoral 의 detect.get_objects 와 동일한 결과 생성 (목표).
+    // 입력 : squeeze1_relayout (uint8 [2034][4]), scores_relayout (uint8 [2034][2])
+    //        + anchors.bin (float32 [2034][4]) — extract_postproc_deps.py 로 추출.
+    // 출력 : 정규화된 [ymin,xmin,ymax,xmax] + score + class_id 리스트.
+    //        320x320 input 기준 픽셀 좌표로 환산해서 출력.
+    //
+    // 모델별 hardcoded 상수 (extract_postproc_deps.py 결과):
+    //   Squeeze1        : scale=0.10822763  zp=144
+    //   convert_scores  : scale=0.00390625  zp=0
+    //   SSD scale       : (10, 10, 5, 5)  (표준)
+    //   NMS             : score_thresh=0.5, iou_thresh=0.6, max_det=50, num_classes=1 (face)
+    // -------------------------------------------------------------------------
+    {
+        const int num_anchors = 2034;
+        const char* anchors_path = "C:\\temp\\anchors.bin";
+
+        std::vector<float> anchors = apex_pp::LoadAnchorsBin(anchors_path);
+        if (anchors.size() != (size_t)(num_anchors * 4)) {
+            std::cout << "[ssd-postproc] FAIL: anchors load size mismatch ("
+                      << anchors.size() << " floats, expected " << num_anchors * 4
+                      << "). Did you run extract_postproc_deps.py?"
+                      << " path=" << anchors_path << std::endl;
+        } else if (squeeze1_relayout.size() != (size_t)(num_anchors * 4) ||
+                   scores_relayout.size()   != (size_t)(num_anchors * 2)) {
+            std::cout << "[ssd-postproc] FAIL: relayout buffer size mismatch."
+                      << " squeeze1=" << squeeze1_relayout.size()
+                      << " scores="   << scores_relayout.size() << std::endl;
+        } else {
+            apex_pp::QuantParams q_squeeze1{ 0.10822763f, 144 };
+            apex_pp::QuantParams q_scores  { 0.00390625f, 0   };
+            apex_pp::SsdScaleFactors sf{};               // (10, 10, 5, 5)
+            apex_pp::SsdNmsParams    nms{};              // 0.5 / 0.6 / 50 / 1
+            // 첫 실행에서 노이즈 anchor 도 같이 보고 디버깅하려면 threshold 낮춤.
+            // nms.score_threshold = 0.3f;
+
+            // -----------------------------------------------------------------
+            // 단계별 결과를 파일로 저장:
+            //   our_dq_squeeze1.bin       : Dequantize 결과 (float32 [2034,4])
+            //   our_dq_convert_scores.bin : Dequantize 결과 (float32 [2034,2])
+            //   our_decoded_boxes.bin     : DecodeBoxes 결과 (float32 [2034,4]
+            //                                = [ymin,xmin,ymax,xmax] normalized)
+            //   our_detections.txt        : NMS 결과 (사람이 읽기 좋게)
+            // python:
+            //   import numpy as np
+            //   dq_sq = np.fromfile('C:/temp/our_dq_squeeze1.bin',
+            //                       dtype=np.float32).reshape(2034, 4)
+            // -----------------------------------------------------------------
+            auto save_bin = [](const char* path, const void* d, size_t n) {
+                FILE* f = nullptr;
+                fopen_s(&f, path, "wb");
+                if (f) {
+                    fwrite(d, 1, n, f);
+                    fclose(f);
+                    std::cout << "[save] " << path << " (" << n << " bytes)" << std::endl;
+                }
+            };
+
+            // 1) Dequantize (uint8 -> float32, anchor 단위 unpack)
+            std::vector<float> dq_squeeze1(num_anchors * 4);
+            std::vector<float> dq_scores  (num_anchors * 2);
+            apex_pp::Dequantize(dq_squeeze1.data(), squeeze1_relayout.data(),
+                                dq_squeeze1.size(), q_squeeze1);
+            apex_pp::Dequantize(dq_scores.data(),   scores_relayout.data(),
+                                dq_scores.size(),   q_scores);
+            save_bin("C:\\temp\\our_dq_squeeze1.bin",
+                     dq_squeeze1.data(), dq_squeeze1.size() * sizeof(float));
+            save_bin("C:\\temp\\our_dq_convert_scores.bin",
+                     dq_scores.data(),   dq_scores.size()   * sizeof(float));
+
+            // 2) DecodeBoxes (anchor + dy/dx/dh/dw -> ymin/xmin/ymax/xmax)
+            std::vector<float> decoded_boxes(num_anchors * 4);
+            apex_pp::DecodeBoxes(decoded_boxes.data(), dq_squeeze1.data(),
+                                 anchors.data(), num_anchors, sf);
+            save_bin("C:\\temp\\our_decoded_boxes.bin",
+                     decoded_boxes.data(), decoded_boxes.size() * sizeof(float));
+
+            // 3) NMS
+            auto dets = apex_pp::NonMaxSuppression(decoded_boxes.data(),
+                                                   dq_scores.data(),
+                                                   num_anchors, nms);
+
+            // 4) detection 결과를 텍스트로 저장 (정규화 좌표 + 320x320 픽셀)
+            {
+                FILE* f = nullptr;
+                fopen_s(&f, "C:\\temp\\our_detections.txt", "w");
+                if (f) {
+                    fprintf(f, "# id  score     ymin       xmin       ymax       xmax"
+                               "    | px_box (320x320): xmin,ymin,xmax,ymax\n");
+                    const int W = 320, H = 320;
+                    for (size_t i = 0; i < dets.size(); i++) {
+                        const auto& d = dets[i];
+                        fprintf(f,
+                            "%3d %.6f %.6f %.6f %.6f %.6f  | (%4d,%4d)-(%4d,%4d)\n",
+                            d.class_id, d.score,
+                            d.ymin, d.xmin, d.ymax, d.xmax,
+                            (int)(d.xmin * W), (int)(d.ymin * H),
+                            (int)(d.xmax * W), (int)(d.ymax * H));
+                    }
+                    fclose(f);
+                    std::cout << "[save] C:\\temp\\our_detections.txt ("
+                              << dets.size() << " detections)" << std::endl;
+                }
+            }
+
+            std::cout << "\n[ssd-postproc] num_detections (>= "
+                      << nms.score_threshold << ") = " << dets.size()
+                      << " (input image 320x320)" << std::endl;
+            const int W = 320, H = 320;
+            for (size_t i = 0; i < dets.size(); i++) {
+                const auto& d = dets[i];
+                const int x0 = (int)(d.xmin * W);
+                const int y0 = (int)(d.ymin * H);
+                const int x1 = (int)(d.xmax * W);
+                const int y1 = (int)(d.ymax * H);
+                std::cout << "  [det " << i << "] id=" << d.class_id
+                          << " score=" << d.score
+                          << " box=(" << x0 << "," << y0 << ")-(" << x1 << "," << y1 << ")"
+                          << "  norm=[" << d.ymin << "," << d.xmin << ","
+                          << d.ymax << "," << d.xmax << "]"
+                          << std::endl;
+            }
+            std::cout << "[ssd-postproc] expected (pycoral) = "
+                      << "[det 0] id=0 score=0.9961 box=(74,14)-(131,80)" << std::endl;
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // outfeed inspect — chip 이 OUTPUT 영역에 실제로 무엇을 썼는지 byte 단위 진단.
     //   1) coverage  : sentinel(0xCC) 잔존 byte 카운트 + 영역별 written/untouched
     //   2) per-layer : 각 output_layer 의 head/tail hex dump.
@@ -760,52 +998,43 @@ int main(int argc, char** argv)
     //                  비교 가능한 포맷. (chip 출력은 quant uint8/int8 — float 해석 X)
     // -------------------------------------------------------------------------
     {
-        PUCHAR output = (PUCHAR)pOutputBuf;
+        // 두 별도 OUTPUT buffer (bbox + score) — 각 layer 가 자기 buffer 시작에서.
+        PUCHAR outputs[2]    = { (PUCHAR)pOutputBboxBuf, (PUCHAR)pOutputScoreBuf };
+        SIZE_T output_sizes[2] = { OUTPUT_BBOX_SIZE,     OUTPUT_SCORE_SIZE };
 
-        // (1) coverage summary
-        size_t still_cc = 0, nonZero = 0;
-        for (size_t i = 0; i < OUTPUT_SIZE; i++) {
-            if (output[i] == 0xCC) still_cc++;
-            if (output[i] != 0)    nonZero++;
+        // (1) coverage summary — 두 buffer 각각
+        for (int li = 0; li < 2 && li < (int)model.output_layers.size(); li++) {
+            size_t still_cc = 0, nonZero = 0;
+            for (size_t i = 0; i < output_sizes[li]; i++) {
+                if (outputs[li][i] == 0xCC) still_cc++;
+                if (outputs[li][i] != 0)    nonZero++;
+            }
+            std::cout << "[outfeed] layer[" << li << "] size=" << output_sizes[li]
+                      << "  written~=" << (output_sizes[li] - still_cc)
+                      << "  still-0xCC=" << still_cc
+                      << "  non-zero=" << nonZero << std::endl;
         }
-        std::cout << "[outfeed] OUTPUT_SIZE=" << OUTPUT_SIZE
-                  << "  written~=" << (OUTPUT_SIZE - still_cc)
-                  << "  still-0xCC=" << still_cc
-                  << "  non-zero=" << nonZero << std::endl;
 
-        // (2) per-layer head + tail dump (Python pycoral [OUT-DUMP] 와 직접 비교)
-        size_t off = 0;
-        for (size_t li = 0; li < model.output_layers.size(); li++) {
+        // (2) per-layer head + tail dump (각 layer 는 자기 buffer 시작 0)
+        for (size_t li = 0; li < model.output_layers.size() && li < 2; li++) {
             const auto& layer = model.output_layers[li];
-            size_t aligned = apex_fb::PageAlignUp(layer.size_bytes);
-
-            // 영역별 sentinel 잔존 카운트 (chip 이 이 layer 까지 outfeed 했는지)
-            size_t layer_cc = 0;
-            for (size_t i = 0; i < aligned && off + i < OUTPUT_SIZE; i++)
-                if (output[off + i] == 0xCC) layer_cc++;
 
             std::cout << "\n[outfeed] layer[" << li << "] '" << layer.name
-                      << "' off=0x" << std::hex << off
-                      << " logical=" << std::dec << layer.size_bytes
-                      << " aligned=0x" << std::hex << aligned << std::dec
-                      << " still-0xCC=" << layer_cc << "/" << aligned << std::endl;
+                      << "' buffer_size=0x" << std::hex << output_sizes[li] << std::dec
+                      << " logical=" << layer.size_bytes << std::endl;
 
-            // head: 첫 256 byte (Python OUT-DUMP 와 동일 양)
+            // head: 첫 256 byte
             size_t headN = (std::min<size_t>)(layer.size_bytes, (size_t)256);
-            DumpHex("  head", output, off, headN);
+            DumpHex("  head", outputs[li], 0, headN);
 
-            // tail: 마지막 64 byte — chip 이 layer 끝까지 outfeed 했는지 확인용
+            // tail: 마지막 64 byte
             if (layer.size_bytes > 256) {
-                size_t tailOff = off + layer.size_bytes - 64;
-                DumpHex("  tail", output, tailOff, 64);
+                size_t tailOff = layer.size_bytes - 64;
+                DumpHex("  tail", outputs[li], tailOff, 64);
             }
-
-            // 전체 byte 를 txt 파일로 저장 — pycoral OUT-DUMP 와 diff 용
-            //SaveLayerToFile(layer.name + ".txt", output, off, layer.size_bytes);
-
-            off += aligned;
         }
     }
+    }  // outer scope (relayout/postproc vectors) — close before goto cleanup
 
 cleanup:
     if (handle && handle != INVALID_HANDLE_VALUE) {

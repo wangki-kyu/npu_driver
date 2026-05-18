@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <string>
+#include <map>
 #include <fstream>
 #include <cstdint>
 #include <cstring>
@@ -35,6 +36,20 @@ struct LayerInfo {
     size_t      size_bytes;
     int         y_dim, x_dim, z_dim;
     platforms::darwinn::DataType data_type;
+
+    // --- Extended metadata for post-processing (Relayout / TransformSignedDataType) ---
+    // Filled only for output layers in LoadModel(); input layers leave has_layout=false.
+    int  execution_count_per_inference = 1;
+    bool has_layout = false;
+
+    // OutputLayout vectors (mirror libedgetpu/executable.fbs OutputLayout).
+    // Used by apex_pp::Relayout to undo chip's TYXZ tile-interleaved padding.
+    std::vector<int32_t> y_to_tile_id;          // y_coordinate_to_linear_tile_id_map
+    std::vector<int32_t> y_to_local_y_offset;   // y_coordinate_to_local_y_offset
+    std::vector<int32_t> x_to_tile_id;          // x_coordinate_to_linear_tile_id_map
+    std::vector<int32_t> tile_byte_offset;      // linearized_tile_byte_offset
+    std::vector<int32_t> x_to_local_byte;       // x_coordinate_to_local_byte_offset
+    std::vector<int32_t> x_to_local_y_row_size; // x_coordinate_to_local_y_row_size
 };
 
 struct ApexModelFb {
@@ -338,10 +353,37 @@ inline ApexModelFb LoadModel(const std::string& path) {
             info.x_dim      = (int)layer->x_dim();
             info.z_dim      = (int)layer->z_dim();
             info.data_type  = layer->data_type();
+            info.execution_count_per_inference = (int)layer->execution_count_per_inference();
+
+            // Extract OutputLayout vectors used by apex_pp::Relayout.
+            // The Layer wraps an AnyLayer union; output side is OutputLayer{layout}.
+            const auto* out_layer = layer->any_layer_as_OutputLayer();
+            if (out_layer && out_layer->layout()) {
+                const auto* lyt = out_layer->layout();
+                auto copy_vec = [](std::vector<int32_t>& dst,
+                                   const ::flatbuffers::Vector<int32_t>* src) {
+                    if (!src) return;
+                    dst.assign(src->begin(), src->end());
+                };
+                copy_vec(info.y_to_tile_id,          lyt->y_coordinate_to_linear_tile_id_map());
+                copy_vec(info.y_to_local_y_offset,   lyt->y_coordinate_to_local_y_offset());
+                copy_vec(info.x_to_tile_id,          lyt->x_coordinate_to_linear_tile_id_map());
+                copy_vec(info.tile_byte_offset,      lyt->linearized_tile_byte_offset());
+                copy_vec(info.x_to_local_byte,       lyt->x_coordinate_to_local_byte_offset());
+                copy_vec(info.x_to_local_y_row_size, lyt->x_coordinate_to_local_y_row_size());
+                info.has_layout = !info.y_to_tile_id.empty() && !info.x_to_tile_id.empty();
+            }
 
             std::cout << "[LoadModel]   output[" << i << "]: " << info.name
                       << " " << info.y_dim << "x" << info.x_dim << "x" << info.z_dim
-                      << " = " << info.size_bytes << " bytes" << std::endl;
+                      << " = " << info.size_bytes << " bytes"
+                      << " exec=" << info.execution_count_per_inference
+                      << " dtype=" << (int)info.data_type
+                      << " layout=" << (info.has_layout ? "yes" : "no")
+                      << " (y_map=" << info.y_to_tile_id.size()
+                      << " x_map=" << info.x_to_tile_id.size()
+                      << " tiles=" << info.tile_byte_offset.size() << ")"
+                      << std::endl;
 
             model.output_layers.push_back(info);
         }
@@ -556,13 +598,54 @@ inline void PatchVAs(ApexModelFb& model, uint64_t input_va, uint64_t output_va,
         uint32_t shift = p.offset_bit % 8;
         size_t off = p.offset_bit / 8;
         uint64_t shifted_val = ((uint64_t)val) << shift;    // 패치 값을 shift만큼 left
-        uint64_t shifted_mask = ((uint64_t)0xFFFFFFFF) << shift; // 덮어쓸 32비트만 1로 표시 
+        uint64_t shifted_mask = ((uint64_t)0xFFFFFFFF) << shift; // 덮어쓸 32비트만 1로 표시
         uint64_t cur;
-        std::memcpy(&cur, model.bitstream.data() + off, 8); //기존 8바이트 읽기 
-        cur = (cur & ~shifted_mask) | (shifted_val & shifted_mask); // 패치 영역만 교체 
+        std::memcpy(&cur, model.bitstream.data() + off, 8); //기존 8바이트 읽기
+        cur = (cur & ~shifted_mask) | (shifted_val & shifted_mask); // 패치 영역만 교체
         std::memcpy(model.bitstream.data() + off, &cur, 8); // 다시 쓰기
 
         //std::memcpy(model.bitstream.data() + p.offset_bit / 8, &val, sizeof(uint32_t));
+    }
+}
+
+// ★ 2026-05-18: OUTPUT 별도 base VA overload — libedgetpu 처럼 layer 별 분리.
+// output_vas_by_name: layer name → base VA (예: {"Squeeze1": 0x100000, "convert_scores": 0x110000})
+// 각 layer 의 base VA 가 별도 IO slot (별도 PA range) 의 시작점.
+inline void PatchVAs(ApexModelFb& model, uint64_t input_va,
+                     const std::map<std::string, uint64_t>& output_vas_by_name,
+                     uint64_t param_va = 0, uint64_t scratch_va = 0) {
+    using namespace platforms::darwinn;
+    for (const auto& p : model.patches) {
+        uint64_t va = 0;
+        switch (p.desc) {
+        case Description_BASE_ADDRESS_INPUT_ACTIVATION:  va = input_va;   break;
+        case Description_BASE_ADDRESS_OUTPUT_ACTIVATION: {
+            auto it = output_vas_by_name.find(p.name);
+            if (it != output_vas_by_name.end()) {
+                va = it->second;
+            } else {
+                // layer name 매치 안 되면 skip (patch 안 함)
+                continue;
+            }
+            break;
+        }
+        case Description_BASE_ADDRESS_PARAMETER:         va = param_va;   break;
+        case Description_BASE_ADDRESS_SCRATCH:           va = scratch_va; break;
+        default: continue;
+        }
+
+        uint32_t val = (p.position == Position_LOWER_32BIT)
+                       ? (uint32_t)(va & 0xFFFFFFFF)
+                       : (uint32_t)(va >> 32);
+
+        uint32_t shift = p.offset_bit % 8;
+        size_t off = p.offset_bit / 8;
+        uint64_t shifted_val  = ((uint64_t)val) << shift;
+        uint64_t shifted_mask = ((uint64_t)0xFFFFFFFF) << shift;
+        uint64_t cur;
+        std::memcpy(&cur, model.bitstream.data() + off, 8);
+        cur = (cur & ~shifted_mask) | (shifted_val & shifted_mask);
+        std::memcpy(model.bitstream.data() + off, &cur, 8);
     }
 }
 

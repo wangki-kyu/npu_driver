@@ -22,12 +22,14 @@ typedef struct _ALLOC_IO_SLOT {
 
 typedef enum _IO_SLOT_INDEX {
 	IO_SLOT_INPUT = 0,
-	IO_SLOT_OUTPUT = 1,
-	IO_SLOT_SCRATCH = 2,
-	IO_SLOT_EXE0_BS = 3,
-	IO_SLOT_PARAM_DATA = 4,	// Phase 1 (PARAMETER_CACHING) weights blob
-	IO_SLOT_EXE1_BS = 5,	// Phase 1 bitstream (exe1)
-	IO_SLOT_EXE0_PARAM = 6,
+	// ★ 2026-05-18: OUTPUT 두 별도 slot — libedgetpu 처럼 bbox/score 가 별도 PA range.
+	IO_SLOT_OUTPUT_BBOX = 1,    // Squeeze1
+	IO_SLOT_OUTPUT_SCORE = 2,   // convert_scores
+	IO_SLOT_SCRATCH = 3,
+	IO_SLOT_EXE0_BS = 4,
+	IO_SLOT_PARAM_DATA = 5,	// Phase 1 (PARAMETER_CACHING) weights blob
+	IO_SLOT_EXE1_BS = 6,	// Phase 1 bitstream (exe1)
+	IO_SLOT_EXE0_PARAM = 7,
 	IO_SLOT_COUNT
 } IO_SLOT_INDEX;
 

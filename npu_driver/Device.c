@@ -891,6 +891,54 @@ npudriverEvtDevicePrepareHardware(
 		apex_write_register(bar2, APEX_REG_INSTR_QUEUE_INT_CONTROL, 1);
 		apex_write_register(bar2, APEX_REG_FATAL_ERR_INT_CONTROL,   1);
 		DbgPrint("[%s] Interrupts enabled: SC_HOST=0xF IQ=1 FATAL=1\n", __FUNCTION__);
+
+		// =================================================================
+		// Phase 6: TopLevelInterruptManager EnableInterrupts (2026-05-18)
+		// libedgetpu BeagleTopLevelInterruptManager::DoEnableInterrupts() 동등.
+		// coral.sys 는 omc0_d4/d8 (thermal) 만 처리. 나머지 6개 CSR 은
+		// libedgetpu user-mode 만 처리 → 우리 KMDF 단독에서는 전부 빠짐.
+		// 가장 의심: MBIST mask (SRAM 자가검사 결과 무시) 와 PCIe master ABM
+		// (chip→host DMA error detection). score-branch bias-only 의 잠재 원인.
+		// =================================================================
+		{
+			// 1. EnableThermalWarningInterrupt — omc0_d4 set thm_warn_en (bit 31)
+			UINT32 v_d4 = apex_read_register_32(bar2, APEX_REG_OMC0_D4);
+			UINT32 n_d4 = v_d4 | (1u << 31);
+			apex_write_register_32(bar2, APEX_REG_OMC0_D4, n_d4);
+			DbgPrint("[%s] TopLevelInt: omc0_d4 0x%08x -> 0x%08x (thm_warn_en=1)\n",
+				__FUNCTION__, v_d4, n_d4);
+
+			// 2. EnableMbistInterrupt — rambist_ctrl_1: mask=0, status W1C-safe=0
+			//    Bits[22:20]=rg_mbist_int_mask, Bits[18:16]=rg_mbist_int_status (W1C).
+			//    Write 0 to status bits = "no clear" (preserve). Write 0 to mask = unmask.
+			UINT32 v_rb = apex_read_register_32(bar2, APEX_REG_RAMBIST_CTRL_1);
+			UINT32 n_rb = v_rb & ~((0x7u << 16) | (0x7u << 20));
+			apex_write_register_32(bar2, APEX_REG_RAMBIST_CTRL_1, n_rb);
+			DbgPrint("[%s] TopLevelInt: rambist_ctrl_1 0x%08x -> 0x%08x (int_mask=0, status preserved)\n",
+				__FUNCTION__, v_rb, n_rb);
+
+			// 2b. scu_ctr_7: boot_failure_mask=0 (bits[19:18]), pll/usb_failure W1C-safe=0
+			UINT32 v_s7 = apex_read_register_32(bar2, APEX_REG_SCU_CTR_7);
+			UINT32 n_s7 = v_s7 & ~((1u << 16) | (1u << 17) | (0x3u << 18));
+			apex_write_register_32(bar2, APEX_REG_SCU_CTR_7, n_s7);
+			DbgPrint("[%s] TopLevelInt: scu_ctr_7 0x%08x -> 0x%08x (boot_failure_mask=0)\n",
+				__FUNCTION__, v_s7, n_s7);
+
+			// 3. EnablePcieErrorInterrupt — slv/mst ABM=1, err_resp_isr_mask=0x3 (unmask both)
+			apex_write_register_32(bar2, APEX_REG_SLV_ABM_EN, 1);
+			apex_write_register_32(bar2, APEX_REG_MST_ABM_EN, 1);
+			apex_write_register_32(bar2, APEX_REG_SLV_ERR_RESP_ISR_MASK, 0x3);
+			apex_write_register_32(bar2, APEX_REG_MST_ERR_RESP_ISR_MASK, 0x3);
+			DbgPrint("[%s] TopLevelInt: PCIe ABM=1 (slv+mst), err_resp_isr_mask=0x3\n",
+				__FUNCTION__);
+
+			// 4. EnableThermalShutdownInterrupt — omc0_d8 set sd_en (bit 31)
+			UINT32 v_d8 = apex_read_register_32(bar2, APEX_REG_OMC0_D8);
+			UINT32 n_d8 = v_d8 | (1u << 31);
+			apex_write_register_32(bar2, APEX_REG_OMC0_D8, n_d8);
+			DbgPrint("[%s] TopLevelInt: omc0_d8 0x%08x -> 0x%08x (sd_en=1)\n",
+				__FUNCTION__, v_d8, n_d8);
+		}
 	}
 
 	// =====================================================================
