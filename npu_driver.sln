@@ -11,6 +11,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "add_model_test_console", "a
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "infer_test_console", "infer_test_console\infer_test_console.vcxproj", "{DACAF55E-E1B2-4842-9865-99715B2D4B61}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "npu_runtime", "npu_runtime\npu_runtime.vcxproj", "{C7243B32-2832-43DA-A521-92172CFAA525}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -55,6 +57,14 @@ Global
 		{DACAF55E-E1B2-4842-9865-99715B2D4B61}.Release|ARM64.Build.0 = Release|x64
 		{DACAF55E-E1B2-4842-9865-99715B2D4B61}.Release|x64.ActiveCfg = Release|x64
 		{DACAF55E-E1B2-4842-9865-99715B2D4B61}.Release|x64.Build.0 = Release|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Debug|ARM64.ActiveCfg = Debug|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Debug|ARM64.Build.0 = Debug|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Debug|x64.ActiveCfg = Debug|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Debug|x64.Build.0 = Debug|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Release|ARM64.ActiveCfg = Release|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Release|ARM64.Build.0 = Release|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Release|x64.ActiveCfg = Release|x64
+		{C7243B32-2832-43DA-A521-92172CFAA525}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

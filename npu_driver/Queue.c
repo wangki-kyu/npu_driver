@@ -530,7 +530,7 @@ VOID npudriverEvtIoDeviceControl(
 		// 가설: 이 재무장이 score-branch tile 의 잘못된 state 를 만든다.
 		// 검증: 이 블록 비활성화 후 convert_scores 가 `ff 00 80 80` 에서 바뀌면 원인 확정.
 		// 되돌리려면 `#if 0` → `#if 1`. init 시 arm 은 Device.c:757-792 가 담당.
-#if 0
+#if 1
 		// 왜 한줄에 하나씩 전부 키는건가?
 		// Edge TPU 데이터패스는 파이프라인된 독립 엔진들의 집합이다. 각자 자기 명령 큐를 fetch해서 실행하므로,
 		// 하나라도 Halted면 그 단계에서 파이프라인이 막힌다.
@@ -775,8 +775,8 @@ VOID npudriverEvtIoDeviceControl(
 
 			ALLOC_IO_SLOT* exe1Slot = &pDc->IOSlots[IO_SLOT_EXE1_BS];
 			if (exe1Slot->Kva != NULL && exe1Slot->Size > 0) {
-				npudriverDumpPciAer(device, "BeforeSubmit");
-				ApexDumpCsrRegions(pDc, "BeforeSubmit");
+				//npudriverDumpPciAer(device, "BeforeSubmit");
+				//ApexDumpCsrRegions(pDc, "BeforeSubmit");
 				UINT32 slot1 = pDc->DescRingTail % 256;
 				ring[slot1].address = exe1Slot->DeviceVa;
 				ring[slot1].size_in_bytes = (UINT32)exe1Slot->ActualSize;
@@ -784,26 +784,9 @@ VOID npudriverEvtIoDeviceControl(
 				pDc->DescRingTail++;
 				DbgPrint("[INFER_NEW] enqueued exe1: VA=0x%llx size=0x%x slot=%u\n",
 					exe1Slot->DeviceVa, (UINT32)exe1Slot->Size, slot1);
-				KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록
-				apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
+				//KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록
+				//apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
 
-
-				// 임시 코드 
-				DbgPrint("[INFER_NEW] enqueued exe1, waiting...\n");
-				LARGE_INTEGER t1; t1.QuadPart = -30000000LL;  // 5s
-				NTSTATUS s1 = KeWaitForSingleObject(&pDc->InferCompleteEvent,
-					Executive, KernelMode, FALSE, &t1);
-				if (s1 == STATUS_TIMEOUT) {
-					DbgPrint("[INFER_NEW] PARAM_CACHE phase TIMEOUT\n");
-					status = STATUS_IO_TIMEOUT;
-					break;
-				}
-				// HIB_ERR check 한 번
-				if (apex_read_register(bar2, APEX_REG_USER_HIB_ERROR_STATUS) != 0) {
-					DbgPrint("[INFER_NEW] PARAM_CACHE phase FAULT\n");
-					status = STATUS_DEVICE_HARDWARE_ERROR;
-					break;
-				}
 
 				// === EXE1-POPCOUNT (2026-05-16) =================================
 				// CSR diff vs libedgetpu showed user does only ~3085 PARAMETER_POPs
@@ -831,7 +814,7 @@ VOID npudriverEvtIoDeviceControl(
 						curPc, popStart, popEnd, popPc);
 				}
 
-				npudriverDumpPciAer(device, "AfterIssueDmas");
+				//npudriverDumpPciAer(device, "AfterIssueDmas");
 
 				// === [SENTINEL] exe1 캐싱 후 host PARAM 영역 wipe ===
 				// 가설 검증: 칩이 PARAMETER_CACHING 으로 weight 를 자기 SRAM 으로 copy 했다면,
@@ -873,8 +856,8 @@ VOID npudriverEvtIoDeviceControl(
 			
 
 				//// ★ exe1 끝났으니 다음 phase 위해 reset
-				//KeClearEvent(&pDc->InferCompleteEvent);
-				//pDc->IsrSeenPendingBits = 0;
+				KeClearEvent(&pDc->InferCompleteEvent);
+				pDc->IsrSeenPendingBits = 0;
 
 				//// exe1 완료 직후, exe0 enqueue 전에 박을 진단:
 				//DbgPrint("[POST-EXE1] page_table_size=0x%llx extended=0x%llx translation_en=0x%llx\n",
@@ -929,8 +912,8 @@ VOID npudriverEvtIoDeviceControl(
 			pDc->DescRingTail++;
 			KeMemoryBarrier();	// ring write 가 chip 보다 먼저 보이도록'
 
-			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail);
-			ApexDumpCsrRegions(pDc, "AfterIssueDmas");
+			apex_write_register(bar2, APEX_REG_INSTR_QUEUE_TAIL, pDc->DescRingTail % 256);
+			//ApexDumpCsrRegions(pDc, "AfterIssueDmas");
 		}
 
 		// sc_host_int_count 스냅샷 - 완료 판정 기준선
@@ -963,7 +946,7 @@ VOID npudriverEvtIoDeviceControl(
 			break;   // 슬롯 unlock은 IOCTL_FREE_IO_BUFFERS / FileCleanup 책임
 		}
 
-		ApexDumpCsrRegions(pDc, "AfterExecution");
+		//ApexDumpCsrRegions(pDc, "AfterExecution");
 
 		// post-wait 진단
 		// dpc는 터미널 상태 도달만 알리고, success / failure 판정은 ioctl 책임
