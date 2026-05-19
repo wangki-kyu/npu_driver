@@ -440,3 +440,40 @@ extern "C" NPU_API void npu_runtime_free(npu_handle_t h) {
     }
     delete h;
 }
+
+extern "C" NPU_API npu_status_t npu_runtime_get_temperature(
+    npu_handle_t h,
+    float* out_celsius,
+    uint32_t* out_raw_adc
+)
+{
+    if (!h || !out_celsius) {
+        SetError(h, "get_temperature: invalid arg");
+        return NPU_ERR_INVALID_ARG;
+    }
+    if (h->hDevice == nullptr || h->hDevice == INVALID_HANDLE_VALUE) {
+        SetError(h, "get_temperature: device handle not open");
+        return NPU_ERR_DEVICE_NOT_FOUND;
+    }
+
+    try
+    {
+        IOCTL_GET_TEMPERATURE_OUT out{};
+        DWORD br = 0;
+        if (!DeviceIoControl(h->hDevice, IOCTL_GET_TEMPERATURE,
+            nullptr, 0, &out, sizeof(out), &br, nullptr)) {
+            SetError(h, std::string("IOCTL_GET_TEMPERATURE failed, GetLastError=") + std::to_string(GetLastError()));
+            return NPU_ERR_IOCTL_FAIL;
+        }
+        *out_celsius = out.millic / 1000.0f;
+        if (out_raw_adc) *out_raw_adc = out.raw_adc;
+        return NPU_OK;
+    }
+    catch (...)
+    {
+        SetError(h, "get_temperature exception");
+        return NPU_ERR_INTERNAL;
+    }
+
+
+}

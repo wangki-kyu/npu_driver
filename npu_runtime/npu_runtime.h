@@ -94,6 +94,16 @@ NPU_API npu_status_t npu_runtime_infer_image(
 // Safe to call with NULL.
 NPU_API void npu_runtime_free(npu_handle_t h);
 
+// Read current chip temperature
+//   out_celsius: (ex) 45.55f
+//   out_raw_adc: (옵션, NULL OK) 디버그용 10-bit raw ADC
+// NPU_ERR_DEVICE_NOT_FOUND : init 안 됐거나 BAR2 unmap
+// NPU_ERR_IOCTL_FAIL       : driver에서 거부  
+NPU_API npu_status_t npu_runtime_get_temperature(
+    npu_handle_t h,
+    float* out_celsius,
+    uint32_t* out_raw_adc);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

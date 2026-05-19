@@ -36,6 +36,14 @@ DEFINE_GUID(GUID_DEVINTERFACE_npudriver,
 #define IOCTL_PARAM_CACHE_NEW \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
+#define IOCTL_GET_TEMPERATURE \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80A, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+typedef struct _IOCTL_GET_TEMPERATURE_OUT {
+    INT32 millic;   // 섭씨 * 1000 (예: 45550 = 45.55도)
+    UINT32 raw_adc; // 디버그용 - 10-bit raw ADC
+} IOCTL_GET_TEMPERATURE_OUT;
+
 typedef struct _IOCTL_ALLOC_IO_BUFFERS_IN {
     UINT64 InputSize;       // bytes (0 = skip)
     UINT64 InputDeviceVA;       // chip device VA (4 KB align). extended VA 권장.

@@ -866,16 +866,16 @@ npudriverEvtDevicePrepareHardware(
 		//   0x40190 = RING_BUS_CONSUMER0
 		//   0x401d0 = RING_BUS_CONSUMER1
 		//   0x40210 = RING_BUS_PRODUCER
-		apex_write_register(bar2, APEX_REG_TILE_OP_RUN_CONTROL,            1);
-		apex_write_register(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL,     1);
-		apex_write_register(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL,     1);
-		apex_write_register(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL,          1);
-		apex_write_register(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL,          1);
-		apex_write_register(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL,          1);
-		apex_write_register(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL,          1);
+		apex_write_register(bar2, APEX_REG_TILE_OP_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_NARROW_TO_WIDE_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_WIDE_TO_NARROW_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS0_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS1_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS2_RUN_CONTROL, 1);
+		apex_write_register(bar2, APEX_REG_MESH_BUS3_RUN_CONTROL, 1);
 		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER0_RUN_CONTROL, 1);
 		apex_write_register(bar2, APEX_REG_RING_BUS_CONSUMER1_RUN_CONTROL, 1);
-		apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL,  1);
+		apex_write_register(bar2, APEX_REG_RING_BUS_PRODUCER_RUN_CONTROL, 1);
 		DbgPrint("[%s] Run controls set (all units kRunning)\n", __FUNCTION__);
 
 		// Phase 4: STATUS_BLOCK_UPDATE = 0 (must come AFTER all run controls per
@@ -887,9 +887,9 @@ npudriverEvtDevicePrepareHardware(
 		//   0x486a0 = SC_HOST_INT_CONTROL  = 0xF (enable SC_HOST 0..3)
 		//   0x485c0 = INSTR_QUEUE_INT_CTRL = 1
 		//   0x486c0 = FATAL_ERR_INT_CTRL   = 1
-		apex_write_register(bar2, APEX_REG_SC_HOST_INT_CONTROL,    0xF);
+		apex_write_register(bar2, APEX_REG_SC_HOST_INT_CONTROL, 0xF);
 		apex_write_register(bar2, APEX_REG_INSTR_QUEUE_INT_CONTROL, 1);
-		apex_write_register(bar2, APEX_REG_FATAL_ERR_INT_CONTROL,   1);
+		apex_write_register(bar2, APEX_REG_FATAL_ERR_INT_CONTROL, 1);
 		DbgPrint("[%s] Interrupts enabled: SC_HOST=0xF IQ=1 FATAL=1\n", __FUNCTION__);
 
 		// =================================================================
@@ -939,6 +939,16 @@ npudriverEvtDevicePrepareHardware(
 			DbgPrint("[%s] TopLevelInt: omc0_d8 0x%08x -> 0x%08x (sd_en=1)\n",
 				__FUNCTION__, v_d8, n_d8);
 		}
+	}
+
+	// === Thermal sensor enable (gasket-driver:931-945) === 
+	{
+		PVOID bar2 = deviceContext->Bar2BaseAddress;
+		apex_rmw_register_32(bar2, APEX_REG_OMC0_D0, 1, APEX_OMC_D0_CLK_EN_WIDTH, APEX_OMC_D0_CLK_EN_SHIFT);
+		apex_rmw_register_32(bar2, APEX_REG_OMC0_D8, APEX_OMC_D8_SENSOR_EN_VAL, APEX_OMC_D8_SENSOR_EN_WIDTH, APEX_OMC_D8_SENSOR_EN_SHIFT);
+		KeStallExecutionProcessor(APEX_OMC_SENSOR_SETTLE_US);
+		apex_rmw_register_32(bar2, APEX_REG_OMC0_DC, 1, APEX_OMC_DC_CTRL_EN_WIDTH, APEX_OMC_DC_CTRL_EN_SHIFT);
+		DbgPrint("[thermal] sensor enabled\n");
 	}
 
 	// =====================================================================

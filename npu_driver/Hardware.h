@@ -367,4 +367,72 @@ static inline void apex_rmw_register_32(PVOID base, UINT64 offset, UINT32 value,
     apex_write_register_32(base, offset, new_val);
 }
 
+// ============================================================================
+// ========== THERMAL SENSOR (OMC0) ==========
+// ============================================================================
+// 10-bit ADC at OMC0_DC[25:16]. 칩이 enable 시퀀스 후 자동 sampling. 
+// ADC 값은 온도와 INVERSE - 낮을수록 뜨거움 
+// 
+// gasket-driver/src/apex_driver.c:
+//   - enable seq:     enable_thermal_sensing() 931-945
+//   - read + convert: check_temperature_work_handler() 947-990
+//   - 공식:           adc_to_millic / millic_to_adc 632-640
+//
+// Enable seq (init 시 1회 — EvtDevicePrepareHardware):
+//   apex_rmw_register_32(bar2, APEX_REG_OMC0_D0, 1,   1, 7);  // clk
+//   apex_rmw_register_32(bar2, APEX_REG_OMC0_D8, 0x7, 3, 0);  // ENAD|ENVR|ENBG
+//   KeStallExecutionProcessor(100);                            // 100us settle
+//   apex_rmw_register_32(bar2, APEX_REG_OMC0_DC, 1,   1, 0);  // controller
+//
+// Read (after enable, anytime):
+//   UINT32 reg    = apex_read_register_32(bar2, APEX_REG_OMC0_DC);
+//   UINT32 adc    = APEX_OMC_DC_ADC_FROM_REG(reg);
+//   INT32  millic = apex_adc_to_millic(adc);    // 45550 → 45.55°C
+
+// Bit layout
+#define APEX_OMC_D0_CLK_EN_SHIFT       7
+#define APEX_OMC_D0_CLK_EN_WIDTH       1
+
+#define APEX_OMC_D8_SENSOR_EN_SHIFT    0
+#define APEX_OMC_D8_SENSOR_EN_WIDTH    3
+#define APEX_OMC_D8_SENSOR_EN_VAL      0x7   // ENAD | ENVR | ENBG
+
+#define APEX_OMC_DC_CTRL_EN_SHIFT      0
+#define APEX_OMC_DC_CTRL_EN_WIDTH      1
+#define APEX_OMC_DC_ADC_SHIFT          16
+#define APEX_OMC_DC_ADC_MASK           0x3FF  // 10-bit
+#define APEX_OMC_DC_ADC_FROM_REG(r)    (((UINT32)(r) >> APEX_OMC_DC_ADC_SHIFT) & APEX_OMC_DC_ADC_MASK)
+
+// Settle delay (gasket-driver:942)
+#define APEX_OMC_SENSOR_SETTLE_US      100
+
+// ADC ↔ millidegrees Celsius (gasket-driver:632-640)
+//   millic = (662 - adc) * 250 + 550
+//   adc    = (550 - millic) / 250 + 662
+// 표:
+//   adc=662 → 550 millic   (= 0.55°C zero)
+//   adc=502 → 40.55°C
+//   adc=462 → 50.55°C
+//   adc=402 → 65.55°C
+//   adc=362 → 75.55°C
+//   adc=302 → 90.55°C
+//   adc=262 → 100.55°C
+static inline INT32 apex_adc_to_millic(UINT32 adc) {
+    return (662 - (INT32)adc) * 250 + 550;
+}
+static inline UINT32 apex_millic_to_adc(INT32 millic) {
+    return (UINT32)((550 - millic) / 250 + 662);
+}
+
+// DFS trip points (gasket-driver:282-284) — 참고용. 우리 driver 는 monitor only.
+#define APEX_THERMAL_TRIP_POINT_0_MILLIC   85000  // 85°C
+#define APEX_THERMAL_TRIP_POINT_1_MILLIC   90000  // 90°C
+#define APEX_THERMAL_TRIP_POINT_2_MILLIC   95000  // 95°C
+
+// HW warning interrupt 관련 (optional, v1 skip):
+//   OMC0_D4 bit 31 = thm_warn_en   → INTR
+//   OMC0_D8 bit 31 = sd_en         → SD_ALARM
+// ============================================================================
+
+
 #endif // _HARDWARE_H_

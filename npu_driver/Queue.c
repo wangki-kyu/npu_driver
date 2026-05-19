@@ -2915,7 +2915,34 @@ VOID npudriverEvtIoDeviceControl(
 		status = STATUS_SUCCESS;
 		break;
 	}
+	case IOCTL_GET_TEMPERATURE:
+	{
+		PDEVICE_CONTEXT pDC = DeviceGetContext(device);
+		PVOID bar2 = pDC->Bar2BaseAddress;
 
+		if (bar2 == NULL) {
+			status = STATUS_DEVICE_NOT_READY;
+			break;
+		}
+
+		WDFMEMORY outMem;
+		IOCTL_GET_TEMPERATURE_OUT* pOut = NULL;
+		status = WdfRequestRetrieveOutputMemory(Request, &outMem);
+		if (!NT_SUCCESS(status)) break;
+		pOut = (IOCTL_GET_TEMPERATURE_OUT*)WdfMemoryGetBuffer(outMem, NULL);
+		if (pOut == NULL) { status = STATUS_INVALID_PARAMETER; break; }
+		
+		UINT32 reg = apex_read_register_32(bar2, APEX_REG_OMC0_DC);
+		UINT32 adc = APEX_OMC_DC_ADC_FROM_REG(reg);
+		pOut->raw_adc = adc;
+		pOut->millic = apex_adc_to_millic(adc);
+		DbgPrint("[thermal] reg=0x%x adc=%u millic=%d\n", reg, adc, pOut->millic);  // ← 임시
+
+		bytesReturned = sizeof(IOCTL_GET_TEMPERATURE_OUT);
+		status = STATUS_SUCCESS;
+		
+		break;
+	}
 	default:
 		DbgPrint("[%s] Unknown IOCTL: 0x%x\n", __FUNCTION__, IoControlCode);
 		status = STATUS_INVALID_DEVICE_REQUEST;
