@@ -4,7 +4,7 @@
 > reverse-engineered from libedgetpu + gasket-driver, with a C ABI runtime DLL and
 > real-time face detection demos. No vendor driver, no SDK — raw PCIe MMIO up.
 
-[데모 영상](https://www.youtube.com/watch?v=FChT0XPICRc) · [Notion 포트폴리오](#) · [Technical deep dives](#기술-하이라이트)
+[데모 영상](https://www.youtube.com/watch?v=FChT0XPICRc) · [Notion 포트폴리오](https://cream-wasabi-2ba.notion.site/KMDF-Windows-Driver-NPU-Project-366b66ea1e26807a9dd8d9d59418142f?pvs=74)
 
 [![Demo: real-time face detection on a custom Coral Edge TPU Windows driver](https://img.youtube.com/vi/FChT0XPICRc/maxresdefault.jpg)](https://www.youtube.com/watch?v=FChT0XPICRc)
 
