@@ -34,34 +34,6 @@ Google 의 Coral M.2 Edge TPU 는 **Linux 용 (libedgetpu) 만** 공식 지원�
 
 ---
 
-## Reverse Engineering 방법론 — "정답지를 만들어 맞춘다"
-
-register 시퀀스를 추측으로 포팅하는 대신, **reference 구현 (libedgetpu) 을 직접 계측해서
-실제 동작을 정답(ground truth)으로 캡처하고, 자작 driver 를 그것과 byte 단위로 맞추는** 방식으로 진행했습니다.
-
-**1. libedgetpu fork + 계측 (instrumentation)**
-- Google libedgetpu 를 fork, **Windows 빌드 환경을 직접 수정**해서 `edgetpu.dll` 산출
-- `verbosity=10` + 직접 삽입한 dump 코드로 **실제 추론 중** 다음을 캡처:
-  - 모든 **CSR write** (register offset + value) — 칩 init / 추론 시퀀스의 정답
-  - **INFEED** (전처리된 input) / **OUTFEED** (raw TPU tensor)
-  - **PARAM** (weight blob, ~6MB) — CRC32 + HEAD/MID/TAIL 형식
-- → 칩이 "원래 어떻게 동작해야 하는가" 의 정답지 확보
-
-**2. 자작 driver / test console 에 동일 포맷 dump 심기**
-- 자작 driver 와 test console 에 **byte-by-byte 비교 가능한 동일 dump 포맷** 삽입
-  (CRC32 `poly 0xEDB88320` + HEAD/MID/TAIL 32B)
-- 동일 tag (`[CSR@...]`, `[PARAM-DUMP]`, `[INPUT-DUMP]`, `[OUT-DUMP]`) 로 양쪽 grep → diff
-
-**3. byte-identical 비교 + mismatch 추적**
-- 양쪽 출력의 **size + CRC32 가 일치** → 자작 구현이 libedgetpu 와 byte-perfect 호환임을 증명
-- mismatch 시 **첫 다른 byte offset 까지 binary search** 로 좁혀서 정확히 어느 단계가 어긋났는지 격리
-- 이 방식으로 FlatBuffer 파싱 / VA 패치 / Relayout / Dequant 를 단계별로 검증
-
-> 이 "역 리버싱" 접근 덕분에 칩 동작을 추측 없이 복원할 수 있었고,
-> ring wrap 같은 미세 버그도 "정답지 대비 어디서 처음 어긋나는가" 로 빠르게 격리할 수 있었습니다.
-
----
-
 ## 아키텍처
 
 ```
@@ -135,6 +107,34 @@ npu_driver/
 
 > **참고:** Python 데모 (`npu_runtime_demo.py` / `npu_runtime_camera.py` / `npu_runtime_gui.py`) 는
 > 별도 디렉터리(`edge_tpu_test/`)에 있으며 `npu_runtime.dll` 을 ctypes 로 로드합니다.
+
+---
+
+## Reverse Engineering 방법론
+
+register 시퀀스를 추측으로 포팅하는 대신, **reference 구현 (libedgetpu) 을 직접 계측해서
+실제 동작을 정답(ground truth)으로 캡처하고, npu driver 를 그것과 byte 단위로 맞추는** 방식으로 진행했습니다.
+
+**1. libedgetpu fork + 계측 (instrumentation)**
+- Google libedgetpu 를 fork, **Windows 빌드 환경을 직접 수정**해서 `edgetpu.dll` 산출
+- `verbosity=10` + 직접 삽입한 dump 코드로 **실제 추론 중** 다음을 캡처:
+  - 모든 **CSR write** (register offset + value) — 칩 init / 추론 시퀀스의 정답
+  - **INFEED** (전처리된 input) / **OUTFEED** (raw TPU tensor)
+  - **PARAM** (weight blob, ~6MB) — CRC32 + HEAD/MID/TAIL 형식
+- → 칩이 "원래 어떻게 동작해야 하는가" 의 정답지 확보
+
+**2. npu driver / test console 에 동일 포맷 dump 심기**
+- 자작 driver 와 test console 에 **byte-by-byte 비교 가능한 동일 dump 포맷** 삽입
+  (CRC32 `poly 0xEDB88320` + HEAD/MID/TAIL 32B)
+- 동일 tag (`[CSR@...]`, `[PARAM-DUMP]`, `[INPUT-DUMP]`, `[OUT-DUMP]`) 로 양쪽 grep → diff
+
+**3. byte-identical 비교 + mismatch 추적**
+- 양쪽 출력의 **size + CRC32 가 일치** → 자작 구현이 libedgetpu 와 byte-perfect 호환임을 증명
+- mismatch 시 **첫 다른 byte offset 까지 binary search** 로 좁혀서 정확히 어느 단계가 어긋났는지 격리
+- 이 방식으로 FlatBuffer 파싱 / VA 패치 / Relayout / Dequant 를 단계별로 검증
+
+> 이 "역 리버싱" 접근 덕분에 칩 동작을 추측 없이 복원할 수 있었고,
+> ring wrap 같은 미세 버그도 "정답지 대비 어디서 처음 어긋나는가" 로 빠르게 격리할 수 있었습니다.
 
 ---
 
