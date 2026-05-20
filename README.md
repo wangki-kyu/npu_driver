@@ -12,25 +12,17 @@
 
 ---
 
-## TL;DR
+## 프로젝트 배경 및 동기
 
-Google 의 Coral M.2 Edge TPU 는 **Linux 용 (libedgetpu) 만** 공식 지원합니다. 이 프로젝트는 그 칩을 **Windows 에서 직접 구동**하기 위해:
-
-1. libedgetpu / gasket-driver / coral.sys 를 reverse 해서 PCIe MMIO·IOCTL·DMA 흐름을 복원하고
-2. **KMDF 커널 드라이버 (`npu_driver.sys`)** 를 from-scratch 작성,
-3. 그 위에 **C ABI 런타임 DLL (`npu_runtime.dll`)** 을 얹어 Python / C# / Rust 어디서든 호출 가능하게 만들고,
-4. SSD MobileNet v2 face 모델로 **실시간 얼굴 검출 데모** 까지 end-to-end 완성
-
-한 프로젝트입니다. 추론 결과는 pycoral (공식 SDK) 와 **byte-identical** 검증 완료.
-
----
-
-## 왜 만들었나
-
-- 목표: **Windows 커널 드라이버 + NPU 하드웨어** 를 개발하여 부족한 실무 능력을 채우기 위함 
-- Coral M.2 는 시중에서 구매 가능한 NPU 라 학습용으로 선택 (실제 상용 NPU 가속기와 동일한 PCIe·DMA·MMU 패턴)
-- Google 의 driver 는 Linux 전용 → Windows 에는 driver 자체가 없음 → reverse 부터 자작 필요
-- 그 과정에서 ring buffer wrap 버그, SSD quant 표현 등 **비자명한 hardware-level 문제를 직접 진단/해결**
+- **배경**
+    - 커널 레이어에 대한 탐구심 — 운영체제 최하단에서 하드웨어와 직접 소통하는 Windows Kernel Driver 개발에 깊은 관심
+    - 공식적으로 제공되지 않는 Coral Edge TPU 의 Windows 드라이버를 **소스 레벨로 직접 구현**하며, PCIe 기반 하드웨어 가속기가 커널 계층에서 동작하는 메커니즘을 심층 파악
+- **목적**
+    - 공식 SDK 없이 libedgetpu / gasket-driver / coral.sys 를 reverse 해서 **KMDF 드라이버 → C ABI DLL → 실시간 추론** 까지 직접 설계
+- **성과**
+    - User Space 에서 Coral Edge TPU 를 제어하는 Windows Driver 구현 — 추론 결과를 pycoral(공식 SDK)과 **byte-identical** 검증
+    - PCIe · BAR · IOMMU · PTE · CSR 등 SW–HW 를 연결하는 메커니즘을 직접 구현하며 이해
+    - SSD MobileNet v2 face 모델로 **실시간 얼굴 검출 + 칩 온도 모니터링** 데모 end-to-end 완성
 
 ---
 
